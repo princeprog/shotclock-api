@@ -5,33 +5,39 @@ import {
     OnModuleInit,
 } from '@nestjs/common'
 import { ConfigService } from '@nestjs/config'
+import { Kysely, PostgresDialect, sql } from 'kysely';
 import { Pool } from 'pg'
+import { DB } from './db';
 
 @Injectable()
 export class DatabaseService implements OnModuleInit, OnModuleDestroy{
     private readonly logger = new Logger(DatabaseService.name);
-    readonly pool: Pool;
+    readonly db: Kysely<DB>;
 
     constructor(config: ConfigService){
-        this.pool = new Pool ({
+        const pool = new Pool ({
             host: config.getOrThrow<string>('DB_HOST'),
             port: Number(config.getOrThrow<string>('DB_PORT')),
             user: config.getOrThrow<string>('DB_USER'),
             password: config.getOrThrow<string>('DB_PASSWORD'),
             database: config.getOrThrow<string>('DB_NAME')
         });
-        this.pool.on('error', (error: Error) => {
+        pool.on('error', (error: Error) => {
             this.logger.error('Unexpected database connection error', error.stack);
         });
+
+        this.db = new Kysely<DB>({
+            dialect: new PostgresDialect({pool}),
+        })
     }
 
     async onModuleInit(): Promise<void>{
-        await this.pool.query('Select 1');
+        await sql`SELECT 1`.execute(this.db)
         this.logger.log('Connected to PostgreSQL')
     }
 
     async onModuleDestroy(): Promise<void> {
-        await this.pool.end();
+        await this.db.destroy();
     }
 
 }

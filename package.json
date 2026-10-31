@@ -18,7 +18,12 @@
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
-    "test:e2e": "jest --config ./test/jest-e2e.json"
+    "test:e2e": "jest --config ./test/jest-e2e.json",
+    "generate:schema": "kysely-codegen --out-file ./src/database/db.d.ts",
+    "migrate:create": "kysely migrate:make",
+    "migrate:up": "kysely migrate:up",
+    "migrate:latest": "kysely migrate:latest",
+    "migrate:down": "kysely migrate:down"
   },
   "dependencies": {
     "@nestjs/common": "^12.0.1",
@@ -26,6 +31,8 @@
     "@nestjs/core": "^12.0.1",
     "@nestjs/observe": "^0.1.8",
     "@nestjs/platform-express": "^12.0.1",
+    "kysely": "^0.29.7",
+    "kysely-migration-cli": "^0.4.2",
     "pg": "^8.23.1",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1"
@@ -41,6 +48,8 @@
     "@types/pg": "^8.23.1",
     "@types/supertest": "^7.0.0",
     "jest": "^30.0.0",
+    "kysely-codegen": "^0.20.0",
+    "kysely-ctl": "^0.22.0",
     "oxlint": "^1.58.0",
     "prettier": "^3.4.2",
     "source-map-support": "^0.5.21",
