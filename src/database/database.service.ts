@@ -15,9 +15,11 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy{
     readonly db: Kysely<DB>;
 
     constructor(config: ConfigService){
+        const port = Number(config.getOrThrow<string>('DB_PORT'));
+        if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid DB_PORT');
         const pool = new Pool ({
             host: config.getOrThrow<string>('DB_HOST'),
-            port: Number(config.getOrThrow<string>('DB_PORT')),
+            port,
             user: config.getOrThrow<string>('DB_USER'),
             password: config.getOrThrow<string>('DB_PASSWORD'),
             database: config.getOrThrow<string>('DB_NAME')

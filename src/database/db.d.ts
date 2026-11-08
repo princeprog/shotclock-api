@@ -3,4 +3,184 @@
  * Please do not edit it manually.
  */
 
-export interface DB {}
+import type { ColumnType } from "kysely";
+
+export type Generated<T> = T extends ColumnType<infer S, infer I, infer U>
+  ? ColumnType<S, I | undefined, U>
+  : ColumnType<T, T | undefined, T>;
+
+export type Timestamp = ColumnType<Date, Date | string, Date | string>;
+
+export interface AuthActionTokens {
+  created_at: Generated<Timestamp>;
+  expires_at: Timestamp;
+  purpose: string;
+  token_hash: string;
+  used_at: Timestamp | null;
+  user_id: string;
+}
+
+export interface AuthRateLimits {
+  count: number;
+  key: string;
+  window_start: Timestamp;
+}
+
+export interface AuthRefreshTokens {
+  created_at: Generated<Timestamp>;
+  session_id: string;
+  token_hash: string;
+  used_at: Timestamp | null;
+}
+
+export interface AuthSessions {
+  absolute_expires_at: Timestamp;
+  created_at: Generated<Timestamp>;
+  id: string;
+  idle_expires_at: Timestamp;
+  revoked_at: Timestamp | null;
+  user_id: string;
+}
+
+export interface AuthUsers {
+  created_at: Generated<Timestamp>;
+  email: string;
+  email_verified: Generated<boolean>;
+  id: string;
+  name: string | null;
+  password_hash: string;
+  updated_at: Generated<Timestamp>;
+}
+
+export interface LeagueGames {
+  away_score: number | null;
+  away_season_team_id: string;
+  created_at: Generated<Timestamp>;
+  home_score: number | null;
+  home_season_team_id: string;
+  id: Generated<string>;
+  scheduled_at: Timestamp | null;
+  season_id: string;
+  status: Generated<string>;
+  updated_at: Generated<Timestamp>;
+  venue_id: string | null;
+}
+
+export interface LeagueLeagueMembers {
+  created_at: Generated<Timestamp>;
+  id: Generated<string>;
+  league_id: string;
+  role: string;
+  updated_at: Generated<Timestamp>;
+  user_id: string;
+}
+
+export interface LeagueLeagues {
+  created_at: Generated<Timestamp>;
+  id: Generated<string>;
+  location: string | null;
+  name: string;
+  organization_id: string;
+  updated_at: Generated<Timestamp>;
+}
+
+export interface LeagueOrganizations {
+  created_at: Generated<Timestamp>;
+  id: Generated<string>;
+  name: string;
+  owner_user_id: string;
+  updated_at: Generated<Timestamp>;
+}
+
+export interface LeaguePlayerGameStats {
+  assists: Generated<number>;
+  blocks: Generated<number>;
+  created_at: Generated<Timestamp>;
+  fouls: Generated<number>;
+  game_id: string;
+  id: Generated<string>;
+  points: Generated<number>;
+  rebounds: Generated<number>;
+  roster_id: string;
+  steals: Generated<number>;
+  turnovers: Generated<number>;
+  updated_at: Generated<Timestamp>;
+}
+
+export interface LeaguePlayers {
+  created_at: Generated<Timestamp>;
+  date_of_birth: Timestamp | null;
+  first_name: string;
+  id: Generated<string>;
+  last_name: string;
+  updated_at: Generated<Timestamp>;
+  user_id: string | null;
+}
+
+export interface LeagueRosters {
+  created_at: Generated<Timestamp>;
+  id: Generated<string>;
+  jersey_number: number | null;
+  player_id: string;
+  season_team_id: string;
+  status: Generated<string>;
+  updated_at: Generated<Timestamp>;
+}
+
+export interface LeagueSeasons {
+  created_at: Generated<Timestamp>;
+  end_date: Timestamp | null;
+  id: Generated<string>;
+  league_id: string;
+  name: string;
+  start_date: Timestamp | null;
+  status: Generated<string>;
+  updated_at: Generated<Timestamp>;
+}
+
+export interface LeagueSeasonTeams {
+  created_at: Generated<Timestamp>;
+  id: Generated<string>;
+  league_id: string;
+  season_id: string;
+  status: Generated<string>;
+  team_id: string;
+  updated_at: Generated<Timestamp>;
+}
+
+export interface LeagueTeams {
+  abbreviation: string | null;
+  created_at: Generated<Timestamp>;
+  id: Generated<string>;
+  league_id: string;
+  name: string;
+  updated_at: Generated<Timestamp>;
+}
+
+export interface LeagueVenues {
+  address: string | null;
+  created_at: Generated<Timestamp>;
+  id: Generated<string>;
+  league_id: string;
+  name: string;
+  updated_at: Generated<Timestamp>;
+}
+
+export interface DB {
+  "auth.action_tokens": AuthActionTokens;
+  "auth.rate_limits": AuthRateLimits;
+  "auth.refresh_tokens": AuthRefreshTokens;
+  "auth.sessions": AuthSessions;
+  "auth.users": AuthUsers;
+  "league.games": LeagueGames;
+  "league.league_members": LeagueLeagueMembers;
+  "league.leagues": LeagueLeagues;
+  "league.organizations": LeagueOrganizations;
+  "league.player_game_stats": LeaguePlayerGameStats;
+  "league.players": LeaguePlayers;
+  "league.rosters": LeagueRosters;
+  "league.season_teams": LeagueSeasonTeams;
+  "league.seasons": LeagueSeasons;
+  "league.teams": LeagueTeams;
+  "league.venues": LeagueVenues;
+}

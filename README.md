@@ -1,114 +1,42 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Shotclock API
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+NestJS API using PostgreSQL and Kysely. The API listens on port 3001 by default; the frontend gateway should use `AUTH_API_URL=http://localhost:3001` in development. Copy `.env.example` to `.env`, provide real database and SMTP settings, and set a unique random `AUTH_JWT_SECRET` of at least 32 bytes. In production `FRONTEND_URL` and configured CORS origins must use HTTPS, and SMTP must use implicit TLS or STARTTLS with certificate verification. Startup rejects invalid required authentication, gateway and SMTP configuration. CORS defaults to no allowed browser origins; server-to-server calls do not require CORS. TLS termination and network access controls must be configured at the trusted ingress.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+Run `pnpm install`, then `pnpm migrate:latest` and `pnpm generate:schema` against a database you know is development, or through your normal reviewed deployment migration process. Both commands load database settings in the same order as the API: process environment, `.env.local`, then `.env`. Code generation derives its connection URL from `DB_*`, so it targets the same database as migrations. Never generate the schema from or apply migrations to an unknown database. Start with `pnpm start:dev`. Run unit tests with `pnpm test --runInBand` and the basic HTTP test with `pnpm test:e2e --runInBand`.
 
-## Description
+Authentication tables live in the `auth` schema and basketball tables live in `league`; the migration preserves existing authentication records and sessions while moving the original `public.auth_*` tables. Stop the old API before applying this migration and restart it with the matching code after migration and type generation. The migration rollback drops the league tables and their data. `pnpm generate:schema` includes both schemas.
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+The PostgreSQL integration tests are opt-in: provision a disposable database named `shotclock_auth_dev_test_<hex>`, migrate it, then set `AUTH_TEST_DB=1` and `DB_NAME` to that database along with its connection settings before running `pnpm test --runInBand`. The suite writes authentication records; never point it at an existing database. SMTP is replaced by an in-process test mailer.
 
-## Project setup
+The schema migration up/down test uses a separate, empty disposable database matching that name pattern. Set `SCHEMA_MIGRATION_TEST_DB=1` with that database's `DB_*` settings and run `pnpm test --runInBand src/database/schema-migration.integration.spec.ts`; the test creates tables and exercises a destructive rollback, so do not pre-migrate or reuse that database.
 
-```bash
-$ pnpm install
-```
+## League management
 
-## Compile and run the project
+The authenticated `/league` API provides organization, league, season, team, season-team, roster, venue, game, score, standings, and dashboard endpoints. See `src/league/league.controller.ts` and `league.dto.ts` for paths and request fields. Every operation validates the session and checks ownership through the organization; inaccessible resources return 404.
 
-```bash
-# development
-$ pnpm run start
+Seasons transition from draft to active to completed. Completion requires at least one game and every game to be final; scores can be corrected afterward. Standings are calculated from final results and sorted by wins, point difference, team name, and ID. The MVP excludes invitations, deletion, player statistics, and live scoring. `src/league/league.integration.spec.ts` runs with the same disposable database settings as the authentication integration suite.
 
-# watch mode
-$ pnpm run start:dev
+## Authentication contract
 
-# production mode
-$ pnpm run start:prod
-```
+All bodies are JSON. Emails are case-normalized. New passwords must be 12–128 characters. Unknown properties and malformed input are rejected. `name` is optional and at most 120 characters.
 
-## Run tests
+- `POST /auth/register {email,password,name?}` returns HTTP 200 and `{message}` for both new and existing accounts, creates no session, and sends a verification email only for a new account. Verification is required before login.
+- `POST /auth/login {email,password}` returns `{accessToken,refreshToken,user}` for verified accounts; incorrect credentials and unverified accounts both return 401.
+- `POST /auth/refresh {refreshToken}` rotates the opaque refresh token and returns the same shape. A replay revokes the entire session, including tokens issued by a concurrent successful refresh; replay revocation commits before the 401 response. Access tokens expire after 15 minutes. Sessions have a 7-day sliding idle limit and a 30-day absolute limit.
+- `POST /auth/logout` accepts either a valid `Authorization: Bearer <accessToken>` or `{refreshToken}` (also usable after access-token expiry). It returns 204 and invalidates the session; an unknown refresh token also returns 204. Without a usable credential it returns 401.
+- `GET /auth/me` with a valid bearer token returns `{user}`; absent, expired or revoked credentials return 401. The user fields are `id`, `email`, `name`, and `emailVerified`.
+- `POST /auth/verify-email {token}` verifies an email. `POST /auth/resend-verification {email}` and `POST /auth/forgot-password {email}` return the same generic HTTP 200 message for eligible and ineligible accounts. `POST /auth/reset-password {token,password}` changes the password and revokes all sessions. Verification and reset tokens are single-use, expire after 24 hours and one hour respectively, and replacement tokens invalidate previous tokens for the same purpose. Invalid, used, or expired action tokens return 400.
 
-```bash
-# unit tests
-$ pnpm run test
+Email links use `FRONTEND_URL/verify-email#token=...` and `FRONTEND_URL/reset-password#token=...`. The frontend must read the fragment and POST the token in the JSON body; fragments are not sent in HTTP requests. Authentication emails are dispatched asynchronously after the database transaction, and delivery errors are logged without tokens, addresses, or credentials. There is no durable mail queue or automatic retry: users can request another email. SMTP is not awaited selectively for existing accounts.
 
-# e2e tests
-$ pnpm run test:e2e
+Passwords use Argon2id; database rows store only SHA-256 hashes of random refresh and action tokens. An hourly task deletes expired sessions (and their refresh history), expired action tokens, and rate-limit windows older than 24 hours. Refresh history is retained while its session can still be valid so replay detection continues to work. Cleanup runs in each API instance; operations are safe to repeat.
 
-# test coverage
-$ pnpm run test:cov
-```
+## Rate limiting and gateway deployment
 
-## Deployment
+Authentication POSTs other than logout have database-backed fixed windows of 15 minutes: 100 requests per peer per route by default (`AUTH_RATE_LIMIT_IP` changes this) and 10 per normalized email per route when supplied. Failure returns 429. Logout is not application-rate-limited so an attack cannot prevent explicit revocation; protect it and all endpoints with network-level abuse controls. The database is required for authentication and throttling.
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+By default, the API uses the socket peer and ignores `X-Forwarded-For` and all client-supplied IP headers. A server-to-server Next gateway shares one peer address for all visitors; without attestation its aggregate per-route limit applies to the entire gateway and must be sized appropriately, with independent trusted-ingress abuse protection.
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+For per-client limits, optionally configure **both** `AUTH_TRUSTED_GATEWAY_IPS` (comma-separated exact API-visible IPv4/IPv6 socket peer addresses; no CIDRs) and a separate random `AUTH_GATEWAY_SECRET` of at least 32 bytes. The gateway sends `X-Auth-Client-IP` as one IPv4 or IPv6 address and `X-Auth-Gateway-Secret` with that secret. The API honors the address only if the socket peer is allowlisted and the secret matches. Incorrect or missing attestation falls back to the socket peer.
 
-```bash
-$ pnpm install -g @nestjs/mau
-$ mau deploy
-```
-
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
-
-## Observability
-
-In production applications, observability is essential for understanding how your system behaves, detecting issues early, and maintaining reliable performance.
-
-[NestJS Observe](https://observe.nestjs.com) automatically instruments your NestJS application, giving you deep visibility into your system with minimal setup:
-
-- **Distributed tracing:** Follow requests across services and understand how they flow through your system.
-- **Waterfall analysis:** Visualize request execution and identify slow operations, bottlenecks, and unexpected delays.
-- **Performance analysis:** Analyze application performance in real time and quickly pinpoint areas that need optimization.
-- **Metrics:** Track key application and infrastructure metrics to understand system health and performance trends.
-- **Logging:** Centralize and correlate logs with traces and other telemetry to make debugging easier.
-- **Error tracking:** Detect errors quickly and investigate their root causes with the surrounding context.
-- **SLA monitoring:** Track service-level objectives and identify when your application is approaching or exceeding defined thresholds.
-- **Alarms and alerts:** Set up alerts for critical errors, performance degradation, SLA violations, and other anomalies so your team can react quickly.
-
-## Resources
-
-Check out a few resources that may come in handy when working with NestJS:
-
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Auto-instrument your application with [NestJS Observer](https://observer.nestjs.com). Distributed tracing, metrics, and logging made easy. Error tracking and performance monitoring for your NestJS applications.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
-
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+The gateway must obtain the client IP from a trusted platform connection address or an ingress that strips and overwrites client-provided forwarding headers. Never copy an arbitrary browser-supplied forwarding header. Strip incoming `X-Auth-Client-IP` and `X-Auth-Gateway-Secret` before creating backend requests; do not expose the secret to browser code, redact it from logs, and use TLS on the gateway-to-API connection. Restrict API network access to the gateway and rotate the secret if exposed. If the API sees a proxy rather than the gateway as its peer, allowlisting that proxy is safe only if it prevents untrusted traffic from reaching the API and does not disclose or inject the secret. If the gateway cannot identify client IPs reliably, omit attestation instead of guessing.
