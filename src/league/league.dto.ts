@@ -1,5 +1,7 @@
-import { IsDateString, IsIn, IsInt, IsOptional, IsString, IsUUID, Max, MaxLength, Min, MinLength } from 'class-validator';
+import { IsDateString, IsIn, IsInt, IsOptional, IsString, IsUUID, Max, MaxLength, Min, MinLength, ValidateIf } from 'class-validator';
 import { Type } from 'class-transformer';
+
+const positions = ['point_guard', 'shooting_guard', 'small_forward', 'power_forward', 'center'];
 
 export class NameDto {
   @IsString() @MinLength(1) @MaxLength(120) name!: string;
@@ -12,6 +14,29 @@ export class TeamDto extends NameDto {
 }
 export class CreateTeamDto extends TeamDto {
   @IsUUID() seasonId!: string;
+  @IsOptional() @IsUUID() divisionId?: string;
+}
+export class DivisionDto extends NameDto {
+  @IsOptional() @IsInt() @Min(1) @Max(150) maxAge?: number | null;
+}
+export class UpdateDivisionDto {
+  @ValidateIf((_, value) => value !== undefined) @IsString() @MinLength(1) @MaxLength(120) name?: string;
+  @IsOptional() @IsInt() @Min(1) @Max(150) maxAge?: number | null;
+}
+export class DivisionFilterDto {
+  @IsOptional() @IsUUID() divisionId?: string;
+}
+export class PlayerDto {
+  @IsString() @MinLength(1) @MaxLength(80) firstName!: string;
+  @IsString() @MinLength(1) @MaxLength(80) lastName!: string;
+  @IsDateString({ strict: true }) dateOfBirth!: string;
+  @IsOptional() @IsIn(positions) position?: string | null;
+}
+export class UpdatePlayerDto {
+  @ValidateIf((_, value) => value !== undefined) @IsString() @MinLength(1) @MaxLength(80) firstName?: string;
+  @ValidateIf((_, value) => value !== undefined) @IsString() @MinLength(1) @MaxLength(80) lastName?: string;
+  @ValidateIf((_, value) => value !== undefined) @IsDateString({ strict: true }) dateOfBirth?: string;
+  @IsOptional() @IsIn(positions) position?: string | null;
 }
 export class SeasonDto extends NameDto {
   @IsOptional() @IsDateString({ strict: true }) startDate?: string | null;
@@ -30,6 +55,7 @@ export class OrganizationTeamFilterDto {
   @IsOptional() @IsString() @MaxLength(120) search?: string;
   @IsOptional() @IsUUID() leagueId?: string;
   @IsOptional() @IsUUID() seasonId?: string;
+  @IsOptional() @IsUUID() divisionId?: string;
 }
 export class OrganizationVenueFilterDto {
   @IsOptional() @IsString() @MaxLength(120) search?: string;
@@ -40,16 +66,20 @@ export class StatusDto {
 }
 export class TeamRegistrationDto {
   @IsUUID() teamId!: string;
+  @IsOptional() @IsUUID() divisionId?: string;
+}
+export class MoveTeamRegistrationDto {
+  @IsUUID() divisionId!: string;
 }
 export class RosterDto {
-  @IsString() @MinLength(1) @MaxLength(80) firstName!: string;
-  @IsString() @MinLength(1) @MaxLength(80) lastName!: string;
+  @IsUUID() playerId!: string;
   @IsOptional() @IsInt() @Min(0) @Max(999) jerseyNumber?: number | null;
 }
 export class RosterFilterDto {
   @IsOptional() @IsString() @MaxLength(161) search?: string;
 }
 export class JerseyDto {
+  @IsOptional() @IsUUID() seasonTeamId?: string;
   @IsOptional() @IsInt() @Min(0) @Max(999) jerseyNumber?: number | null;
 }
 export class VenueDto extends NameDto {
@@ -61,7 +91,7 @@ export class GameDto {
   @IsDateString({ strict: true }) scheduledAt!: string;
   @IsOptional() @IsUUID() venueId?: string | null;
 }
-export class GameFilterDto {
+export class GameFilterDto extends DivisionFilterDto {
   @IsOptional() @IsString() @MaxLength(120) search?: string;
   @IsOptional() @IsIn(['scheduled', 'completed']) status?: 'scheduled' | 'completed';
   @IsOptional() @IsUUID() teamId?: string;

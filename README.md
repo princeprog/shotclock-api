@@ -12,9 +12,9 @@ The schema migration up/down test uses a separate, empty disposable database mat
 
 ## League management
 
-The authenticated `/league` API provides organization, league, season, team, season-team, roster, venue, game, score, standings, and dashboard endpoints. See `src/league/league.controller.ts` and `league.dto.ts` for paths and request fields. Every operation validates the session and checks ownership through the organization; inaccessible resources return 404.
+The authenticated `/league` API provides organization, league, season, division, team, season-team, player, roster, venue, game, score, standings, and dashboard endpoints. See `src/league/league.controller.ts` and `league.dto.ts` for paths and request fields. Every operation validates the session and checks ownership through the organization; inaccessible resources return 404.
 
-Seasons transition from draft to active to completed. Completion requires at least one game and every game to be final; scores can be corrected afterward. Standings are calculated from final results and sorted by wins, point difference, team name, and ID. The MVP excludes invitations, deletion, player statistics, and live scoring. `src/league/league.integration.spec.ts` runs with the same disposable database settings as the authentication integration suite.
+Seasons transition from draft to active to completed. Each new season starts with an Open division; teams register once per division and games and standings stay within that division. Age-limited divisions compare player birth dates against the season start date. Reusable organization players can hold one roster registration per season; draft corrections are allowed and activation locks transfers. Completion requires at least one game and every game to be final; scores can be corrected afterward. The MVP excludes invitations, player statistics, certificate uploads, and live scoring; empty draft divisions, roster registrations, and team registrations without players or games can be removed. Draft team registrations can move between divisions if their players are eligible and no games depend on them. `src/league/league.integration.spec.ts` runs with the same disposable database settings as the authentication integration suite.
 
 ## Authentication contract
 

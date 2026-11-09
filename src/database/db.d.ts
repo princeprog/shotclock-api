@@ -52,10 +52,20 @@ export interface AuthUsers {
   updated_at: Generated<Timestamp>;
 }
 
+export interface LeagueDivisions {
+  created_at: Generated<Timestamp>;
+  id: Generated<string>;
+  max_age: number | null;
+  name: string;
+  season_id: string;
+  updated_at: Generated<Timestamp>;
+}
+
 export interface LeagueGames {
   away_score: number | null;
   away_season_team_id: string;
   created_at: Generated<Timestamp>;
+  division_id: string;
   home_score: number | null;
   home_season_team_id: string;
   id: Generated<string>;
@@ -82,6 +92,11 @@ export interface LeagueLeagues {
   name: string;
   organization_id: string;
   updated_at: Generated<Timestamp>;
+}
+
+export interface LeagueOrganizationPlayers {
+  organization_id: string;
+  player_id: string;
 }
 
 export interface LeagueOrganizations {
@@ -113,6 +128,7 @@ export interface LeaguePlayers {
   first_name: string;
   id: Generated<string>;
   last_name: string;
+  position: string | null;
   updated_at: Generated<Timestamp>;
   user_id: string | null;
 }
@@ -122,6 +138,7 @@ export interface LeagueRosters {
   id: Generated<string>;
   jersey_number: number | null;
   player_id: string;
+  season_id: string;
   season_team_id: string;
   status: Generated<string>;
   updated_at: Generated<Timestamp>;
@@ -140,6 +157,7 @@ export interface LeagueSeasons {
 
 export interface LeagueSeasonTeams {
   created_at: Generated<Timestamp>;
+  division_id: string;
   id: Generated<string>;
   league_id: string;
   season_id: string;
@@ -172,9 +190,11 @@ export interface DB {
   "auth.refresh_tokens": AuthRefreshTokens;
   "auth.sessions": AuthSessions;
   "auth.users": AuthUsers;
+  "league.divisions": LeagueDivisions;
   "league.games": LeagueGames;
   "league.league_members": LeagueLeagueMembers;
   "league.leagues": LeagueLeagues;
+  "league.organization_players": LeagueOrganizationPlayers;
   "league.organizations": LeagueOrganizations;
   "league.player_game_stats": LeaguePlayerGameStats;
   "league.players": LeaguePlayers;
