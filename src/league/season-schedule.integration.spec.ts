@@ -58,6 +58,17 @@ databaseTests('season-wide scheduling against disposable PostgreSQL', () => {
     const base = `/seasons/${f.season.id}/schedule`;
     await f.get(`${base}/status`, other).expect(404);
     await f.post(`${base}/preview`, f.input, other).expect(404);
+    await f.post(`${base}/estimate`, f.input, other).expect(404);
+    await f.post(`${base}/calendar`, { availability: f.input.availability }, other).expect(404);
+    const estimate = (await f.post(`${base}/estimate`, f.input).expect(201)).body;
+    expect(estimate).toMatchObject({ required: 9, capacity: 35 });
+    expect(estimate.divisions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: f.open.id, gameCount: 6 }),
+      expect.objectContaining({ id: f.small.id, gameCount: 3 }),
+      expect.objectContaining({ id: f.occupied.id, reason: expect.any(String), gameCount: 0 }),
+    ]));
+    const calendar = (await f.post(`${base}/calendar`, { availability: f.input.availability }).expect(201)).body;
+    expect(calendar.games).toEqual([expect.objectContaining({ divisionName: 'Existing', venueId: f.venue.id })]);
     const preview = (await f.post(`${base}/preview`, f.input).expect(201)).body;
     expect(preview.games).toHaveLength(9);
     expect(preview.divisions).toEqual(expect.arrayContaining([
@@ -79,6 +90,10 @@ databaseTests('season-wide scheduling against disposable PostgreSQL', () => {
     const divisionIds = [f.open.id, f.small.id];
     const payload = { ...f.input, games, divisionIds };
     const edited = games.map((game) => ({ ...game, scheduledAt: games[0].scheduledAt }));
+    await f.post(`${base}/validate`, payload, other).expect(404);
+    expect((await f.post(`${base}/validate`, payload).expect(201)).body.issues).toEqual([]);
+    const issues = (await f.post(`${base}/validate`, { ...payload, games: edited }).expect(201)).body.issues;
+    expect(issues).toEqual(expect.arrayContaining([expect.objectContaining({ index: 0 }), expect.objectContaining({ index: 1 })]));
     await f.post(base, { ...payload, games: edited }).expect(400);
     expect((await f.get(`/seasons/${f.season.id}/games?scope=season`).expect(200)).body.total).toBe(1);
     const saves = await Promise.all([f.post(base, payload), f.post(base, payload)]);
@@ -115,11 +130,15 @@ databaseTests('season-wide scheduling against disposable PostgreSQL', () => {
     const openGames = (await f.get(`/seasons/${f.season.id}/games?divisionId=${f.open.id}&pageSize=100`).expect(200)).body.items;
     for (const game of openGames.filter((item: { stage: string }) => item.stage === 'semifinal')) await f.post(`/games/${game.id}/score`, { homeScore: 20, awayScore: 10 }).expect(201);
     const playoffs = `/seasons/${f.season.id}/playoffs`;
+    const playoffEstimate = (await f.post(`${playoffs}/estimate`, { availability: f.input.availability }).expect(201)).body;
+    expect(playoffEstimate.required).toBe(4);
     const next = (await f.post(`${playoffs}/preview`, { availability: f.input.availability }).expect(201)).body;
     expect(next.games).toHaveLength(4);
     expect(next.games.filter((game: PreviewGame) => game.divisionId === f.small.id).map((game: PreviewGame) => game.stage)).toEqual(['semifinal', 'semifinal']);
     expect(next.games.filter((game: PreviewGame) => game.divisionId === f.open.id).map((game: PreviewGame) => game.stage).sort()).toEqual(['final', 'third_place']);
-    await f.post(playoffs, { availability: f.input.availability, divisionIds: [f.open.id, f.small.id], games: next.games }).expect(201);
+    const payload = { availability: f.input.availability, divisionIds: [f.open.id, f.small.id], games: next.games };
+    expect((await f.post(`${playoffs}/validate`, payload).expect(201)).body.issues).toEqual([]);
+    await f.post(playoffs, payload).expect(201);
     const after = (await f.get(`/seasons/${f.season.id}/games?scope=season&pageSize=100`).expect(200)).body.items;
     expect(after.filter((game: { stage: string }) => game.stage === 'final')).toHaveLength(1);
     expect(after.filter((game: { stage: string }) => game.stage === 'third_place')).toHaveLength(1);

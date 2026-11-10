@@ -308,11 +308,46 @@ function busyGames(
   });
 }
 
-function conflict(
+// An upper bound: venue occupancy is considered, but team rest and round order are not.
+export function estimateCourtCapacity(availability: ScheduleAvailability, existing: ExistingGame[]): number {
+  const intervals = windows(settings(availability));
+  const busy = busyGames(existing, availability).filter((game) => {
+    if (game.venueId === null || !availability.venueIds.includes(game.venueId)) return false;
+    let low = 0, high = intervals.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (intervals[middle].end <= game.start) low = middle + 1;
+      else high = middle;
+    }
+    return low < intervals.length && intervals[low].start < game.end;
+  });
+  if (intervals.length * Math.max(1, busy.length) > MAX_COMPARISONS)
+    throw new Error('Schedule capacity input exceeds work limit');
+  const length = availability.durationMinutes * MINUTE;
+  let total = 0;
+  for (const venueId of availability.venueIds) {
+    const blocked = busy.filter((game) => game.venueId === venueId).sort((a, b) => a.start - b.start);
+    for (const interval of intervals) {
+      let cursor = interval.start;
+      for (const item of blocked) {
+        if (item.end <= cursor) continue;
+        if (item.start >= interval.end) break;
+        total += Math.floor(Math.max(0, item.start - cursor) / length);
+        cursor = Math.max(cursor, item.end);
+        if (cursor >= interval.end) break;
+      }
+      total += Math.floor(Math.max(0, interval.end - cursor) / length);
+    }
+  }
+  return total;
+}
+
+function conflictReasons(
   candidate: BusyGame,
   previous: BusyGame,
   rest: number,
-): boolean {
+): string[] {
+  const reasons: string[] = [];
   const sameTeam =
     candidate.homeTeamId === previous.homeTeamId ||
     candidate.homeTeamId === previous.awayTeamId ||
@@ -323,13 +358,14 @@ function conflict(
     candidate.start < previous.end + rest &&
     previous.start < candidate.end + rest
   )
-    return true;
-  return (
+    reasons.push('Team conflict: a team is playing or has insufficient rest. Choose another time.');
+  if (
     candidate.venueId !== null &&
     candidate.venueId === previous.venueId &&
     candidate.start < previous.end &&
     previous.start < candidate.end
-  );
+  ) reasons.push('Venue conflict: this court is already booked. Choose another time or venue.');
+  return reasons;
 }
 
 function findPlacement(
@@ -464,16 +500,32 @@ export function validateSchedule(
   availability: ScheduleAvailability,
   existing: ExistingGame[],
 ): void {
+  const issues = scheduleIssues(games, availability, existing);
+  if (issues.length) throw new Error(issues[0].message);
+}
+
+export function scheduleIssues(
+  games: ScheduleGame[],
+  availability: ScheduleAvailability,
+  existing: ExistingGame[],
+): { index: number; message: string }[] {
   const config = settings(availability);
   if (!Array.isArray(games) || games.length > MAX_GAMES)
     throw new Error('Invalid games (maximum 10000)');
   const busy = busyGames(existing, availability);
-  if (!games.length) return;
+  if (!games.length) return [];
   if (games.length * (busy.length + games.length) > MAX_COMPARISONS)
     throw new Error('Schedule validation input exceeds work limit');
   const intervals = windows(config);
   const rounds = new Map<number, Interval>();
-  for (const game of games) {
+  const issues: { index: number; message: string }[] = [];
+  const issueKeys = new Set<string>();
+  const previousDraft: BusyGame[] = [];
+  const addIssue = (index: number, message: string) => {
+    const key = `${index}:${message}`;
+    if (!issueKeys.has(key)) { issueKeys.add(key); issues.push({ index, message }); }
+  };
+  for (const [index, game] of games.entries()) {
     validateMatch(game);
     if (!availability.venueIds.includes(game.venueId))
       throw new Error('Invalid game venue');
@@ -494,14 +546,15 @@ export function validateSchedule(
           candidate.start >= interval.start && candidate.end <= interval.end,
       )
     )
-      throw new Error('Game outside availability window');
-    if (
-      busy.some((item) =>
-        conflict(candidate, item, availability.restMinutes * MINUTE),
-      )
-    )
-      throw new Error('Game conflict: team, rest, or venue');
-    busy.push(candidate);
+      addIssue(index, 'Game outside availability window');
+    for (const item of busy) for (const message of conflictReasons(candidate, item, availability.restMinutes * MINUTE)) addIssue(index, message);
+    for (const [otherIndex, item] of previousDraft.entries()) {
+      for (const message of conflictReasons(candidate, item, availability.restMinutes * MINUTE)) {
+        addIssue(index, message);
+        addIssue(otherIndex, message);
+      }
+    }
+    previousDraft.push(candidate);
     const round = rounds.get(game.round);
     if (round) {
       round.start = Math.min(round.start, candidate.start);
@@ -510,11 +563,20 @@ export function validateSchedule(
       rounds.set(game.round, { start: candidate.start, end: candidate.end });
   }
   let lastEnd = -Infinity;
-  for (const [, round] of [...rounds].sort(([a], [b]) => a - b)) {
-    if (round.start < lastEnd)
-      throw new Error(
-        'Round sequence conflict: a later round starts before an earlier round ends',
-      );
-    lastEnd = round.end;
+  for (const [roundNumber, round] of [...rounds].sort(([a], [b]) => a - b)) {
+    if (round.start < lastEnd) {
+      const message = 'Round sequence conflict: a later round starts before an earlier round ends';
+      for (const [index, game] of games.entries()) {
+        if (game.round !== roundNumber) continue;
+        for (const [otherIndex, other] of games.entries()) {
+          if (other.round < roundNumber && previousDraft[index].start < previousDraft[otherIndex].end) {
+            addIssue(index, message);
+            addIssue(otherIndex, message);
+          }
+        }
+      }
+    }
+    lastEnd = Math.max(lastEnd, round.end);
   }
+  return issues;
 }

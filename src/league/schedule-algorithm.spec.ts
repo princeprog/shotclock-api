@@ -2,6 +2,8 @@ import {
   roundRobin,
   scheduleMatches,
   validateSchedule,
+  estimateCourtCapacity,
+  scheduleIssues,
 } from './schedule-algorithm';
 import type {
   ExistingGame,
@@ -35,6 +37,34 @@ const game = (overrides: Partial<ScheduleGame> = {}): ScheduleGame => ({
   venueId: 'court-a',
   durationMinutes: 60,
   ...overrides,
+});
+
+describe('schedule preview diagnostics', () => {
+  it('counts free court capacity after overlapping bookings and legacy durations', () => {
+    const existing: ExistingGame[] = [
+      { homeTeamId: 'x', awayTeamId: 'y', scheduledAt: '2026-11-01T01:30:00.000Z', venueId: 'court-a', durationMinutes: null },
+      { homeTeamId: 'q', awayTeamId: 'r', scheduledAt: '2026-11-01T02:00:00.000Z', venueId: 'court-a', durationMinutes: 60 },
+    ];
+    expect(estimateCourtCapacity(availability, existing)).toBe(6);
+  });
+  it('identifies both draft games involved in venue and rest conflicts', () => {
+    const games = [game(), game({ homeTeamId: 'a', awayTeamId: 'c', scheduledAt: '2026-11-01T01:30:00.000Z' })];
+    const issues = scheduleIssues(games, availability, []);
+    expect(new Set(issues.map((issue) => issue.index))).toEqual(new Set([0, 1]));
+    expect(issues.map((issue) => issue.message).join(' ')).toMatch(/team.*rest/i);
+    expect(issues.map((issue) => issue.message).join(' ')).toMatch(/venue.*booked/i);
+  });
+  it('merges overlapping windows and counts elapsed time across DST', () => {
+    const spring = { ...availability, startDate: '2026-03-08', endDate: '2026-03-08', timeZone: 'America/New_York', venueIds: ['court-a'], windows: [{ weekdays: [0], startTime: '01:30', endTime: '03:30' }, { weekdays: [0], startTime: '03:00', endTime: '04:30' }] };
+    expect(estimateCourtCapacity(spring, [])).toBe(2);
+    const fall = { ...spring, startDate: '2026-11-01', endDate: '2026-11-01', windows: [{ weekdays: [0], startTime: '01:00', endTime: '02:00' }] };
+    expect(estimateCourtCapacity(fall, [])).toBe(2);
+  });
+  it('marks both the earlier and later games when round order is broken', () => {
+    const games = [game({ scheduledAt: '2026-11-01T03:00:00Z' }), game({ homeTeamId: 'c', awayTeamId: 'd', round: 2, scheduledAt: '2026-11-01T02:00:00Z' })];
+    const issues = scheduleIssues(games, availability, []);
+    expect(issues.filter((issue) => /round sequence/i.test(issue.message)).map((issue) => issue.index).sort()).toEqual([0, 1]);
+  });
 });
 
 describe('roundRobin', () => {
