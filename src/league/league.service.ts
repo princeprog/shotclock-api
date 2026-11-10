@@ -185,10 +185,13 @@ export class LeagueService {
     const season = await this.season(user, dto.seasonId, tx, true);
     if (season.league_id !== league) throw new NotFoundException();
     this.editable(season.status);
-    const division = await this.divisionForSeason(season.id, dto.divisionId, tx);
+    if (dto.divisionId && dto.divisionIds) throw new BadRequestException('Choose either divisionId or divisionIds');
+    const divisionIds = dto.divisionIds ?? [dto.divisionId];
+    const divisions: Awaited<ReturnType<typeof this.divisionForSeason>>[] = [];
+    for (const id of divisionIds) divisions.push(await this.divisionForSeason(season.id, id, tx));
     const team = await tx.insertInto('league.teams').values({ league_id: league, name: this.name(dto.name), abbreviation: dto.abbreviation?.trim() || null }).returningAll().executeTakeFirstOrThrow();
-    await tx.insertInto('league.season_teams').values({ season_id: dto.seasonId, division_id: division.id, league_id: league, team_id: team.id, status: 'active' }).execute();
-    return { ...team, division_id: division.id, division_name: division.name };
+    await tx.insertInto('league.season_teams').values(divisions.map((division) => ({ season_id: dto.seasonId, division_id: division.id, league_id: league, team_id: team.id, status: 'active' }))).execute();
+    return { ...team, division_id: divisions[0].id, division_name: divisions[0].name };
   }); }
   async getTeam(user: string, id: string) { return this.team(user, id); }
   async editTeam(user: string, id: string, dto: TeamDto) { await this.team(user, id); return this.db.updateTable('league.teams').set({ name: this.name(dto.name), abbreviation: dto.abbreviation?.trim() || null, updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow(); }

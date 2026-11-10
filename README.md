@@ -16,6 +16,8 @@ The authenticated `/league` API provides organization, league, season, division,
 
 Seasons transition from draft to active to completed. Each new season starts with an Open division; teams register once per division and games and standings stay within that division. Age-limited divisions compare player birth dates against the season start date; `minAge` is inclusive, `maxAge` is exclusive, and a division may use either or both. Reusable organization players can hold one roster registration per season; draft corrections are allowed and activation locks transfers. Completion requires at least one game and every game to be final; scores can be corrected afterward. The MVP excludes invitations, player statistics, certificate uploads, and live scoring; empty draft divisions, roster registrations, and team registrations without players or games can be removed. Draft team registrations can move between divisions if their players are eligible and no games depend on them. `src/league/league.integration.spec.ts` runs with the same disposable database settings as the authentication integration suite.
 
+Team creation accepts `divisionIds` to register a new team in one or more divisions in a single transaction. Each registration has a separate roster. The existing single `divisionId` remains supported; a player record can still join only one roster per season.
+
 ## Authentication contract
 
 All bodies are JSON. Emails are case-normalized. New passwords must be 12–128 characters. Unknown properties and malformed input are rejected. `name` is optional and at most 120 characters.

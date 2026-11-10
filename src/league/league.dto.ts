@@ -1,4 +1,4 @@
-import { IsDateString, IsIn, IsInt, IsOptional, IsString, IsUUID, Max, MaxLength, Min, MinLength, ValidateIf } from 'class-validator';
+import { ArrayNotEmpty, ArrayUnique, IsArray, IsDateString, IsIn, IsInt, IsOptional, IsString, IsUUID, Max, MaxLength, Min, MinLength, ValidateIf } from 'class-validator';
 import { Type } from 'class-transformer';
 
 const positions = ['point_guard', 'shooting_guard', 'small_forward', 'power_forward', 'center'];
@@ -15,6 +15,7 @@ export class TeamDto extends NameDto {
 export class CreateTeamDto extends TeamDto {
   @IsUUID() seasonId!: string;
   @IsOptional() @IsUUID() divisionId?: string;
+  @IsOptional() @IsArray() @ArrayNotEmpty() @ArrayUnique() @IsUUID('all', { each: true }) divisionIds?: string[];
 }
 export class DivisionDto extends NameDto {
   @IsOptional() @IsInt() @Min(1) @Max(150) minAge?: number | null;
