@@ -3,6 +3,7 @@ import { AuthService } from '../auth/auth.service';
 import { CreateTeamDto, MoveTeamRegistrationDto, DivisionDto, DivisionFilterDto, PlayerDto, UpdateDivisionDto, UpdatePlayerDto, GameDto, GameFilterDto, JerseyDto, LeagueDto, NameDto, OrganizationSeasonFilterDto, OrganizationTeamFilterDto, OrganizationVenueFilterDto, RosterDto, RosterFilterDto, ScoreDto, SeasonDto, SeasonFilterDto, StatusDto, TeamDto, TeamRegistrationDto, VenueDto } from './league.dto';
 import { LeagueService } from './league.service';
 import { ScheduleService } from './schedule.service';
+import { ForfeitDto } from './forfeit.dto';
 import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto } from './league.dto';
 
 @Controller('league')
@@ -58,8 +59,10 @@ export class LeagueController {
   @Get('seasons/:id/games') async games(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Query() filters: GameFilterDto) { const user = await this.user(h); const { divisionId, ...other } = filters; return Object.values(other).some((value) => value !== undefined) ? this.league.filteredGames(user, id, filters) : this.league.games(user, id, divisionId); }
   @Post('seasons/:id/games') async createGame(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: GameDto) { return this.league.createGame(await this.user(h), id, dto); }
   @Patch('games/:id') async editGame(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: GameDto) { return this.league.editGame(await this.user(h), id, dto); }
+  @Get('games/:id/schedule-history') async scheduleHistory(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.league.scheduleHistory(await this.user(h), id); }
   @Delete('games/:id') async deleteGame(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.schedule.remove(await this.user(h), id); }
   @Post('games/:id/score') async score(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: ScoreDto) { return this.league.score(await this.user(h), id, dto); }
+  @Post('games/:id/forfeit') async forfeit(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: ForfeitDto) { return this.league.forfeit(await this.user(h), id, dto); }
   @Get('seasons/:id/standings') async standings(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Query() filters: DivisionFilterDto) { return this.league.standings(await this.user(h), id, filters.divisionId); }
   @Get('seasons/:id/dashboard') async dashboard(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Query() filters: DivisionFilterDto) { return this.league.dashboard(await this.user(h), id, filters.divisionId); }
 }

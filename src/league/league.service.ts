@@ -3,6 +3,7 @@ import { sql, type Kysely, type Selectable, type Transaction } from 'kysely';
 import { DatabaseService } from '../database/database.service';
 import type { DB } from '../database/db';
 import { calculateStandings } from './standings';
+import { ForfeitDto } from './forfeit.dto';
 import { paginationMeta } from '../common/pagination';
 import { CreateTeamDto, DivisionDto, PlayerDto, UpdateDivisionDto, UpdatePlayerDto, GameDto, GameFilterDto, JerseyDto, LeagueDto, NameDto, OrganizationSeasonFilterDto, OrganizationTeamFilterDto, OrganizationVenueFilterDto, RosterDto, RosterFilterDto, ScoreDto, SeasonDto, SeasonFilterDto, TeamDto, VenueDto } from './league.dto';
 
@@ -398,7 +399,7 @@ export class LeagueService {
     if (dto.venueId) { const venue = await tx.selectFrom('league.venues').select('id').where('id', '=', dto.venueId).where('league_id', '=', season.league_id).executeTakeFirst(); if (!venue) throw new NotFoundException(); }
     return { division_id: teams[0].division_id, home_season_team_id: dto.homeTeamId, away_season_team_id: dto.awayTeamId, scheduled_at: new Date(dto.scheduledAt), venue_id: dto.venueId ?? null };
   }
-  async createGame(user: string, id: string, dto: GameDto) { return this.db.transaction().execute(async (tx) => { const season = await this.season(user, id, tx, true); this.editable(season.status); await this.scheduleLock(season.league_id, tx); const values = await this.gameValues(user, season, dto, tx); return tx.insertInto('league.games').values({ season_id: id, ...values, home_score: null, away_score: null }).returningAll().executeTakeFirstOrThrow(); }); }
+  async createGame(user: string, id: string, dto: GameDto) { return this.db.transaction().execute(async (tx) => { const season = await this.season(user, id, tx, true); this.editable(season.status); await this.scheduleLock(season.league_id, tx); const values = await this.gameValues(user, season, dto, tx); return tx.insertInto('league.games').values({ season_id: id, ...values, duration_minutes: dto.durationMinutes ?? null, home_score: null, away_score: null }).returningAll().executeTakeFirstOrThrow(); }); }
   async editGame(user: string, id: string, dto: GameDto) { return this.db.transaction().execute(async (tx) => {
     const initial = await tx.selectFrom('league.games').select(['season_id']).where('id', '=', id).executeTakeFirst(); if (!initial) throw new NotFoundException();
     const season = await this.season(user, initial.season_id, tx, true); this.editable(season.status); await this.scheduleLock(season.league_id, tx);
@@ -406,8 +407,44 @@ export class LeagueService {
     if (game.status !== 'scheduled') throw new BadRequestException('A completed game cannot be rescheduled');
     if (game.schedule_id && (game.home_season_team_id !== dto.homeTeamId || game.away_season_team_id !== dto.awayTeamId)) throw new BadRequestException('Generated game participants cannot be changed');
     const values = await this.gameValues(user, season, dto, tx);
-    return tx.updateTable('league.games').set({ ...values, updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow();
+    const duration = dto.durationMinutes ?? game.duration_minutes ?? 60;
+    const scheduleChanged = (game.scheduled_at ? new Date(game.scheduled_at).getTime() : null) !== values.scheduled_at.getTime()
+      || game.venue_id !== values.venue_id || (dto.durationMinutes !== undefined && game.duration_minutes !== dto.durationMinutes);
+    const participantsChanged = game.home_season_team_id !== values.home_season_team_id || game.away_season_team_id !== values.away_season_team_id;
+    if (!scheduleChanged && !participantsChanged) return game;
+
+    const start = values.scheduled_at.getTime();
+    const end = start + duration * 60_000;
+    const existing = await tx.selectFrom('league.games as g').innerJoin('league.seasons as s', 's.id', 'g.season_id')
+      .select(['g.id', 'g.home_season_team_id', 'g.away_season_team_id', 'g.scheduled_at', 'g.venue_id', 'g.duration_minutes'])
+      .where('s.league_id', '=', season.league_id).where('g.id', '!=', id).where('g.scheduled_at', 'is not', null)
+      .where('g.scheduled_at', '<', new Date(end)).execute();
+    const teams = [values.home_season_team_id, values.away_season_team_id];
+    for (const other of existing) {
+      if (!other.scheduled_at || other.id === id) continue;
+      const otherStart = new Date(other.scheduled_at).getTime();
+      if (otherStart >= end || otherStart + (other.duration_minutes ?? duration) * 60_000 <= start) continue;
+      if ((values.venue_id && values.venue_id === other.venue_id) || teams.includes(other.home_season_team_id) || teams.includes(other.away_season_team_id)) {
+        throw new BadRequestException('Game conflicts with another game at this venue or involving a team');
+      }
+    }
+    const updated = await tx.updateTable('league.games').set({ ...values, ...(scheduleChanged ? { duration_minutes: duration } : {}), updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow();
+    if (scheduleChanged) await tx.insertInto('league.game_schedule_changes').values({
+      game_id: id, changed_by_user_id: user, old_scheduled_at: game.scheduled_at, new_scheduled_at: values.scheduled_at,
+      old_venue_id: game.venue_id, new_venue_id: values.venue_id, old_duration_minutes: game.duration_minutes, new_duration_minutes: duration,
+    }).execute();
+    return updated;
   }); }
+  async scheduleHistory(user: string, id: string) {
+    const game = await this.db.selectFrom('league.games').select('season_id').where('id', '=', id).executeTakeFirst();
+    if (!game) throw new NotFoundException();
+    await this.season(user, game.season_id);
+    return this.db.selectFrom('league.game_schedule_changes as c')
+      .leftJoin('league.venues as old_venue', 'old_venue.id', 'c.old_venue_id')
+      .leftJoin('league.venues as new_venue', 'new_venue.id', 'c.new_venue_id')
+      .select(['c.id', 'c.old_scheduled_at', 'c.new_scheduled_at', 'c.old_venue_id', 'c.new_venue_id', 'old_venue.name as old_venue_name', 'new_venue.name as new_venue_name', 'c.old_duration_minutes', 'c.new_duration_minutes', 'c.changed_at'])
+      .where('c.game_id', '=', id).orderBy('c.changed_at', 'desc').orderBy('c.id', 'desc').execute();
+  }
   private async preliminaryStandings(db: Database, seasonId: string, divisionId: string, proposed?: { game: Selectable<DB['league.games']>; score: ScoreDto }) {
     const teams = await db.selectFrom('league.season_teams as st').innerJoin('league.teams as t', 't.id', 'st.team_id').select(['st.id', 't.name']).where('st.season_id', '=', seasonId).where('st.division_id', '=', divisionId).execute();
     const games = await db.selectFrom('league.games').select(['id', 'home_season_team_id', 'away_season_team_id', 'home_score', 'away_score']).where('season_id', '=', seasonId).where('division_id', '=', divisionId).where('stage', '=', 'preliminary').where('status', '=', 'completed').where('home_score', 'is not', null).where('away_score', 'is not', null).execute();
@@ -420,24 +457,40 @@ export class LeagueService {
     if (seeds.length < 4) return JSON.stringify(seeds);
     return JSON.stringify([[seeds[0], seeds[3]].sort(), [seeds[1], seeds[2]].sort()].sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1])));
   }
+  private async writeGameResult(tx: Transaction<DB>, seasonId: string, game: Selectable<DB['league.games']>, dto: ScoreDto, forfeitingTeamId: string | null) {
+    if (dto.homeScore === dto.awayScore) throw new BadRequestException('Final scores cannot be tied');
+    if (game.stage === 'preliminary') {
+      const semifinal = await tx.selectFrom('league.games').select('id').where('season_id', '=', seasonId).where('division_id', '=', game.division_id).where('stage', '=', 'semifinal').executeTakeFirst();
+      if (semifinal) {
+        const before = await this.preliminaryStandings(tx, seasonId, game.division_id);
+        const after = await this.preliminaryStandings(tx, seasonId, game.division_id, { game, score: dto });
+        if (this.semifinalPairings(before) !== this.semifinalPairings(after)) throw new BadRequestException('Score would change existing semifinal pairings');
+      }
+    } else if (game.stage === 'semifinal' && game.status === 'completed' && game.home_score !== null && game.away_score !== null && (game.home_score > game.away_score) !== (dto.homeScore > dto.awayScore)) {
+      const next = await tx.selectFrom('league.games').select('id').where('season_id', '=', seasonId).where('division_id', '=', game.division_id).where('schedule_id', '=', game.schedule_id).where('stage', 'in', ['final', 'third_place']).executeTakeFirst();
+      if (next) throw new BadRequestException('Semifinal winner cannot change after the final or third-place game is created');
+    }
+    return tx.updateTable('league.games').set({ home_score: dto.homeScore, away_score: dto.awayScore, forfeited_by_season_team_id: forfeitingTeamId, status: 'completed', updated_at: new Date() }).where('id', '=', game.id).returningAll().executeTakeFirstOrThrow();
+  }
   async score(user: string, id: string, dto: ScoreDto) { return this.db.transaction().execute(async (tx) => {
     const initial = await tx.selectFrom('league.games').select(['season_id']).where('id', '=', id).executeTakeFirst(); if (!initial) throw new NotFoundException();
     const season = await this.season(user, initial.season_id, tx, true);
     const game = await tx.selectFrom('league.games').selectAll().where('id', '=', id).executeTakeFirstOrThrow();
     if (season.status === 'draft' || (season.status === 'completed' && game.status !== 'completed')) throw new BadRequestException('Season is not active');
-    if (dto.homeScore === dto.awayScore) throw new BadRequestException('Final scores cannot be tied');
-    if (game.stage === 'preliminary') {
-      const semifinal = await tx.selectFrom('league.games').select('id').where('season_id', '=', season.id).where('division_id', '=', game.division_id).where('stage', '=', 'semifinal').executeTakeFirst();
-      if (semifinal) {
-        const before = await this.preliminaryStandings(tx, season.id, game.division_id);
-        const after = await this.preliminaryStandings(tx, season.id, game.division_id, { game, score: dto });
-        if (this.semifinalPairings(before) !== this.semifinalPairings(after)) throw new BadRequestException('Score would change existing semifinal pairings');
-      }
-    } else if (game.stage === 'semifinal' && game.status === 'completed' && game.home_score !== null && game.away_score !== null && (game.home_score > game.away_score) !== (dto.homeScore > dto.awayScore)) {
-      const next = await tx.selectFrom('league.games').select('id').where('season_id', '=', season.id).where('division_id', '=', game.division_id).where('schedule_id', '=', game.schedule_id).where('stage', 'in', ['final', 'third_place']).executeTakeFirst();
-      if (next) throw new BadRequestException('Semifinal winner cannot change after the final or third-place game is created');
-    }
-    return tx.updateTable('league.games').set({ home_score: dto.homeScore, away_score: dto.awayScore, status: 'completed', updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow();
+    return this.writeGameResult(tx, season.id, game, dto, null);
+  }); }
+  async forfeit(user: string, id: string, dto: ForfeitDto) { return this.db.transaction().execute(async (tx) => {
+    const initial = await tx.selectFrom('league.games').select('season_id').where('id', '=', id).executeTakeFirst();
+    if (!initial) throw new NotFoundException();
+    const season = await this.season(user, initial.season_id, tx, true);
+    const game = await tx.selectFrom('league.games').selectAll().where('id', '=', id).executeTakeFirstOrThrow();
+    if (season.status === 'draft' || (season.status === 'completed' && game.status !== 'completed')) throw new BadRequestException('Season is not active');
+    if (game.status === 'completed' && !game.forfeited_by_season_team_id) throw new BadRequestException('A played result cannot be marked as a forfeit');
+    if (dto.forfeitingTeamId !== game.home_season_team_id && dto.forfeitingTeamId !== game.away_season_team_id) throw new BadRequestException('The forfeiting team must be a participant in this game');
+    const stats = await tx.selectFrom('league.player_game_stats').select('id').where('game_id', '=', id).executeTakeFirst();
+    if (stats) throw new BadRequestException('A game with player statistics cannot be marked as a forfeit');
+    const homeForfeits = dto.forfeitingTeamId === game.home_season_team_id;
+    return this.writeGameResult(tx, season.id, game, { homeScore: homeForfeits ? 0 : 20, awayScore: homeForfeits ? 20 : 0 }, dto.forfeitingTeamId);
   }); }
   async standings(user: string, season: string, divisionId?: string) {
     await this.season(user, season);

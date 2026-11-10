@@ -78,6 +78,7 @@ export interface LeagueGames {
   created_at: Generated<Timestamp>;
   division_id: string;
   duration_minutes: number | null;
+  forfeited_by_season_team_id: string | null;
   home_score: number | null;
   home_season_team_id: string;
   id: Generated<string>;
@@ -89,6 +90,19 @@ export interface LeagueGames {
   status: Generated<string>;
   updated_at: Generated<Timestamp>;
   venue_id: string | null;
+}
+
+export interface LeagueGameScheduleChanges {
+  changed_at: Generated<Timestamp>;
+  changed_by_user_id: string;
+  game_id: string;
+  id: Generated<string>;
+  new_duration_minutes: number | null;
+  new_scheduled_at: Timestamp;
+  new_venue_id: string | null;
+  old_duration_minutes: number | null;
+  old_scheduled_at: Timestamp | null;
+  old_venue_id: string | null;
 }
 
 export interface LeagueLeagueMembers {
@@ -207,6 +221,7 @@ export interface DB {
   "auth.users": AuthUsers;
   "league.division_schedules": LeagueDivisionSchedules;
   "league.divisions": LeagueDivisions;
+  "league.game_schedule_changes": LeagueGameScheduleChanges;
   "league.games": LeagueGames;
   "league.league_members": LeagueLeagueMembers;
   "league.leagues": LeagueLeagues;

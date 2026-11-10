@@ -93,6 +93,7 @@ export class GameDto {
   @IsUUID() awayTeamId!: string;
   @IsDateString({ strict: true }) scheduledAt!: string;
   @IsOptional() @IsUUID() venueId?: string | null;
+  @ValidateIf((_object, value) => value !== undefined) @IsInt() @Min(1) @Max(1440) durationMinutes?: number;
 }
 export class GameFilterDto extends DivisionFilterDto {
   @IsOptional() @IsString() @MaxLength(120) search?: string;
