@@ -96,6 +96,7 @@ export class GameDto {
   @ValidateIf((_object, value) => value !== undefined) @IsInt() @Min(1) @Max(1440) durationMinutes?: number;
 }
 export class GameFilterDto extends DivisionFilterDto {
+  @IsOptional() @IsIn(['season']) scope?: 'season';
   @IsOptional() @IsString() @MaxLength(120) search?: string;
   @IsOptional() @IsIn(['scheduled', 'completed']) status?: 'scheduled' | 'completed';
   @IsOptional() @IsUUID() teamId?: string;
@@ -149,4 +150,16 @@ export class ScheduleSaveDto extends SchedulePreviewDto {
 }
 export class PlayoffSaveDto extends ScheduleAvailabilityRequestDto {
   @IsArray() @ArrayNotEmpty() @ArrayMaxSize(2) @ValidateNested({ each: true }) @Type(() => ScheduleGameDto) games!: ScheduleGameDto[];
+}
+export class SeasonScheduleGameDto extends ScheduleGameDto {
+  @IsUUID() divisionId!: string;
+  @IsOptional() @IsString() @MaxLength(120) divisionName?: string;
+}
+export class SeasonScheduleSaveDto extends SchedulePreviewDto {
+  @IsArray() @ArrayNotEmpty() @ArrayUnique() @ArrayMaxSize(5000) @IsUUID('all', { each: true }) divisionIds!: string[];
+  @IsArray() @ArrayNotEmpty() @ArrayMaxSize(5000) @ValidateNested({ each: true }) @Type(() => SeasonScheduleGameDto) games!: SeasonScheduleGameDto[];
+}
+export class SeasonPlayoffSaveDto extends ScheduleAvailabilityRequestDto {
+  @IsArray() @ArrayNotEmpty() @ArrayUnique() @ArrayMaxSize(5000) @IsUUID('all', { each: true }) divisionIds!: string[];
+  @IsArray() @ArrayNotEmpty() @ArrayMaxSize(5000) @ValidateNested({ each: true }) @Type(() => SeasonScheduleGameDto) games!: SeasonScheduleGameDto[];
 }

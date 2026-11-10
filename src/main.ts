@@ -6,8 +6,8 @@ import { AppModule } from './app.module';
 
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
-  // A reviewed schedule can contain hundreds of games; keep the request bounded.
-  app.useBodyParser('json', { limit: '256kb' });
+  // A reviewed season schedule can contain games from multiple divisions.
+  app.useBodyParser('json', { limit: '2mb' });
   app.use(helmet());
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
   const origins = (process.env.CORS_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean);

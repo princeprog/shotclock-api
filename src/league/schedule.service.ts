@@ -2,7 +2,7 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { sql, type Kysely, type Transaction } from 'kysely';
 import { DatabaseService } from '../database/database.service';
 import type { DB } from '../database/db';
-import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto } from './league.dto';
+import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffSaveDto, SeasonScheduleSaveDto } from './league.dto';
 import { roundRobin, scheduleMatches, SchedulePlacementError, validateSchedule, type ExistingGame, type ScheduleAvailability, type ScheduleGame, type ScheduleMatch } from './schedule-algorithm';
 import { calculateStandings } from './standings';
 
@@ -85,6 +85,7 @@ export class ScheduleService {
         const away = teams.find((team) => team.id === error.match.awayTeamId)?.name;
         throw new BadRequestException(error.withTeamNames(home, away));
       }
+      if (error instanceof Error && /work limit/i.test(error.message)) throw new BadRequestException('This schedule is too large to process safely. Try a single round robin or fewer venues. No games were saved.');
       throw new BadRequestException(error instanceof Error ? error.message : 'Invalid schedule');
     }
   }
@@ -121,6 +122,132 @@ export class ScheduleService {
     }
     return { hasSchedule: !!schedule, canGeneratePreliminary: context.status !== 'completed' && !schedule && !prelim.length,
       playoffStage: context.status === 'completed' ? null : playoffStage, playoffs: !!schedule?.playoffs, thirdPlace: !!schedule?.third_place };
+  }
+
+  private async seasonContext(user: string, seasonId: string, db: Database, lock = false) {
+    let query = db.selectFrom('league.seasons as s').innerJoin('league.leagues as l', 'l.id', 's.league_id')
+      .innerJoin('league.organizations as o', 'o.id', 'l.organization_id')
+      .select(['s.id as seasonId', 's.league_id as leagueId', 's.status', sql<string | null>`s.start_date::text`.as('startDate'), sql<string | null>`s.end_date::text`.as('endDate')])
+      .where('s.id', '=', seasonId).where('o.owner_user_id', '=', user);
+    if (lock) query = query.forUpdate('s');
+    const season = await query.executeTakeFirst();
+    if (!season) throw new NotFoundException();
+    return season;
+  }
+
+  private async seasonDivisions(db: Database, season: Awaited<ReturnType<ScheduleService['seasonContext']>>) {
+    const divisions = await db.selectFrom('league.divisions').select(['id', 'name']).where('season_id', '=', season.seasonId).orderBy('name').orderBy('id').execute();
+    return Promise.all(divisions.map(async (division) => {
+      const context = { ...season, divisionId: division.id };
+      const [teams, schedule, games] = await Promise.all([
+        this.teams(db, division.id),
+        db.selectFrom('league.division_schedules').selectAll().where('division_id', '=', division.id).executeTakeFirst(),
+        db.selectFrom('league.games').select(['stage', 'status']).where('division_id', '=', division.id).execute(),
+      ]);
+      let playoff: Awaited<ReturnType<ScheduleService['playoffMatches']>> | null = null;
+      let playoffReason = !schedule?.playoffs ? 'Playoffs are not enabled.' : 'Complete the previous round before scheduling playoffs.';
+      if (schedule?.playoffs && season.status !== 'completed') {
+        try { playoff = await this.playoffMatches(db, context); }
+        catch (error) {
+          if (!(error instanceof BadRequestException)) throw error;
+          playoffReason = error.message;
+        }
+      }
+      const preliminaryReason = schedule || games.some((game) => game.stage === 'preliminary')
+        ? 'This division already has preliminary games or a generated schedule.'
+        : teams.length < 2 ? 'At least two teams are required.'
+          : teams.length > 32 ? 'A generated schedule supports at most 32 teams.' : undefined;
+      const playoffStage = playoff ? (playoff.matches[0]?.stage === 'semifinal' ? 'semifinal' as const : 'final' as const) : null;
+      return { id: division.id, name: division.name, teamCount: teams.length, hasSchedule: !!schedule,
+        canGeneratePreliminary: season.status !== 'completed' && !preliminaryReason,
+        playoffs: !!schedule?.playoffs, thirdPlace: !!schedule?.third_place, playoffStage,
+        preliminaryReason, playoffReason: playoff ? undefined : playoffReason, context, teams, playoff };
+    }));
+  }
+
+  async seasonStatus(user: string, seasonId: string) {
+    const season = await this.seasonContext(user, seasonId, this.db);
+    const divisions = await this.seasonDivisions(this.db, season);
+    return { divisions: divisions.map(({ context: _context, teams: _teams, playoff: _playoff, ...division }) => division) };
+  }
+
+  private async seasonPlan(db: Database, season: Awaited<ReturnType<ScheduleService['seasonContext']>>, input: ScheduleAvailabilityRequestDto | SchedulePreviewDto, mode: 'preliminary' | 'playoffs') {
+    if (season.status === 'completed') throw new BadRequestException('Completed seasons cannot be changed');
+    if (mode === 'preliminary' && 'thirdPlace' in input && input.thirdPlace && !input.playoffs) throw new BadRequestException('A third-place game requires playoffs');
+    await this.validateVenues(db, season.leagueId, input.availability);
+    const divisions = await this.seasonDivisions(db, season);
+    const included = divisions.filter((division) => mode === 'preliminary' ? division.canGeneratePreliminary : !!division.playoff);
+    const details = divisions.map((division) => {
+      const eligible = included.includes(division);
+      const reason = eligible ? undefined : mode === 'preliminary' ? division.preliminaryReason : division.playoffReason;
+      const playoffs = mode === 'preliminary' ? !!('playoffs' in input && input.playoffs && division.teamCount >= 4) : division.playoffs;
+      return { id: division.id, name: division.name, teamCount: division.teamCount, ...(reason ? { reason } : {}), playoffs,
+        ...(division.playoffStage ? { playoffStage: division.playoffStage } : {}),
+        ...(eligible && mode === 'preliminary' && 'playoffs' in input && input.playoffs && !playoffs ? { notice: 'Fewer than four teams; round robin only.' } : {}) };
+    });
+    if (!included.length) throw new BadRequestException(mode === 'preliminary' ? 'No divisions are eligible for schedule generation.' : 'No divisions are ready to schedule playoff games.');
+    const matches = included.flatMap((division) => {
+      const fixtures = mode === 'preliminary' ? roundRobin(division.teams.map((team) => team.id), (input as SchedulePreviewDto).format) : division.playoff!.matches;
+      return fixtures.map((match) => ({ ...match, divisionId: division.id }));
+    });
+    if (matches.length > 5000) throw new BadRequestException('This schedule exceeds the 5,000-game batch limit.');
+    return { included, details, matches };
+  }
+
+  private seasonPlacement(matches: (ScheduleMatch & { divisionId: string })[], availability: ScheduleAvailability, existing: ExistingGame[], divisions: { id: string; name: string; teams: { id: string; name: string }[] }[], mode: 'preliminary' | 'playoffs') {
+    // Playoff divisions can be at different stages, so only preliminary rounds share an ordering barrier.
+    const placementMatches = mode === 'playoffs' ? matches.map((match) => ({ ...match, round: 1 })) : matches;
+    try {
+      return scheduleMatches(placementMatches, availability, existing).map((game, index) => ({ ...game, round: matches[index].round, divisionId: matches[index].divisionId }));
+    } catch (error) {
+      if (error instanceof SchedulePlacementError) {
+        const division = divisions.find((item) => item.teams.some((team) => team.id === error.match.homeTeamId));
+        const home = division?.teams.find((team) => team.id === error.match.homeTeamId)?.name;
+        const away = division?.teams.find((team) => team.id === error.match.awayTeamId)?.name;
+        throw new BadRequestException(`${division?.name ?? 'Division'}: ${error.withTeamNames(home, away)}`);
+      }
+      if (error instanceof Error && /work limit/i.test(error.message)) throw new BadRequestException('This schedule is too large to process safely. Try a single round robin or fewer venues. No games were saved.');
+      throw new BadRequestException(error instanceof Error ? error.message : 'Invalid schedule');
+    }
+  }
+
+  async previewSeason(user: string, seasonId: string, input: ScheduleAvailabilityRequestDto | SchedulePreviewDto, mode: 'preliminary' | 'playoffs') {
+    const season = await this.seasonContext(user, seasonId, this.db);
+    const plan = await this.seasonPlan(this.db, season, input, mode);
+    const existing = await this.existing(this.db, season.leagueId);
+    const games = this.seasonPlacement(plan.matches, input.availability, existing, plan.included, mode);
+    const names = new Map(plan.included.flatMap((division) => division.teams.map((team) => [team.id, team.name] as const)));
+    const divisionNames = new Map(plan.included.map((division) => [division.id, division.name]));
+    return { games: games.map((game) => ({ ...game, homeName: names.get(game.homeTeamId), awayName: names.get(game.awayTeamId), divisionName: divisionNames.get(game.divisionId) })),
+      warnings: this.warnings(games, plan.included[0].context, input.availability.timeZone), divisions: plan.details };
+  }
+
+  async saveSeason(user: string, seasonId: string, input: SeasonScheduleSaveDto | SeasonPlayoffSaveDto, mode: 'preliminary' | 'playoffs') {
+    return this.db.transaction().execute(async (tx) => {
+      const season = await this.seasonContext(user, seasonId, tx, true);
+      await this.leagueLock(tx, season.leagueId);
+      const plan = await this.seasonPlan(tx, season, input, mode);
+      const expectedIds = plan.included.map((division) => division.id).sort();
+      const submittedIds = [...input.divisionIds].sort();
+      if (expectedIds.length !== submittedIds.length || expectedIds.some((id, index) => id !== submittedIds[index])) throw new BadRequestException('Eligible divisions changed; generate a new preview');
+      for (const division of plan.included) this.sameMatches(plan.matches.filter((match) => match.divisionId === division.id), input.games.filter((game) => game.divisionId === division.id));
+      if (input.games.some((game) => !expectedIds.includes(game.divisionId))) throw new BadRequestException('The schedule has changed; generate a new preview');
+      const existing = await this.existing(tx, season.leagueId);
+      this.trySchedule(() => validateSchedule(mode === 'playoffs' ? input.games.map((game) => ({ ...game, round: 1 })) : input.games, input.availability, existing));
+      for (const division of plan.included) {
+        let scheduleId = division.playoff?.schedule.id;
+        if (mode === 'preliminary') {
+          const settings = input as SeasonScheduleSaveDto;
+          const playoffs = settings.playoffs && division.teamCount >= 4;
+          const schedule = await tx.insertInto('league.division_schedules').values({ division_id: division.id, format: settings.format, playoffs,
+            third_place: playoffs && settings.thirdPlace, team_ids: division.teams.map((team) => team.id) }).returning('id').executeTakeFirstOrThrow();
+          scheduleId = schedule.id;
+        }
+        if (!scheduleId) throw new BadRequestException('The playoff schedule changed; generate a new preview');
+        await this.insert(tx, division.context, scheduleId, input.games.filter((game) => game.divisionId === division.id));
+      }
+      return { saved: input.games.length };
+    });
   }
 
   async preview(user: string, divisionId: string, input: SchedulePreviewDto) {
