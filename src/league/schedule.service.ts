@@ -3,7 +3,7 @@ import { sql, type Kysely, type Transaction } from 'kysely';
 import { DatabaseService } from '../database/database.service';
 import type { DB } from '../database/db';
 import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto } from './league.dto';
-import { roundRobin, scheduleMatches, validateSchedule, type ExistingGame, type ScheduleAvailability, type ScheduleGame, type ScheduleMatch } from './schedule-algorithm';
+import { roundRobin, scheduleMatches, SchedulePlacementError, validateSchedule, type ExistingGame, type ScheduleAvailability, type ScheduleGame, type ScheduleMatch } from './schedule-algorithm';
 import { calculateStandings } from './standings';
 
 type Database = Kysely<DB> | Transaction<DB>;
@@ -78,8 +78,13 @@ export class ScheduleService {
     if (left.length !== right.length || left.some((value, index) => value !== right[index])) throw new BadRequestException('The schedule has changed; generate a new preview');
   }
 
-  private trySchedule<T>(fn: () => T): T {
+  private trySchedule<T>(fn: () => T, teams: { id: string; name: string }[] = []): T {
     try { return fn(); } catch (error) {
+      if (error instanceof SchedulePlacementError) {
+        const home = teams.find((team) => team.id === error.match.homeTeamId)?.name;
+        const away = teams.find((team) => team.id === error.match.awayTeamId)?.name;
+        throw new BadRequestException(error.withTeamNames(home, away));
+      }
       throw new BadRequestException(error instanceof Error ? error.message : 'Invalid schedule');
     }
   }
@@ -122,7 +127,7 @@ export class ScheduleService {
     const context = await this.context(user, divisionId, this.db);
     const { teams, matches } = await this.preliminary(this.db, context, input);
     const existing = await this.existing(this.db, context.leagueId);
-    const games = this.trySchedule(() => scheduleMatches(matches, input.availability, existing));
+    const games = this.trySchedule(() => scheduleMatches(matches, input.availability, existing), teams);
     return { games: this.withNames(games, teams), warnings: this.warnings(games, context, input.availability.timeZone) };
   }
 
@@ -179,7 +184,7 @@ export class ScheduleService {
     const { teams, matches } = await this.playoffMatches(this.db, context);
     await this.validateVenues(this.db, context.leagueId, input.availability);
     const existing = await this.existing(this.db, context.leagueId);
-    const games = this.trySchedule(() => scheduleMatches(matches, input.availability, existing));
+    const games = this.trySchedule(() => scheduleMatches(matches, input.availability, existing), teams);
     return { games: this.withNames(games, teams), warnings: this.warnings(games, context, input.availability.timeZone) };
   }
 

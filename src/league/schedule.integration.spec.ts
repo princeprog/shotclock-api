@@ -125,7 +125,9 @@ databaseTests('automatic scheduling against disposable PostgreSQL', () => {
   it('does not persist a partial schedule when playing windows have insufficient capacity', async () => {
     const f = await fixture();
     const availability = { ...f.availability, endDate: '2025-02-01', windows: [{ weekdays: [6], startTime: '08:00', endTime: '09:00' }] };
-    await f.post(`${f.schedule}/preview`, { format: 'single', playoffs: false, thirdPlace: false, availability }).expect(400);
+    const response = await f.post(`${f.schedule}/preview`, { format: 'single', playoffs: false, thirdPlace: false, availability }).expect(400);
+    expect(response.body.message).toMatch(/Could not schedule (Alpha|Bravo|Charlie|Delta) vs (Alpha|Bravo|Charlie|Delta) in round \d+/);
+    expect(response.body.message).toMatch(/1 of 6 games.*5 games remaining.*at most 1 game.*6 games.*No games were saved/);
     expect(await f.games()).toHaveLength(0);
     expect((await f.get(`${f.schedule}/status`).expect(200)).body.hasSchedule).toBe(false);
   });

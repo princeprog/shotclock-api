@@ -103,6 +103,45 @@ describe('roundRobin', () => {
 });
 
 describe('scheduleMatches and validateSchedule', () => {
+  it('explains when selected weekdays do not occur in the date range', () => {
+    const options = { ...availability, windows: [{ weekdays: [1], startTime: '09:00', endTime: '17:00' }] };
+    expect(() => scheduleMatches([match('a', 'b')], options, [])).toThrow(/no selected playing days.*date range/i);
+  });
+
+  it('explains when playing windows are shorter than the game duration', () => {
+    const options = { ...availability, windows: [{ weekdays: [0], startTime: '09:00', endTime: '09:30' }] };
+    expect(() => scheduleMatches([match('a', 'b')], options, [])).toThrow(/longest playing window is 30 minutes.*60-minute game/i);
+  });
+
+  it('reports a proven court-slot shortfall and the number left unscheduled', () => {
+    const options = { ...availability, venueIds: ['court-a'], windows: [{ weekdays: [0], startTime: '09:00', endTime: '10:00' }] };
+    expect(() => scheduleMatches([match('a', 'b'), match('c', 'd')], options, [])).toThrow(/1 of 2 games.*1 game remaining.*at most 1 game.*2 games/i);
+  });
+
+  it('identifies a minimum-rest constraint in the current attempted schedule', () => {
+    const options = { ...availability, venueIds: ['court-a', 'court-b'], windows: [{ weekdays: [0], startTime: '09:00', endTime: '11:00' }] };
+    expect(() => scheduleMatches([match('a', 'b'), match('a', 'c')], options, [])).toThrow(/minimum rest.*30 minutes/i);
+  });
+
+  it('identifies occupied venues in the current attempted schedule', () => {
+    const options = { ...availability, venueIds: ['court-a'], windows: [{ weekdays: [0], startTime: '09:00', endTime: '10:00' }] };
+    const existing: ExistingGame[] = [{ homeTeamId: 'x', awayTeamId: 'y', scheduledAt: '2026-11-01T01:00:00Z', venueId: 'court-a', durationMinutes: 60 }];
+    expect(() => scheduleMatches([match('a', 'b')], options, existing)).toThrow(/selected venues.*occupied/i);
+  });
+
+  it('explains when the round order prevents using an earlier available slot', () => {
+    const options = { ...availability, restMinutes: 0, windows: [{ weekdays: [0], startTime: '09:00', endTime: '10:00' }] };
+    expect(() => scheduleMatches([match('a', 'b', 1), match('c', 'd', 2)], options, [])).toThrow(/slot exists earlier.*round must follow the previous round/i);
+  });
+
+  it('does not claim a single cause when several constraints block the attempt', () => {
+    const options = { ...availability, restMinutes: 0, windows: [{ weekdays: [0], startTime: '09:00', endTime: '10:00' }] };
+    const existing: ExistingGame[] = [
+      { homeTeamId: 'a', awayTeamId: 'x', scheduledAt: '2026-11-01T01:00:00Z', venueId: 'court-a', durationMinutes: 60 },
+      { homeTeamId: 'y', awayTeamId: 'z', scheduledAt: '2026-11-01T01:00:00Z', venueId: 'court-b', durationMinutes: 60 },
+    ];
+    expect(() => scheduleMatches([match('a', 'b')], options, existing)).toThrow(/no slot in this attempt.*different arrangement may also work.*no games were saved/i);
+  });
   it('uses separate Saturday morning and Sunday evening windows', () => {
     const options = {
       ...availability,
@@ -148,7 +187,7 @@ describe('scheduleMatches and validateSchedule', () => {
     ).toThrow(/window/i);
     expect(() =>
       scheduleMatches([match('a', 'b'), match('c', 'd')], options, []),
-    ).toThrow(/capacity/i);
+    ).toThrow(/at most 1 game/i);
   });
 
   it('rejects games that bridge a gap between windows', () => {
@@ -402,7 +441,7 @@ describe('scheduleMatches and validateSchedule', () => {
         },
         [],
       ),
-    ).toThrow(/capacity/i);
+    ).toThrow(/teams are already playing or resting/i);
   });
 
   it('uses local weekdays and changes offset at the spring DST transition', () => {
@@ -435,7 +474,7 @@ describe('scheduleMatches and validateSchedule', () => {
       timeZone: 'America/New_York',
     };
     expect(() => scheduleMatches([match('a', 'b')], spring, [])).toThrow(
-      /capacity/i,
+      /daylight-saving gap/i,
     );
     const fall = {
       ...availability,
