@@ -59,6 +59,8 @@ export class OrganizationTeamFilterDto {
   @IsOptional() @IsUUID() leagueId?: string;
   @IsOptional() @IsUUID() seasonId?: string;
   @IsOptional() @IsUUID() divisionId?: string;
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(1000000) page?: number;
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(100) pageSize?: number;
 }
 export class OrganizationVenueFilterDto {
   @IsOptional() @IsString() @MaxLength(120) search?: string;

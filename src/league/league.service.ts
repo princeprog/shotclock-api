@@ -186,14 +186,22 @@ export class LeagueService {
       .select(['t.id', 't.name', 't.abbreviation', 't.league_id', 'l.name as league_name', 'st.id as season_team_id', 's.id as season_id', 's.name as season_name', 's.status as season_status', 'st.division_id', 'd.name as division_name'])
       .where('l.organization_id', '=', organization);
     if (filters.leagueId) query = query.where('t.league_id', '=', filters.leagueId);
+    const paginated = filters.page !== undefined || filters.pageSize !== undefined;
     if (filters.seasonId) {
       const seasonId = filters.seasonId;
-      query = query.where(({ exists, selectFrom }) => exists(selectFrom('league.season_teams as selected').select('selected.id').whereRef('selected.team_id', '=', 't.id').where('selected.season_id', '=', seasonId)));
+      query = paginated
+        ? query.where('st.season_id', '=', seasonId)
+        : query.where(({ exists, selectFrom }) => exists(selectFrom('league.season_teams as selected').select('selected.id').whereRef('selected.team_id', '=', 't.id').where('selected.season_id', '=', seasonId)));
     }
     if (filters.divisionId) { if (!filters.seasonId) throw new BadRequestException('A season is required when filtering by division'); await this.divisionForSeason(filters.seasonId, filters.divisionId); query = query.where('st.division_id', '=', filters.divisionId); }
     const search = filters.search?.trim();
     if (search) query = query.where('t.name', 'ilike', `%${search.replace(/[\\%_]/g, '\\$&')}%`);
-    return query.orderBy('t.name').orderBy('t.id').orderBy('s.name').orderBy('s.id').execute();
+    const ordered = query.orderBy('t.name').orderBy('t.id').orderBy('s.name').orderBy('s.id');
+    if (!paginated) return ordered.execute();
+    const count = await query.clearSelect().select(({ fn }) => fn.countAll<string>().as('total')).executeTakeFirstOrThrow();
+    const meta = paginationMeta(Number(count.total), filters.page ?? 1, filters.pageSize ?? 10);
+    const items = await ordered.orderBy('st.id').limit(meta.pageSize).offset((meta.page - 1) * meta.pageSize).execute();
+    return { items, ...meta };
   }
   async createTeam(user: string, league: string, dto: CreateTeamDto) { return this.db.transaction().execute(async (tx) => {
     await this.league(user, league, tx);
