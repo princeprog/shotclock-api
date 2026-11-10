@@ -17,10 +17,12 @@ export class CreateTeamDto extends TeamDto {
   @IsOptional() @IsUUID() divisionId?: string;
 }
 export class DivisionDto extends NameDto {
+  @IsOptional() @IsInt() @Min(1) @Max(150) minAge?: number | null;
   @IsOptional() @IsInt() @Min(1) @Max(150) maxAge?: number | null;
 }
 export class UpdateDivisionDto {
   @ValidateIf((_, value) => value !== undefined) @IsString() @MinLength(1) @MaxLength(120) name?: string;
+  @IsOptional() @IsInt() @Min(1) @Max(150) minAge?: number | null;
   @IsOptional() @IsInt() @Min(1) @Max(150) maxAge?: number | null;
 }
 export class DivisionFilterDto {

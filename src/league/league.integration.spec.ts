@@ -27,6 +27,38 @@ databaseTests('league management against isolated PostgreSQL', () => {
     await request(app.getHttpServer()).post('/auth/verify-email').send({ token: emails.find((e) => e.email === email)!.token }).expect(200);
     return `Bearer ${(await request(app.getHttpServer()).post('/auth/login').send({ email, password }).expect(200)).body.accessToken}`;
   }
+  it('enforces inclusive minimum and exclusive maximum ages across division and roster changes', async () => {
+    const owner = await login();
+    const post = (url: string, body: object) => request(app.getHttpServer()).post(`/league${url}`).set('Authorization', owner).send(body);
+    const get = (url: string) => request(app.getHttpServer()).get(`/league${url}`).set('Authorization', owner);
+    const patch = (url: string, body: object) => request(app.getHttpServer()).patch(`/league${url}`).set('Authorization', owner).send(body);
+    const org = (await post('/organizations', { name: 'Age limits' }).expect(201)).body;
+    const league = (await post(`/organizations/${org.id}/leagues`, { name: 'League' }).expect(201)).body;
+    const season = (await post(`/leagues/${league.id}/seasons`, { name: 'Season', startDate: '2025-01-01' }).expect(201)).body;
+    const division = (await post(`/seasons/${season.id}/divisions`, { name: '25 and up', minAge: 25 }).expect(201)).body;
+    expect(division).toMatchObject({ min_age: 25, max_age: null });
+    await post(`/seasons/${season.id}/divisions`, { name: 'Invalid', minAge: 25, maxAge: 25 }).expect(400);
+    await post(`/seasons/${season.id}/divisions`, { name: 'Invalid', minAge: -1 }).expect(400);
+    await post(`/leagues/${league.id}/teams`, { name: 'Team', seasonId: season.id, divisionId: division.id }).expect(201);
+    const team = (await get(`/seasons/${season.id}/teams?divisionId=${division.id}`).expect(200)).body[0];
+    const young = (await post(`/organizations/${org.id}/players`, { firstName: 'Too', lastName: 'Young', dateOfBirth: '2000-01-02' }).expect(201)).body;
+    const eligible = (await post(`/organizations/${org.id}/players`, { firstName: 'Eligible', lastName: 'Player', dateOfBirth: '2000-01-01' }).expect(201)).body;
+    await post(`/season-teams/${team.id}/roster`, { playerId: young.id }).expect(400);
+    const open = (await get(`/seasons/${season.id}/divisions`).expect(200)).body.find((item: { name: string }) => item.name === 'Open');
+    await post(`/leagues/${league.id}/teams`, { name: 'Open team', seasonId: season.id, divisionId: open.id }).expect(201);
+    const openTeam = (await get(`/seasons/${season.id}/teams?divisionId=${open.id}`).expect(200)).body[0];
+    await post(`/season-teams/${openTeam.id}/roster`, { playerId: young.id }).expect(201);
+    await patch(`/season-teams/${openTeam.id}`, { divisionId: division.id }).expect(400);
+    await post(`/season-teams/${team.id}/roster`, { playerId: eligible.id }).expect(201);
+    await patch(`/divisions/${division.id}`, { minAge: 26 }).expect(400);
+    await patch(`/divisions/${division.id}`, { maxAge: 25 }).expect(400);
+    await patch(`/players/${eligible.id}`, { dateOfBirth: '2000-01-02' }).expect(400);
+    await patch(`/seasons/${season.id}`, { name: 'Season', startDate: '2024-12-31' }).expect(400);
+    expect((await patch(`/divisions/${division.id}`, { maxAge: 26 }).expect(200)).body).toMatchObject({ min_age: 25, max_age: 26 });
+    const older = (await post(`/organizations/${org.id}/players`, { firstName: 'Too', lastName: 'Old', dateOfBirth: '1999-01-01' }).expect(201)).body;
+    await post(`/season-teams/${team.id}/roster`, { playerId: older.id }).expect(400);
+    expect((await patch(`/divisions/${division.id}`, { minAge: null, maxAge: null }).expect(200)).body).toMatchObject({ min_age: null, max_age: null });
+  });
   it('safely corrects and removes draft team and roster registrations', async () => {
     const owner = await login(); const other = await login();
     const post = (url: string, body: object = {}) => request(app.getHttpServer()).post(`/league${url}`).set('Authorization', owner).send(body);

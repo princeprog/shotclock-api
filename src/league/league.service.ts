@@ -38,14 +38,17 @@ export class LeagueService {
     if (value > latestCivilDate) throw new BadRequestException('Date of birth cannot be in the future');
     return value;
   }
-  private eligible(birth: string | null, start: string | null, maxAge: number | null) {
+  private ageRange(minAge: number | null, maxAge: number | null) {
+    if (minAge !== null && maxAge !== null && minAge >= maxAge) throw new BadRequestException('Minimum age must be less than the upper age limit');
+  }
+  private eligible(birth: string | null, start: string | null, minAge: number | null, maxAge: number | null) {
     if (!birth) throw new BadRequestException('Player date of birth is required');
     this.calendarDate(birth);
     if (start && birth > start) throw new BadRequestException('Player was not born when the season started');
-    if (maxAge === null) return;
+    if (minAge === null && maxAge === null) return;
     if (!start) throw new BadRequestException('A valid season start date is required');
     const years = Number(start.slice(0, 4)) - Number(birth.slice(0, 4)) - (start.slice(5) < birth.slice(5) ? 1 : 0);
-    if (years >= maxAge) throw new BadRequestException('Player is not eligible for this division');
+    if ((minAge !== null && years < minAge) || (maxAge !== null && years >= maxAge)) throw new BadRequestException('Player is not eligible for this division');
   }
   private async playerLock(id: string, db: Database) { await sql`select pg_advisory_xact_lock(hashtextextended(${id}, 0))`.execute(db); }
   private requiresFork(user: string) { return sql<boolean>`exists (select 1 from league.organization_players op_other join league.organizations o_other on o_other.id = op_other.organization_id where op_other.player_id = p.id and o_other.owner_user_id <> ${user})`.as('requires_fork'); }
@@ -63,19 +66,20 @@ export class LeagueService {
     await this.season(user, division.season_id, db);
     return division;
   }
-  private async checkRegistrations(db: Database, filter: { seasonId?: string; divisionId?: string; playerId?: string }, overrides: { start?: string | null; maxAge?: number | null; birth?: string | null } = {}) {
+  private async checkRegistrations(db: Database, filter: { seasonId?: string; divisionId?: string; playerId?: string }, overrides: { start?: string | null; minAge?: number | null; maxAge?: number | null; birth?: string | null } = {}) {
     let query = db.selectFrom('league.rosters as r').innerJoin('league.season_teams as st', 'st.id', 'r.season_team_id')
       .innerJoin('league.divisions as d', 'd.id', 'st.division_id').innerJoin('league.seasons as s', 's.id', 'st.season_id')
       .innerJoin('league.players as p', 'p.id', 'r.player_id')
-      .select(['d.max_age', sql<string | null>`s.start_date::text`.as('start_date'), sql<string | null>`p.date_of_birth::text`.as('date_of_birth')]);
+      .select(['d.min_age', 'd.max_age', sql<string | null>`s.start_date::text`.as('start_date'), sql<string | null>`p.date_of_birth::text`.as('date_of_birth')]);
     if (filter.seasonId) query = query.where('s.id', '=', filter.seasonId);
     if (filter.divisionId) query = query.where('d.id', '=', filter.divisionId);
     if (filter.playerId) query = query.where('p.id', '=', filter.playerId);
     for (const row of await query.execute()) {
+      const minAge = overrides.minAge !== undefined ? overrides.minAge : row.min_age;
       const maxAge = overrides.maxAge !== undefined ? overrides.maxAge : row.max_age;
       const birth = overrides.birth !== undefined ? overrides.birth : row.date_of_birth;
       const start = overrides.start !== undefined ? overrides.start : row.start_date;
-      if (maxAge !== null || (birth && start && birth > start)) this.eligible(birth, start, maxAge);
+      if (minAge !== null || maxAge !== null || (birth && start && birth > start)) this.eligible(birth, start, minAge, maxAge);
     }
   }
   private async mutation<T>(action: () => Promise<T>): Promise<T> {
@@ -132,8 +136,8 @@ export class LeagueService {
   async getSeason(user: string, id: string) { await this.season(user, id); return this.db.selectFrom('league.seasons').selectAll().select(seasonDates).where('id', '=', id).executeTakeFirstOrThrow(); }
   async editSeason(user: string, id: string, dto: SeasonDto) { return this.db.transaction().execute(async (tx) => { const season = await this.season(user, id, tx, true); this.editable(season.status); const dates = this.dates(dto); await this.checkRegistrations(tx, { seasonId: id }, { start: dates.start_date }); return tx.updateTable('league.seasons').set({ ...dates, updated_at: new Date() }).where('id', '=', id).returningAll().returning(seasonDates).executeTakeFirstOrThrow(); }); }
   async divisions(user: string, seasonId: string) { await this.season(user, seasonId); return this.db.selectFrom('league.divisions').selectAll().where('season_id', '=', seasonId).orderBy('name').orderBy('id').execute(); }
-  async createDivision(user: string, seasonId: string, dto: DivisionDto) { return this.mutation(() => this.db.transaction().execute(async (tx) => { const season = await this.season(user, seasonId, tx, true); this.editable(season.status); return tx.insertInto('league.divisions').values({ season_id: seasonId, name: this.name(dto.name), max_age: dto.maxAge ?? null }).returningAll().executeTakeFirstOrThrow(); })); }
-  async editDivision(user: string, id: string, dto: UpdateDivisionDto) { return this.mutation(() => this.db.transaction().execute(async (tx) => { const initial = await this.division(user, id, tx); const season = await this.season(user, initial.season_id, tx, true); this.editable(season.status); const division = await this.division(user, id, tx); const maxAge = dto.maxAge === undefined ? division.max_age : dto.maxAge; await this.checkRegistrations(tx, { divisionId: id }, { maxAge }); return tx.updateTable('league.divisions').set({ name: dto.name === undefined ? division.name : this.name(dto.name), max_age: maxAge, updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow(); })); }
+  async createDivision(user: string, seasonId: string, dto: DivisionDto) { return this.mutation(() => this.db.transaction().execute(async (tx) => { const season = await this.season(user, seasonId, tx, true); this.editable(season.status); const minAge = dto.minAge ?? null; const maxAge = dto.maxAge ?? null; this.ageRange(minAge, maxAge); return tx.insertInto('league.divisions').values({ season_id: seasonId, name: this.name(dto.name), min_age: minAge, max_age: maxAge }).returningAll().executeTakeFirstOrThrow(); })); }
+  async editDivision(user: string, id: string, dto: UpdateDivisionDto) { return this.mutation(() => this.db.transaction().execute(async (tx) => { const initial = await this.division(user, id, tx); const season = await this.season(user, initial.season_id, tx, true); this.editable(season.status); const division = await this.division(user, id, tx); const minAge = dto.minAge === undefined ? division.min_age : dto.minAge; const maxAge = dto.maxAge === undefined ? division.max_age : dto.maxAge; this.ageRange(minAge, maxAge); await this.checkRegistrations(tx, { divisionId: id }, { minAge, maxAge }); return tx.updateTable('league.divisions').set({ name: dto.name === undefined ? division.name : this.name(dto.name), min_age: minAge, max_age: maxAge, updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow(); })); }
   async deleteDivision(user: string, id: string) { return this.db.transaction().execute(async (tx) => { const division = await this.division(user, id, tx); const season = await this.season(user, division.season_id, tx, true); if (season.status !== 'draft') throw new BadRequestException('Divisions can only be deleted in draft seasons'); const team = await tx.selectFrom('league.season_teams').select('id').where('division_id', '=', id).executeTakeFirst(); const game = await tx.selectFrom('league.games').select('id').where('division_id', '=', id).executeTakeFirst(); if (team || game) throw new BadRequestException('Only empty divisions can be deleted'); await tx.deleteFrom('league.divisions').where('id', '=', id).execute(); return { deleted: true }; }); }
   async transition(user: string, id: string, status: 'active' | 'completed') { return this.db.transaction().execute(async (tx) => {
     const season = await this.season(user, id, tx, true);
@@ -212,7 +216,7 @@ export class LeagueService {
     const dates = await tx.selectFrom('league.seasons').select(sql<string | null>`start_date::text`.as('start_date')).where('id', '=', season.id).executeTakeFirstOrThrow();
     const players = await tx.selectFrom('league.rosters as r').innerJoin('league.players as p', 'p.id', 'r.player_id').select(['p.first_name', 'p.last_name', sql<string | null>`p.date_of_birth::text`.as('date_of_birth')]).where('r.season_team_id', '=', id).execute();
     for (const player of players) {
-      try { if (division.max_age !== null || player.date_of_birth) this.eligible(player.date_of_birth, dates.start_date, division.max_age); }
+      try { if (division.min_age !== null || division.max_age !== null || player.date_of_birth) this.eligible(player.date_of_birth, dates.start_date, division.min_age, division.max_age); }
       catch (error) { if (error instanceof BadRequestException) throw new BadRequestException(`${player.first_name} ${player.last_name}: ${error.message}`); throw error; }
     }
     return tx.updateTable('league.season_teams').set({ division_id: division.id, updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow();
@@ -307,7 +311,7 @@ export class LeagueService {
     if (!player) throw new NotFoundException();
     const division = await this.divisionForSeason(season.id, st.division_id, tx);
     const dates = await tx.selectFrom('league.seasons').select(sql<string | null>`start_date::text`.as('start_date')).where('id', '=', season.id).executeTakeFirstOrThrow();
-    this.eligible(player.date_of_birth, dates.start_date, division.max_age);
+    this.eligible(player.date_of_birth, dates.start_date, division.min_age, division.max_age);
     return tx.insertInto('league.rosters').values({ player_id: dto.playerId, season_id: season.id, season_team_id: id, jersey_number: dto.jerseyNumber ?? null, status: 'active' }).returningAll().executeTakeFirstOrThrow();
   })); }
   async editJersey(user: string, rosterId: string, dto: JerseyDto) { return this.mutation(() => this.db.transaction().execute(async (tx) => {
@@ -322,7 +326,7 @@ export class LeagueService {
       const division = await this.divisionForSeason(season.id, target.division_id, tx);
       const dates = await tx.selectFrom('league.seasons').select(sql<string | null>`start_date::text`.as('start_date')).where('id', '=', season.id).executeTakeFirstOrThrow();
       const player = await tx.selectFrom('league.players').select(sql<string | null>`date_of_birth::text`.as('date_of_birth')).where('id', '=', roster.player_id).executeTakeFirstOrThrow();
-      this.eligible(player.date_of_birth, dates.start_date, division.max_age);
+      this.eligible(player.date_of_birth, dates.start_date, division.min_age, division.max_age);
     }
     return tx.updateTable('league.rosters').set({ season_team_id: dto.seasonTeamId ?? roster.season_team_id, jersey_number: dto.jerseyNumber === undefined ? roster.jersey_number : dto.jerseyNumber, updated_at: new Date() }).where('id', '=', rosterId).returningAll().executeTakeFirstOrThrow();
   })); }

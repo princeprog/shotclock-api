@@ -56,6 +56,7 @@ export interface LeagueDivisions {
   created_at: Generated<Timestamp>;
   id: Generated<string>;
   max_age: number | null;
+  min_age: number | null;
   name: string;
   season_id: string;
   updated_at: Generated<Timestamp>;
