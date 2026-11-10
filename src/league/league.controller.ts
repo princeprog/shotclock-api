@@ -2,10 +2,12 @@ import { Body, Controller, Delete, Get, Headers, Param, ParseUUIDPipe, Patch, Po
 import { AuthService } from '../auth/auth.service';
 import { CreateTeamDto, MoveTeamRegistrationDto, DivisionDto, DivisionFilterDto, PlayerDto, UpdateDivisionDto, UpdatePlayerDto, GameDto, GameFilterDto, JerseyDto, LeagueDto, NameDto, OrganizationSeasonFilterDto, OrganizationTeamFilterDto, OrganizationVenueFilterDto, RosterDto, RosterFilterDto, ScoreDto, SeasonDto, SeasonFilterDto, StatusDto, TeamDto, TeamRegistrationDto, VenueDto } from './league.dto';
 import { LeagueService } from './league.service';
+import { ScheduleService } from './schedule.service';
+import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto } from './league.dto';
 
 @Controller('league')
 export class LeagueController {
-  constructor(private readonly auth: AuthService, private readonly league: LeagueService) {}
+  constructor(private readonly auth: AuthService, private readonly league: LeagueService, private readonly schedule: ScheduleService) {}
   private async user(header?: string) { return (await this.auth.me(header)).user.id; }
   @Get('organizations') async organizations(@Headers('authorization') h?: string) { return this.league.organizations(await this.user(h)); }
   @Post('organizations') async createOrganization(@Headers('authorization') h: string, @Body() dto: NameDto) { return this.league.createOrganization(await this.user(h), dto); }
@@ -31,6 +33,11 @@ export class LeagueController {
   @Post('seasons/:id/divisions') async createDivision(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: DivisionDto) { return this.league.createDivision(await this.user(h), id, dto); }
   @Patch('divisions/:id') async editDivision(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateDivisionDto) { return this.league.editDivision(await this.user(h), id, dto); }
   @Delete('divisions/:id') async deleteDivision(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.league.deleteDivision(await this.user(h), id); }
+  @Get('divisions/:id/schedule/status') async scheduleStatus(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.schedule.status(await this.user(h), id); }
+  @Post('divisions/:id/schedule/preview') async previewSchedule(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: SchedulePreviewDto) { return this.schedule.preview(await this.user(h), id, dto); }
+  @Post('divisions/:id/schedule') async saveSchedule(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: ScheduleSaveDto) { return this.schedule.save(await this.user(h), id, dto); }
+  @Post('divisions/:id/playoffs/preview') async previewPlayoffs(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: ScheduleAvailabilityRequestDto) { return this.schedule.previewPlayoffs(await this.user(h), id, dto); }
+  @Post('divisions/:id/playoffs') async savePlayoffs(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: PlayoffSaveDto) { return this.schedule.savePlayoffs(await this.user(h), id, dto); }
   @Post('seasons/:id/status') async status(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: StatusDto) { return this.league.transition(await this.user(h), id, dto.status); }
   @Get('leagues/:id/teams') async teams(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.league.teams(await this.user(h), id); }
   @Post('leagues/:id/teams') async createTeam(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: CreateTeamDto) { return this.league.createTeam(await this.user(h), id, dto); }
@@ -51,6 +58,7 @@ export class LeagueController {
   @Get('seasons/:id/games') async games(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Query() filters: GameFilterDto) { const user = await this.user(h); const { divisionId, ...other } = filters; return Object.values(other).some((value) => value !== undefined) ? this.league.filteredGames(user, id, filters) : this.league.games(user, id, divisionId); }
   @Post('seasons/:id/games') async createGame(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: GameDto) { return this.league.createGame(await this.user(h), id, dto); }
   @Patch('games/:id') async editGame(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: GameDto) { return this.league.editGame(await this.user(h), id, dto); }
+  @Delete('games/:id') async deleteGame(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.schedule.remove(await this.user(h), id); }
   @Post('games/:id/score') async score(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: ScoreDto) { return this.league.score(await this.user(h), id, dto); }
   @Get('seasons/:id/standings') async standings(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Query() filters: DivisionFilterDto) { return this.league.standings(await this.user(h), id, filters.divisionId); }
   @Get('seasons/:id/dashboard') async dashboard(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Query() filters: DivisionFilterDto) { return this.league.dashboard(await this.user(h), id, filters.divisionId); }

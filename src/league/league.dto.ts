@@ -1,4 +1,4 @@
-import { ArrayNotEmpty, ArrayUnique, IsArray, IsDateString, IsIn, IsInt, IsOptional, IsString, IsUUID, Max, MaxLength, Min, MinLength, ValidateIf } from 'class-validator';
+import { ArrayMaxSize, ArrayNotEmpty, ArrayUnique, IsArray, IsBoolean, IsDateString, IsDefined, IsIn, IsInt, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min, MinLength, ValidateIf, ValidateNested } from 'class-validator';
 import { Type } from 'class-transformer';
 
 const positions = ['point_guard', 'shooting_guard', 'small_forward', 'power_forward', 'center'];
@@ -108,4 +108,44 @@ export class GameFilterDto extends DivisionFilterDto {
 export class ScoreDto {
   @IsInt() @Min(0) @Max(9999) homeScore!: number;
   @IsInt() @Min(0) @Max(9999) awayScore!: number;
+}
+
+export class ScheduleWindowDto {
+  @IsArray() @ArrayNotEmpty() @ArrayUnique() @ArrayMaxSize(7) @IsInt({ each: true }) @Min(0, { each: true }) @Max(6, { each: true }) weekdays!: number[];
+  @Matches(/^([01]\d|2[0-3]):[0-5]\d$/) startTime!: string;
+  @Matches(/^([01]\d|2[0-3]):[0-5]\d$/) endTime!: string;
+}
+export class ScheduleAvailabilityDto {
+  @Matches(/^\d{4}-\d{2}-\d{2}$/) startDate!: string;
+  @Matches(/^\d{4}-\d{2}-\d{2}$/) endDate!: string;
+  @IsArray() @ArrayNotEmpty() @ArrayMaxSize(20) @ValidateNested({ each: true }) @Type(() => ScheduleWindowDto) windows!: ScheduleWindowDto[];
+  @IsString() @MinLength(1) @MaxLength(100) timeZone!: string;
+  @IsArray() @ArrayNotEmpty() @ArrayUnique() @ArrayMaxSize(100) @IsUUID('all', { each: true }) venueIds!: string[];
+  @IsInt() @Min(1) @Max(1440) durationMinutes!: number;
+  @IsInt() @Min(0) @Max(10080) restMinutes!: number;
+}
+export class ScheduleGameDto {
+  @IsUUID() homeTeamId!: string;
+  @IsUUID() awayTeamId!: string;
+  @IsInt() @Min(1) @Max(500) round!: number;
+  @IsIn(['preliminary', 'semifinal', 'final', 'third_place']) stage!: 'preliminary' | 'semifinal' | 'final' | 'third_place';
+  @IsDateString({ strict: true }) @Matches(/(?:Z|[+-]\d\d:\d\d)$/) scheduledAt!: string;
+  @IsUUID() venueId!: string;
+  @IsInt() @Min(1) @Max(1440) durationMinutes!: number;
+  @IsOptional() @IsString() @MaxLength(120) homeName?: string;
+  @IsOptional() @IsString() @MaxLength(120) awayName?: string;
+}
+export class ScheduleAvailabilityRequestDto {
+  @IsDefined() @ValidateNested() @Type(() => ScheduleAvailabilityDto) availability!: ScheduleAvailabilityDto;
+}
+export class SchedulePreviewDto extends ScheduleAvailabilityRequestDto {
+  @IsIn(['single', 'double']) format!: 'single' | 'double';
+  @IsBoolean() playoffs!: boolean;
+  @IsBoolean() thirdPlace!: boolean;
+}
+export class ScheduleSaveDto extends SchedulePreviewDto {
+  @IsArray() @ArrayNotEmpty() @ArrayMaxSize(1000) @ValidateNested({ each: true }) @Type(() => ScheduleGameDto) games!: ScheduleGameDto[];
+}
+export class PlayoffSaveDto extends ScheduleAvailabilityRequestDto {
+  @IsArray() @ArrayNotEmpty() @ArrayMaxSize(2) @ValidateNested({ each: true }) @Type(() => ScheduleGameDto) games!: ScheduleGameDto[];
 }

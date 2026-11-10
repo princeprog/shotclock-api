@@ -62,16 +62,30 @@ export interface LeagueDivisions {
   updated_at: Generated<Timestamp>;
 }
 
+export interface LeagueDivisionSchedules {
+  created_at: Generated<Timestamp>;
+  division_id: string;
+  format: string;
+  id: Generated<string>;
+  playoffs: boolean;
+  team_ids: string[];
+  third_place: boolean;
+}
+
 export interface LeagueGames {
   away_score: number | null;
   away_season_team_id: string;
   created_at: Generated<Timestamp>;
   division_id: string;
+  duration_minutes: number | null;
   home_score: number | null;
   home_season_team_id: string;
   id: Generated<string>;
+  round: number | null;
+  schedule_id: string | null;
   scheduled_at: Timestamp | null;
   season_id: string;
+  stage: Generated<string>;
   status: Generated<string>;
   updated_at: Generated<Timestamp>;
   venue_id: string | null;
@@ -191,6 +205,7 @@ export interface DB {
   "auth.refresh_tokens": AuthRefreshTokens;
   "auth.sessions": AuthSessions;
   "auth.users": AuthUsers;
+  "league.division_schedules": LeagueDivisionSchedules;
   "league.divisions": LeagueDivisions;
   "league.games": LeagueGames;
   "league.league_members": LeagueLeagueMembers;
