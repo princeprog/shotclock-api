@@ -119,6 +119,10 @@ export class ScheduleWindowDto {
   @Matches(/^([01]\d|2[0-3]):[0-5]\d$/) startTime!: string;
   @Matches(/^([01]\d|2[0-3]):[0-5]\d$/) endTime!: string;
 }
+export class TeamUnavailabilityDto {
+  @IsUUID() teamId!: string;
+  @IsArray() @ArrayMaxSize(366) @ArrayUnique() @Matches(/^\d{4}-\d{2}-\d{2}$/, { each: true }) dates!: string[];
+}
 export class ScheduleAvailabilityDto {
   @Matches(/^\d{4}-\d{2}-\d{2}$/) startDate!: string;
   @Matches(/^\d{4}-\d{2}-\d{2}$/) endDate!: string;
@@ -128,6 +132,10 @@ export class ScheduleAvailabilityDto {
   @IsInt() @Min(1) @Max(1440) durationMinutes!: number;
   @IsInt() @Min(0) @Max(10080) restMinutes!: number;
   @IsOptional() @IsArray() @ArrayMaxSize(366) @ArrayUnique() @Matches(/^\d{4}-\d{2}-\d{2}$/, { each: true }) blackoutDates?: string[];
+  @IsOptional() @IsIn(['weekly', 'spread', 'compact']) pace?: 'weekly' | 'spread' | 'compact';
+  @IsOptional() @IsInt() @Min(1) @Max(10) maxGamesPerTeamPerDay?: number;
+  @IsOptional() @IsInt() @Min(0) @Max(240) changeoverMinutes?: number;
+  @IsOptional() @IsArray() @ArrayMaxSize(200) @ValidateNested({ each: true }) @Type(() => TeamUnavailabilityDto) teamUnavailability?: TeamUnavailabilityDto[];
 }
 export class ScheduleGameDto {
   @IsUUID() homeTeamId!: string;

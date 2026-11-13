@@ -1,4 +1,4 @@
-import { estimateCourtCapacity, playingIntervals, scheduleMatches } from './schedule-algorithm';
+import { estimateCourtCapacity, playingIntervals, scheduleIssues, scheduleMatches } from './schedule-algorithm';
 import type { ScheduleAvailability } from './schedule-algorithm';
 
 const MINUTE = 60_000;
@@ -81,6 +81,84 @@ describe('blackout dates', () => {
     expect(() => estimateCourtCapacity({ ...base, blackoutDates: ['2026-02-30'] }, [])).toThrow(/blackout/i);
     expect(() => estimateCourtCapacity({ ...base, blackoutDates: ['2026-11-01', '2026-11-01'] }, [])).toThrow(/blackout/i);
     expect(() => estimateCourtCapacity({ ...base, blackoutDates: Array.from({ length: 367 }, () => '2026-11-01') }, [])).toThrow(/blackout/i);
+  });
+});
+
+const fixture = (homeTeamId: string, awayTeamId: string, round = 1) => ({ homeTeamId, awayTeamId, round, stage: 'preliminary' as const });
+const draft = (homeTeamId: string, awayTeamId: string, scheduledAt: string, round = 1, venueId = 'court-a') =>
+  ({ ...fixture(homeTeamId, awayTeamId, round), scheduledAt, venueId, durationMinutes: 60 });
+const twoSundays: ScheduleAvailability = { ...base, venueIds: ['court-a', 'court-b'] };
+
+describe('court changeover', () => {
+  it('leaves the changeover gap between games on the same court', () => {
+    const options = { ...base, venueIds: ['court-a'], endDate: '2026-11-01', windows: [{ weekdays: [0], startTime: '09:00', endTime: '12:00' }], changeoverMinutes: 15 };
+    expect(estimateCourtCapacity(options, [])).toBe(2);
+    const games = scheduleMatches([fixture('a', 'b'), fixture('c', 'd')], options, []);
+    expect(games.map((game) => game.scheduledAt)).toEqual(['2026-11-01T01:00:00.000Z', '2026-11-01T02:15:00.000Z']);
+    const issues = scheduleIssues([draft('a', 'b', '2026-11-01T01:00:00Z'), draft('c', 'd', '2026-11-01T02:05:00Z')], options, []);
+    expect(issues.map((issue) => issue.message).join(' ')).toMatch(/changeover/i);
+  });
+});
+
+describe('team limits', () => {
+  it('allows one game per team per day and moves the next game to another day', () => {
+    const options = { ...twoSundays, maxGamesPerTeamPerDay: 1 };
+    const games = scheduleMatches([fixture('a', 'b', 1), fixture('a', 'c', 2)], options, []);
+    expect(games.map((game) => game.scheduledAt.slice(0, 10))).toEqual(['2026-11-01', '2026-11-08']);
+    expect(() => scheduleMatches([fixture('a', 'b', 1), fixture('a', 'c', 2)], { ...options, endDate: '2026-11-01' }, []))
+      .toThrow(/games-per-day limit/i);
+    const issues = scheduleIssues([draft('a', 'b', '2026-11-01T01:00:00Z'), draft('a', 'c', '2026-11-01T03:00:00Z', 2)], options, []);
+    expect(issues.filter((issue) => /daily limit/i.test(issue.message)).map((issue) => issue.index)).toEqual([0, 1]);
+  });
+
+  it('counts existing games toward the daily limit', () => {
+    const existing = [{ homeTeamId: 'a', awayTeamId: 'x', scheduledAt: '2026-11-01T04:00:00Z', venueId: 'court-b', durationMinutes: 60 }];
+    const games = scheduleMatches([fixture('a', 'b')], { ...twoSundays, maxGamesPerTeamPerDay: 1 }, existing);
+    expect(games[0].scheduledAt.slice(0, 10)).toBe('2026-11-08');
+  });
+
+  it('plays one game per team each week with weekly pacing', () => {
+    const options = { ...twoSundays, pace: 'weekly' as const, windows: [{ weekdays: [0, 6], startTime: '09:00', endTime: '13:00' }] };
+    const games = scheduleMatches([fixture('a', 'b', 1), fixture('c', 'd', 1), fixture('a', 'c', 2), fixture('b', 'd', 2)], options, []);
+    // Weeks are 7-day blocks from the start date (Sunday), so Saturday the 7th is still the first week.
+    expect(games.map((game) => game.scheduledAt.slice(0, 10))).toEqual(['2026-11-01', '2026-11-01', '2026-11-08', '2026-11-08']);
+    const issues = scheduleIssues([draft('a', 'b', '2026-11-01T01:00:00Z'), draft('a', 'c', '2026-11-08T01:00:00Z', 2)], options, []);
+    expect(issues.filter((issue) => /weekly pacing/i.test(issue.message)).map((issue) => issue.index)).toEqual([]);
+    const sameWeek = scheduleIssues([draft('a', 'b', '2026-11-01T01:00:00Z'), draft('a', 'c', '2026-11-06T23:00:00Z', 2)], { ...options, windows: [{ weekdays: [0, 6], startTime: '07:00', endTime: '13:00' }] }, []);
+    expect(sameWeek.filter((issue) => /weekly pacing/i.test(issue.message)).map((issue) => issue.index)).toEqual([0, 1]);
+  });
+
+  it('keeps games off team unavailable dates and reports them', () => {
+    const options = { ...twoSundays, teamUnavailability: [{ teamId: 'a', dates: ['2026-11-01'] }] };
+    const games = scheduleMatches([fixture('a', 'b'), fixture('c', 'd')], options, []);
+    expect(games.map((game) => game.scheduledAt.slice(0, 10))).toEqual(['2026-11-08', '2026-11-01']);
+    const issues = scheduleIssues([draft('a', 'b', '2026-11-01T01:00:00Z')], options, []);
+    expect(issues.map((issue) => issue.message).join(' ')).toMatch(/unavailable on this date/i);
+  });
+
+  it('reports games on blackout dates', () => {
+    const issues = scheduleIssues([draft('a', 'b', '2026-11-08T01:00:00Z')], { ...twoSundays, blackoutDates: ['2026-11-08'] }, []);
+    expect(issues.map((issue) => issue.message)).toEqual([expect.stringMatching(/blackout date/i)]);
+  });
+});
+
+describe('per-team round order', () => {
+  it('lets other teams play a later round while one team waits', () => {
+    const options = { ...twoSundays, endDate: '2026-11-01', restMinutes: 0 };
+    const existing = [{ homeTeamId: 'b', awayTeamId: 'x', scheduledAt: '2026-11-01T01:00:00Z', venueId: null, durationMinutes: 60 }];
+    const games = scheduleMatches([fixture('a', 'b', 1), fixture('c', 'd', 2)], options, existing);
+    expect(games.map((game) => game.scheduledAt)).toEqual(['2026-11-01T02:00:00.000Z', '2026-11-01T01:00:00.000Z']);
+  });
+});
+
+describe('constraint settings validation', () => {
+  it('rejects invalid pacing, limits and team availability', () => {
+    expect(() => estimateCourtCapacity({ ...base, pace: 'fast' as never }, [])).toThrow(/pace/i);
+    expect(() => estimateCourtCapacity({ ...base, maxGamesPerTeamPerDay: 0 }, [])).toThrow(/maxGamesPerTeamPerDay/);
+    expect(() => estimateCourtCapacity({ ...base, maxGamesPerTeamPerDay: 11 }, [])).toThrow(/maxGamesPerTeamPerDay/);
+    expect(() => estimateCourtCapacity({ ...base, changeoverMinutes: 241 }, [])).toThrow(/changeoverMinutes/);
+    expect(() => estimateCourtCapacity({ ...base, teamUnavailability: [{ teamId: 'a', dates: [] }, { teamId: 'a', dates: [] }] }, [])).toThrow(/teamUnavailability/);
+    expect(() => estimateCourtCapacity({ ...base, teamUnavailability: [{ teamId: 'a', dates: ['2026-13-01'] }] }, [])).toThrow(/teamUnavailability/);
   });
 });
 

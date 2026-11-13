@@ -49,10 +49,15 @@ export class ScheduleService {
 
   private async existing(db: Database, leagueId: string): Promise<ExistingGame[]> {
     const games = await db.selectFrom('league.games as g').innerJoin('league.seasons as s', 's.id', 'g.season_id')
-      .select(['g.home_season_team_id', 'g.away_season_team_id', 'g.scheduled_at', 'g.venue_id', 'g.duration_minutes'])
+      .select(['g.id', 'g.home_season_team_id', 'g.away_season_team_id', 'g.scheduled_at', 'g.venue_id', 'g.duration_minutes'])
       .where('s.league_id', '=', leagueId).where('g.scheduled_at', 'is not', null).execute();
-    return games.map((game) => ({ homeTeamId: game.home_season_team_id, awayTeamId: game.away_season_team_id,
+    return games.map((game) => ({ id: game.id, homeTeamId: game.home_season_team_id, awayTeamId: game.away_season_team_id,
       scheduledAt: new Date(game.scheduled_at!).toISOString(), venueId: game.venue_id, durationMinutes: game.duration_minutes }));
+  }
+
+  private checkTeamAvailability(availability: ScheduleAvailability, teamIds: Iterable<string>) {
+    const allowed = new Set(teamIds);
+    if (availability?.teamUnavailability?.some((entry) => !allowed.has(entry.teamId))) throw new BadRequestException('Team availability includes a team outside this schedule');
   }
 
   private warnings(games: ScheduleGame[], context: DivisionContext, zone: string) {
@@ -103,6 +108,7 @@ export class ScheduleService {
     if (input.playoffs && teams.length < 4) throw new BadRequestException('Playoffs require at least four teams');
     if (input.thirdPlace && !input.playoffs) throw new BadRequestException('A third-place game requires playoffs');
     await this.validateVenues(db, context.leagueId, input.availability);
+    this.checkTeamAvailability(input.availability, teams.map((team) => team.id));
     const matches = this.trySchedule(() => roundRobin(teams.map((team) => team.id), input.format));
     return { teams, matches };
   }
@@ -176,6 +182,7 @@ export class ScheduleService {
     if (mode === 'preliminary' && 'thirdPlace' in input && input.thirdPlace && !input.playoffs) throw new BadRequestException('A third-place game requires playoffs');
     await this.validateVenues(db, season.leagueId, input.availability);
     const divisions = await this.seasonDivisions(db, season);
+    this.checkTeamAvailability(input.availability, divisions.flatMap((division) => division.teams.map((team) => team.id)));
     const included = divisions.filter((division) => mode === 'preliminary' ? division.canGeneratePreliminary : !!division.playoff);
     const details = divisions.map((division) => {
       const eligible = included.includes(division);
@@ -348,6 +355,7 @@ export class ScheduleService {
     const context = await this.context(user, divisionId, this.db);
     const { teams, matches } = await this.playoffMatches(this.db, context);
     await this.validateVenues(this.db, context.leagueId, input.availability);
+    this.checkTeamAvailability(input.availability, teams.map((team) => team.id));
     const existing = await this.existing(this.db, context.leagueId);
     const games = this.trySchedule(() => scheduleMatches(matches, input.availability, existing), teams);
     return { games: this.withNames(games, teams), warnings: this.warnings(games, context, input.availability.timeZone) };
@@ -357,8 +365,9 @@ export class ScheduleService {
     return this.db.transaction().execute(async (tx) => {
       const context = await this.context(user, divisionId, tx, true);
       await this.leagueLock(tx, context.leagueId);
-      const { matches, schedule } = await this.playoffMatches(tx, context);
+      const { teams, matches, schedule } = await this.playoffMatches(tx, context);
       await this.validateVenues(tx, context.leagueId, input.availability);
+      this.checkTeamAvailability(input.availability, teams.map((team) => team.id));
       this.sameMatches(matches, input.games);
       const existing = await this.existing(tx, context.leagueId);
       this.trySchedule(() => validateSchedule(input.games, input.availability, existing));

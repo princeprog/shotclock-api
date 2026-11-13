@@ -60,10 +60,12 @@ describe('schedule preview diagnostics', () => {
     const fall = { ...spring, startDate: '2026-11-01', endDate: '2026-11-01', windows: [{ weekdays: [0], startTime: '01:00', endTime: '02:00' }] };
     expect(estimateCourtCapacity(fall, [])).toBe(2);
   });
-  it('marks both the earlier and later games when round order is broken', () => {
-    const games = [game({ scheduledAt: '2026-11-01T03:00:00Z' }), game({ homeTeamId: 'c', awayTeamId: 'd', round: 2, scheduledAt: '2026-11-01T02:00:00Z' })];
+  it('marks both games when a team plays its rounds out of order', () => {
+    const games = [game({ scheduledAt: '2026-11-01T03:00:00Z' }), game({ homeTeamId: 'a', awayTeamId: 'c', round: 2, scheduledAt: '2026-11-01T01:30:00Z', venueId: 'court-b' })];
     const issues = scheduleIssues(games, availability, []);
     expect(issues.filter((issue) => /round sequence/i.test(issue.message)).map((issue) => issue.index).sort()).toEqual([0, 1]);
+    const unrelated = [game({ scheduledAt: '2026-11-01T03:00:00Z' }), game({ homeTeamId: 'c', awayTeamId: 'd', round: 2, scheduledAt: '2026-11-01T02:00:00Z' })];
+    expect(scheduleIssues(unrelated, availability, []).filter((issue) => /round sequence/i.test(issue.message))).toEqual([]);
   });
 });
 
@@ -159,9 +161,10 @@ describe('scheduleMatches and validateSchedule', () => {
     expect(() => scheduleMatches([match('a', 'b')], options, existing)).toThrow(/selected venues.*occupied/i);
   });
 
-  it('explains when the round order prevents using an earlier available slot', () => {
-    const options = { ...availability, restMinutes: 0, windows: [{ weekdays: [0], startTime: '09:00', endTime: '10:00' }] };
-    expect(() => scheduleMatches([match('a', 'b', 1), match('c', 'd', 2)], options, [])).toThrow(/slot exists earlier.*round must follow the previous round/i);
+  it('explains when a team round order prevents using an earlier available slot', () => {
+    const options = { ...availability, restMinutes: 0, windows: [{ weekdays: [0], startTime: '09:00', endTime: '11:00' }] };
+    const existing: ExistingGame[] = [{ homeTeamId: 'b', awayTeamId: 'x', scheduledAt: '2026-11-01T01:00:00Z', venueId: null, durationMinutes: 60 }];
+    expect(() => scheduleMatches([match('a', 'b', 1), match('a', 'c', 2)], options, existing)).toThrow(/slot exists earlier.*finish its previous round/i);
   });
 
   it('does not claim a single cause when several constraints block the attempt', () => {
@@ -316,12 +319,12 @@ describe('scheduleMatches and validateSchedule', () => {
       },
     ];
     const games = scheduleMatches(
-      [match('c', 'd', 2), match('a', 'b', 1), match('e', 'f', 1)],
+      [match('a', 'c', 2), match('a', 'b', 1), match('e', 'f', 1)],
       availability,
       existing,
     );
     expect(games.map((item) => item.scheduledAt)).toEqual([
-      '2026-11-01T03:30:00.000Z',
+      '2026-11-01T02:30:00.000Z',
       '2026-11-01T01:00:00.000Z',
       '2026-11-01T02:30:00.000Z',
     ]);
@@ -334,8 +337,8 @@ describe('scheduleMatches and validateSchedule', () => {
       scheduledAt: '2026-11-01T02:30:00Z',
     });
     const secondRound = game({
-      ...match('c', 'd', 2),
-      scheduledAt: '2026-11-01T03:00:00Z',
+      ...match('a', 'c', 2),
+      scheduledAt: '2026-11-01T01:00:00Z',
       venueId: 'court-b',
     });
     expect(() =>
@@ -349,7 +352,7 @@ describe('scheduleMatches and validateSchedule', () => {
     ).toThrow(/duration/i);
     expect(() =>
       validateSchedule(
-        [{ ...secondRound, scheduledAt: '2026-11-01T03:30:00Z' }, firstRound],
+        [{ ...secondRound, scheduledAt: '2026-11-01T04:00:00Z' }, firstRound],
         availability,
         [],
       ),
