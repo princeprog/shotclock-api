@@ -127,6 +127,7 @@ export class ScheduleAvailabilityDto {
   @IsArray() @ArrayNotEmpty() @ArrayUnique() @ArrayMaxSize(100) @IsUUID('all', { each: true }) venueIds!: string[];
   @IsInt() @Min(1) @Max(1440) durationMinutes!: number;
   @IsInt() @Min(0) @Max(10080) restMinutes!: number;
+  @IsOptional() @IsArray() @ArrayMaxSize(366) @ArrayUnique() @Matches(/^\d{4}-\d{2}-\d{2}$/, { each: true }) blackoutDates?: string[];
 }
 export class ScheduleGameDto {
   @IsUUID() homeTeamId!: string;

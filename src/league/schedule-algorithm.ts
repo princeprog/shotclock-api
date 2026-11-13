@@ -6,6 +6,7 @@ export type ScheduleAvailability = {
   venueIds: string[];
   durationMinutes: number;
   restMinutes: number;
+  blackoutDates?: string[];
 };
 
 export type ScheduleMatch = {
@@ -33,7 +34,7 @@ const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
 const MAX_GAMES = 10_000;
 const MAX_COMPARISONS = 5_000_000;
-type Interval = { start: number; end: number };
+export type Interval = { start: number; end: number };
 type BusyGame = Interval & {
   homeTeamId: string;
   awayTeamId: string;
@@ -184,6 +185,7 @@ function settings(availability: ScheduleAvailability): {
   end: number;
   weeklyWindows: Interval[][];
   formatter: Intl.DateTimeFormat;
+  blackouts: Set<string>;
 } {
   if (!availability) throw new Error('Invalid availability');
   const start = date(availability.startDate);
@@ -245,39 +247,72 @@ function settings(availability: ScheduleAvailability): {
   } catch {
     throw new Error('Invalid IANA timeZone');
   }
-  return { start, end, weeklyWindows, formatter };
+  const blackouts = dateSet(availability.blackoutDates, 'blackoutDates');
+  return { start, end, weeklyWindows, formatter, blackouts };
 }
 
-// Scan real minutes rather than guessing offsets: DST gaps disappear and folds occur twice.
+function dateSet(values: string[] | undefined, name: string, maximum = 366): Set<string> {
+  if (values === undefined) return new Set();
+  if (!Array.isArray(values) || values.length > maximum) throw new Error(`Invalid ${name}: expected at most ${maximum} dates`);
+  const result = new Set<string>();
+  for (const value of values) {
+    try { date(value); } catch { throw new Error(`Invalid ${name}: expected calendar dates from 2000 through 2100`); }
+    if (result.has(value)) throw new Error(`Invalid ${name}: dates must be unique`);
+    result.add(value);
+  }
+  return result;
+}
+
+function localParts(formatter: Intl.DateTimeFormat, at: number): { date: string; minutes: number; offset: number } {
+  const parts = formatter.formatToParts(at);
+  const get = (type: string) => parts.find((part) => part.type === type)?.value ?? '';
+  const date = `${get('year')}-${get('month')}-${get('day')}`;
+  const minutes = Number(get('hour')) * 60 + Number(get('minute'));
+  return { date, minutes, offset: Date.parse(`${date}T00:00:00Z`) + minutes * MINUTE - Math.floor(at / MINUTE) * MINUTE };
+}
+
+function mergeIntervals(intervals: Interval[]): Interval[] {
+  const merged: Interval[] = [];
+  for (const interval of [...intervals].sort((a, b) => a.start - b.start)) {
+    const last = merged[merged.length - 1];
+    if (last && interval.start <= last.end) last.end = Math.max(last.end, interval.end);
+    else merged.push({ ...interval });
+  }
+  return merged;
+}
+
+// Each local day uses one UTC offset unless it is near a transition. Those days scan real minutes,
+// so DST gaps disappear and folds occur twice, exactly as a minute-by-minute scan would find them.
 function windows(config: ReturnType<typeof settings>): Interval[] {
-  const days = new Map<string, Interval[]>();
-  for (let day = config.start; day <= config.end; day += DAY) {
-    const weekdayWindows = config.weeklyWindows[new Date(day).getUTCDay()];
-    if (weekdayWindows.length)
-      days.set(new Date(day).toISOString().slice(0, 10), weekdayWindows);
-  }
   const intervals: Interval[] = [];
-  let current: Interval | undefined;
-  for (let at = config.start - DAY; at < config.end + 2 * DAY; at += MINUTE) {
-    const parts = config.formatter.formatToParts(at);
-    const get = (type: string) =>
-      parts.find((part) => part.type === type)?.value ?? '';
-    const localDate = `${get('year')}-${get('month')}-${get('day')}`;
-    const localTime = Number(get('hour')) * 60 + Number(get('minute'));
-    const inWindow =
-      days
-        .get(localDate)
-        ?.some(
-          (window) => localTime >= window.start && localTime < window.end,
-        ) ?? false;
-    if (inWindow) {
-      if (!current) {
-        current = { start: at, end: at + MINUTE };
-        intervals.push(current);
-      } else current.end = at + MINUTE;
-    } else current = undefined;
+  for (let day = config.start; day <= config.end; day += DAY) {
+    const localDate = new Date(day).toISOString().slice(0, 10);
+    if (config.blackouts.has(localDate)) continue;
+    const local = mergeIntervals(config.weeklyWindows[new Date(day).getUTCDay()]);
+    if (!local.length) continue;
+    const before = localParts(config.formatter, day - DAY).offset;
+    const after = localParts(config.formatter, day + 2 * DAY).offset;
+    if (before === after) {
+      for (const window of local) intervals.push({ start: day + window.start * MINUTE - before, end: day + window.end * MINUTE - before });
+      continue;
+    }
+    let current: Interval | undefined;
+    for (let at = day - DAY; at < day + 2 * DAY; at += MINUTE) {
+      const parts = localParts(config.formatter, at);
+      const inWindow = parts.date === localDate && local.some((window) => parts.minutes >= window.start && parts.minutes < window.end);
+      if (inWindow) {
+        if (!current) {
+          current = { start: at, end: at + MINUTE };
+          intervals.push(current);
+        } else current.end = at + MINUTE;
+      } else current = undefined;
+    }
   }
-  return intervals;
+  return mergeIntervals(intervals);
+}
+
+export function playingIntervals(availability: ScheduleAvailability): Interval[] {
+  return windows(settings(availability));
 }
 
 function busyGames(
@@ -416,9 +451,13 @@ function placementReason(
 ): string {
   if (!intervals.length) {
     let hasSelectedDay = false;
+    let hasBlackoutDay = false;
     for (let day = config.start; day <= config.end; day += DAY) {
-      if (config.weeklyWindows[new Date(day).getUTCDay()].length) { hasSelectedDay = true; break; }
+      if (!config.weeklyWindows[new Date(day).getUTCDay()].length) continue;
+      if (config.blackouts.has(new Date(day).toISOString().slice(0, 10))) hasBlackoutDay = true;
+      else { hasSelectedDay = true; break; }
     }
+    if (!hasSelectedDay && hasBlackoutDay) return 'Every selected playing day in the date range is a blackout date. Remove a blackout date or extend the date range.';
     return hasSelectedDay
       ? 'The selected playing windows do not occur on those dates in the chosen time zone; check for a daylight-saving gap or choose different hours.'
       : 'No selected playing days fall within the date range. Add a playing day or extend the date range.';
