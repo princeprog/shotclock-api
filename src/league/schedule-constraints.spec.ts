@@ -162,6 +162,30 @@ describe('spread pacing', () => {
   });
 });
 
+describe('fair tip-off times', () => {
+  const saturdays: ScheduleAvailability = { ...base, venueIds: ['court-a'], startDate: '2026-11-07', endDate: '2026-12-19', windows: [{ weekdays: [6], startTime: '09:00', endTime: '11:00' }] };
+  const earlyGames = (games: { homeTeamId: string; awayTeamId: string; scheduledAt: string }[]) => {
+    const counts: Record<string, number> = {};
+    for (const game of games) if (game.scheduledAt.endsWith('T01:00:00.000Z')) for (const team of [game.homeTeamId, game.awayTeamId]) counts[team] = (counts[team] ?? 0) + 1;
+    return ['a', 'b', 'c', 'd'].map((team) => counts[team] ?? 0);
+  };
+
+  it('balances early and late tip-offs across teams', () => {
+    const matches = roundRobin(['a', 'b', 'c', 'd'], 'double');
+    const compact = earlyGames(scheduleMatches(matches, { ...saturdays, pace: 'compact' }, []));
+    const balanced = earlyGames(scheduleMatches(matches, { ...saturdays, pace: 'weekly' }, []));
+    expect(Math.max(...compact) - Math.min(...compact)).toBeGreaterThanOrEqual(4);
+    expect(Math.max(...balanced) - Math.min(...balanced)).toBeLessThanOrEqual(2);
+  });
+
+  it('falls back to earliest slots when balancing would leave a game unplaced', () => {
+    const options: ScheduleAvailability = { ...base, venueIds: ['court-a'], pace: 'spread', windows: [{ weekdays: [0], startTime: '09:00', endTime: '11:00' }] };
+    const existing = [{ homeTeamId: 'c', awayTeamId: 'x', scheduledAt: '2026-11-08T01:00:00Z', venueId: null, durationMinutes: 60 }];
+    const games = scheduleMatches([fixture('a', 'e', 1), fixture('f', 'g', 1), fixture('a', 'b', 2), fixture('c', 'd', 2)], options, existing);
+    expect(games.map((game) => game.scheduledAt)).toEqual(['2026-11-01T01:00:00.000Z', '2026-11-01T02:00:00.000Z', '2026-11-08T01:00:00.000Z', '2026-11-08T02:00:00.000Z']);
+  });
+});
+
 describe('per-team round order', () => {
   it('lets other teams play a later round while one team waits', () => {
     const options = { ...twoSundays, endDate: '2026-11-01', restMinutes: 0 };

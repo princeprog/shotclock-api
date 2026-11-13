@@ -415,7 +415,7 @@ export function estimateCourtCapacity(availability: ScheduleAvailability, existi
 
 type Config = ReturnType<typeof settings>;
 type PlayInterval = Interval & { date: string; week: number; day: number };
-type PlacementOptions = { checkTeams: boolean; checkVenues: boolean; checkDays: boolean; rest: number; earliest: number; latest: number; minDay: number };
+type PlacementOptions = { checkTeams: boolean; checkVenues: boolean; checkDays: boolean; rest: number; earliest: number; latest: number; minDay: number; fair?: boolean };
 
 function playIntervals(config: Config): PlayInterval[] {
   const intervals = windows(config).map((interval) => ({ ...interval, date: localParts(config.formatter, interval.start).date }));
@@ -433,18 +433,29 @@ class PlacementState {
   private readonly days = new Map<string, number>();
   private readonly weeks = new Map<string, number>();
   private readonly rounds = new Map<string, { round: number; start: number; end: number }[]>();
+  private readonly tipOffs = new Map<string, number>();
+  private readonly venues = new Map<string, number>();
 
   constructor(private readonly config: Config) {}
 
   add(game: BusyGame, round?: number): void {
     this.busy.push(game);
-    const date = localParts(this.config.formatter, game.start).date;
+    const { date, minutes } = localParts(this.config.formatter, game.start);
     const week = this.config.weekOf(date);
     for (const team of [game.homeTeamId, game.awayTeamId]) {
       this.days.set(`${team}\u0000${date}`, (this.days.get(`${team}\u0000${date}`) ?? 0) + 1);
       this.weeks.set(`${team}\u0000${week}`, (this.weeks.get(`${team}\u0000${week}`) ?? 0) + 1);
-      if (round !== undefined) this.rounds.set(team, [...(this.rounds.get(team) ?? []), { round, start: game.start, end: game.end }]);
+      if (round === undefined) continue;
+      this.rounds.set(team, [...(this.rounds.get(team) ?? []), { round, start: game.start, end: game.end }]);
+      this.tipOffs.set(`${team}\u0000${minutes}`, (this.tipOffs.get(`${team}\u0000${minutes}`) ?? 0) + 1);
+      this.venues.set(`${team}\u0000${game.venueId}`, (this.venues.get(`${team}\u0000${game.venueId}`) ?? 0) + 1);
     }
+  }
+
+  // Lower is fairer: repeating a team's tip-off time costs twice as much as repeating its venue.
+  score(teams: string[], start: number, venueId: string): number {
+    const { minutes } = localParts(this.config.formatter, start);
+    return teams.reduce((total, team) => total + 2 * (this.tipOffs.get(`${team}\u0000${minutes}`) ?? 0) + (this.venues.get(`${team}\u0000${venueId}`) ?? 0), 0);
   }
 
   allows(teams: string[], date: string, week: number): boolean {
@@ -516,10 +527,11 @@ function findPlacement(
     : [];
   const earliest = Math.ceil(options.earliest / MINUTE) * MINUTE;
   let selected: BusyGame | undefined;
-  for (const venueId of config.venueIds) {
-    const blocked = [...teamBlocked, ...(options.checkVenues
-      ? state.busy.filter((item) => item.venueId === venueId).map((item) => ({ start: item.start - config.changeover, end: item.end + config.changeover }))
-      : [])].sort((a, b) => a.start - b.start);
+  const blockedByVenue = config.venueIds.map((venueId) => [...teamBlocked, ...(options.checkVenues
+    ? state.busy.filter((item) => item.venueId === venueId).map((item) => ({ start: item.start - config.changeover, end: item.end + config.changeover }))
+    : [])].sort((a, b) => a.start - b.start));
+  for (const [venueIndex, venueId] of config.venueIds.entries()) {
+    const blocked = blockedByVenue[venueIndex];
     for (const interval of intervals) {
       if (selected && interval.start >= selected.start) break;
       if (interval.end <= earliest || interval.day < options.minDay) continue;
@@ -530,7 +542,23 @@ function findPlacement(
       break;
     }
   }
-  return selected;
+  if (!selected || !options.fair) return selected;
+  // On the earliest playable day, prefer the slot that evens out each team's tip-off times and venues.
+  const day = localParts(config.formatter, selected.start).date;
+  let best = { game: selected, score: state.score(teams, selected.start, selected.venueId!) };
+  for (const [venueIndex, venueId] of config.venueIds.entries()) {
+    for (const interval of intervals) {
+      if (interval.date !== day || interval.end <= earliest) continue;
+      const to = Math.min(interval.end, options.latest);
+      let from = Math.max(interval.start, earliest);
+      for (let start = firstFit(blockedByVenue[venueIndex], from, to, config.length); start !== undefined; start = firstFit(blockedByVenue[venueIndex], from, to, config.length)) {
+        const score = state.score(teams, start, venueId);
+        if (score < best.score || (score === best.score && start < best.game.start)) best = { game: { ...match, venueId, start, end: start + config.length }, score };
+        from = start + config.length + config.changeover;
+      }
+    }
+  }
+  return best.game;
 }
 
 function placementReason(
@@ -589,12 +617,14 @@ function placementReason(
 
 type Unplaced = { index: number; match: ScheduleMatch; placed: number; reason: string };
 
+type Placement = { games: (ScheduleGame | undefined)[]; unplaced: Unplaced[] };
+
 function place(
   matches: ScheduleMatch[],
   availability: ScheduleAvailability,
   existing: ExistingGame[],
   stopAtFirst: boolean,
-): { games: (ScheduleGame | undefined)[]; unplaced: Unplaced[] } {
+): Placement {
   const config = settings(availability);
   if (!Array.isArray(matches) || matches.length > MAX_GAMES)
     throw new Error('Invalid matches (maximum 10000)');
@@ -609,6 +639,22 @@ function place(
   )
     throw new Error('Scheduling input exceeds work limit');
   const intervals = playIntervals(config);
+  const fair = attempt(matches, availability, config, intervals, busy, stopAtFirst, config.pace !== 'compact');
+  if (!fair.unplaced.length || config.pace === 'compact') return fair;
+  // Balancing can take a slot a later game needed; retry with earliest slots and keep the better attempt.
+  const earliest = attempt(matches, availability, config, intervals, busy, stopAtFirst, false);
+  return earliest.unplaced.length < fair.unplaced.length ? earliest : fair;
+}
+
+function attempt(
+  matches: ScheduleMatch[],
+  availability: ScheduleAvailability,
+  config: Config,
+  intervals: PlayInterval[],
+  busy: BusyGame[],
+  stopAtFirst: boolean,
+  fair: boolean,
+): Placement {
   const state = new PlacementState(config);
   for (const game of busy) state.add(game);
   const rest = availability.restMinutes * MINUTE;
@@ -624,10 +670,10 @@ function place(
   let placed = 0;
   for (const { match, index } of ordered) {
     const minDay = config.pace === 'spread' ? Math.floor((match.round - 1) * playingDays / groupRounds.get(match.groupId ?? '')!) : 0;
-    const options: PlacementOptions = { checkTeams: true, checkVenues: true, checkDays: true, rest, minDay, ...state.bounds(match) };
+    const options: PlacementOptions = { checkTeams: true, checkVenues: true, checkDays: true, rest, minDay, fair, ...state.bounds(match) };
     const selected = findPlacement(match, config, intervals, state, options);
     if (!selected) {
-      unplaced.push({ index, match, placed, reason: placementReason(match, matches.length, availability, config, intervals, state, options) });
+      unplaced.push({ index, match, placed, reason: placementReason(match, matches.length, availability, config, intervals, state, { ...options, fair: false }) });
       if (stopAtFirst) break;
       continue;
     }
