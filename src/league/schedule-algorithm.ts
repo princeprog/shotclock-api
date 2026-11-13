@@ -42,6 +42,8 @@ const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
 const MAX_GAMES = 10_000;
 const MAX_COMPARISONS = 5_000_000;
+const MAX_ISSUES = 5000;
+const MAX_RELATED_ISSUES = 3;
 export type Interval = { start: number; end: number };
 type BusyGame = Interval & {
   homeTeamId: string;
@@ -201,7 +203,7 @@ function settings(availability: ScheduleAvailability): {
   length: number;
   venueIds: string[];
   unavailable: Map<string, Set<string>>;
-  weekOf: (date: string) => number;
+  dayOf: (date: string) => number;
 } {
   if (!availability) throw new Error('Invalid availability');
   const start = date(availability.startDate);
@@ -281,7 +283,7 @@ function settings(availability: ScheduleAvailability): {
     changeover: (availability.changeoverMinutes ?? 0) * MINUTE,
     length: availability.durationMinutes * MINUTE,
     venueIds: availability.venueIds,
-    weekOf: (value: string) => Math.floor((Date.parse(`${value}T00:00:00Z`) - start) / (7 * DAY)) };
+    dayOf: (value: string) => Math.round(Date.parse(`${value}T00:00:00Z`) / DAY) };
 }
 
 function dateSet(values: string[] | undefined, name: string, maximum = 366): Set<string> {
@@ -414,13 +416,13 @@ export function estimateCourtCapacity(availability: ScheduleAvailability, existi
 }
 
 type Config = ReturnType<typeof settings>;
-type PlayInterval = Interval & { date: string; week: number; day: number };
+type PlayInterval = Interval & { date: string; dayNumber: number; day: number };
 type PlacementOptions = { checkTeams: boolean; checkVenues: boolean; checkDays: boolean; rest: number; earliest: number; latest: number; minDay: number; fair?: boolean };
 
 function playIntervals(config: Config): PlayInterval[] {
   const intervals = windows(config).map((interval) => ({ ...interval, date: localParts(config.formatter, interval.start).date }));
   const days = new Map([...new Set(intervals.map((interval) => interval.date))].sort().map((value, index) => [value, index]));
-  return intervals.map((interval) => ({ ...interval, week: config.weekOf(interval.date), day: days.get(interval.date)! }));
+  return intervals.map((interval) => ({ ...interval, dayNumber: config.dayOf(interval.date), day: days.get(interval.date)! }));
 }
 
 function involves(game: { homeTeamId: string; awayTeamId: string }, team: string): boolean {
@@ -431,7 +433,7 @@ function involves(game: { homeTeamId: string; awayTeamId: string }, team: string
 class PlacementState {
   readonly busy: BusyGame[] = [];
   private readonly days = new Map<string, number>();
-  private readonly weeks = new Map<string, number>();
+  private readonly playDays = new Map<string, number[]>();
   private readonly rounds = new Map<string, { round: number; start: number; end: number }[]>();
   private readonly tipOffs = new Map<string, number>();
   private readonly venues = new Map<string, number>();
@@ -441,10 +443,10 @@ class PlacementState {
   add(game: BusyGame, round?: number): void {
     this.busy.push(game);
     const { date, minutes } = localParts(this.config.formatter, game.start);
-    const week = this.config.weekOf(date);
+    const dayNumber = this.config.dayOf(date);
     for (const team of [game.homeTeamId, game.awayTeamId]) {
       this.days.set(`${team}\u0000${date}`, (this.days.get(`${team}\u0000${date}`) ?? 0) + 1);
-      this.weeks.set(`${team}\u0000${week}`, (this.weeks.get(`${team}\u0000${week}`) ?? 0) + 1);
+      this.playDays.set(team, [...(this.playDays.get(team) ?? []), dayNumber]);
       if (round === undefined) continue;
       this.rounds.set(team, [...(this.rounds.get(team) ?? []), { round, start: game.start, end: game.end }]);
       this.tipOffs.set(`${team}\u0000${minutes}`, (this.tipOffs.get(`${team}\u0000${minutes}`) ?? 0) + 1);
@@ -458,10 +460,11 @@ class PlacementState {
     return teams.reduce((total, team) => total + 2 * (this.tipOffs.get(`${team}\u0000${minutes}`) ?? 0) + (this.venues.get(`${team}\u0000${venueId}`) ?? 0), 0);
   }
 
-  allows(teams: string[], date: string, week: number): boolean {
+  // Weekly pacing keeps each team's games at least 7 local days apart, so week boundaries cannot create back-to-back days.
+  allows(teams: string[], date: string, dayNumber: number): boolean {
     return teams.every((team) => !this.config.unavailable.get(team)?.has(date) &&
       (this.days.get(`${team}\u0000${date}`) ?? 0) < this.config.maxPerDay &&
-      (this.config.pace !== 'weekly' || (this.weeks.get(`${team}\u0000${week}`) ?? 0) < 1));
+      (this.config.pace !== 'weekly' || !(this.playDays.get(team) ?? []).some((day) => Math.abs(day - dayNumber) < 7)));
   }
 
   // A team plays its rounds in order: after its earlier-round games end and before its later-round games start.
@@ -536,7 +539,7 @@ function findPlacement(
     for (const interval of intervals) {
       if (selected && interval.start >= selected.start) break;
       if (interval.end <= earliest || interval.day < options.minDay) continue;
-      if (options.checkDays && !state.allows(teams, interval.date, interval.week)) continue;
+      if (options.checkDays && !state.allows(teams, interval.date, interval.dayNumber)) continue;
       const start = firstFit(blocked, Math.max(interval.start, earliest), Math.min(interval.end, options.latest), config.length);
       if (start === undefined) continue;
       if (!selected || start < selected.start) selected = { ...match, venueId, start, end: start + config.length };
@@ -760,7 +763,7 @@ export function suggestSlots(
   const slots: { start: number; venueId: string }[] = [];
   for (const interval of playIntervals(config)) {
     if (slots.length >= limit) break;
-    if (interval.end <= from || !state.allows(teams, interval.date, interval.week)) continue;
+    if (interval.end <= from || !state.allows(teams, interval.date, interval.dayNumber)) continue;
     const found = new Map<number, string>();
     for (const [venueIndex, venueId] of config.venueIds.entries()) {
       const to = Math.min(interval.end, latest);
@@ -810,7 +813,15 @@ export function scheduleIssues(
   const issues: ScheduleIssue[] = [];
   const issueKeys = new Set<string>();
   const drafts: (BusyGame & { round: number; date: string })[] = [];
+  // Many overlapping games would otherwise produce an issue for every pair; keep a few related games per type and cap the total.
+  const relatedCounts = new Map<string, number>();
   const addIssue = (issue: ScheduleIssue) => {
+    if (issues.length >= MAX_ISSUES) return;
+    if (issue.with) {
+      const count = relatedCounts.get(`${issue.index}:${issue.type}`) ?? 0;
+      if (count >= MAX_RELATED_ISSUES) return;
+      relatedCounts.set(`${issue.index}:${issue.type}`, count + 1);
+    }
     const key = JSON.stringify([issue.index, issue.type, issue.message, issue.teamId, issue.with]);
     if (!issueKeys.has(key)) { issueKeys.add(key); issues.push(issue); }
   };
@@ -856,10 +867,23 @@ export function scheduleIssues(
   const limitRules: { type: ScheduleIssueType; key: (date: string) => string; limit: number; message: string }[] = [];
   if (Number.isFinite(config.maxPerDay)) limitRules.push({ type: 'daily_limit', key: (date) => date, limit: config.maxPerDay,
     message: `Daily limit: a team has more than ${config.maxPerDay} ${config.maxPerDay === 1 ? 'game' : 'games'} on this day. Choose another date.` });
-  if (config.pace === 'weekly') limitRules.push({ type: 'weekly_limit', key: (date) => String(config.weekOf(date)), limit: 1,
-    message: 'Weekly pacing: a team plays more than once this week. Choose another week.' });
+  const existingDates = limitRules.length || config.pace === 'weekly' ? busy.map((item) => ({ item, date: localParts(config.formatter, item.start).date })) : [];
+  if (config.pace === 'weekly') {
+    // A team's games, including existing ones, must be at least 7 local days apart.
+    const byTeamDay = new Map<string, { day: number; index?: number }[]>();
+    const note = (team: string, day: number, index?: number) => byTeamDay.set(team, [...(byTeamDay.get(team) ?? []), { day, index }]);
+    for (const { item, date } of existingDates) for (const team of [item.homeTeamId, item.awayTeamId]) note(team, config.dayOf(date));
+    for (const [index, item] of drafts.entries()) for (const team of [item.homeTeamId, item.awayTeamId]) note(team, config.dayOf(item.date), index);
+    for (const [team, entries] of byTeamDay) {
+      entries.sort((a, b) => a.day - b.day);
+      for (let first = 0; first < entries.length; first++) {
+        for (let second = first + 1; second < entries.length && entries[second].day - entries[first].day < 7; second++) {
+          for (const entry of [entries[first], entries[second]]) if (entry.index !== undefined) addIssue({ index: entry.index, type: 'weekly_limit', teamId: team, message: 'Weekly pacing: a team plays twice within 7 days. Choose a date at least a week from its other games.' });
+        }
+      }
+    }
+  }
   if (limitRules.length) {
-    const existingDates = busy.map((item) => ({ item, date: localParts(config.formatter, item.start).date }));
     for (const rule of limitRules) {
       const counts = new Map<string, { team: string; total: number; indexes: number[] }>();
       const count = (team: string, date: string, index?: number) => {

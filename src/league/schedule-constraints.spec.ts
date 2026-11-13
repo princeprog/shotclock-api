@@ -128,6 +128,16 @@ describe('team limits', () => {
     expect(sameWeek.filter((issue) => /weekly pacing/i.test(issue.message)).map((issue) => issue.index)).toEqual([0, 1]);
   });
 
+  it('keeps a team 7 days apart under weekly pacing, even across a week boundary', () => {
+    // The range starts on a Sunday, so a Saturday and the next Sunday fall in different 7-day blocks but are only a day apart.
+    const options = { ...twoSundays, pace: 'weekly' as const, endDate: '2026-11-15', windows: [{ weekdays: [0, 6], startTime: '09:00', endTime: '10:00' }], venueIds: ['court-a'] };
+    const games = scheduleMatches([fixture('c', 'd', 1), fixture('e', 'f', 1), fixture('a', 'b', 1), fixture('a', 'c', 2)], options, []);
+    const aDays = games.filter((game) => game.homeTeamId === 'a' || game.awayTeamId === 'a').map((game) => Date.parse(game.scheduledAt.slice(0, 10)) / 86_400_000);
+    expect(aDays[1] - aDays[0]).toBeGreaterThanOrEqual(7);
+    const backToBack = scheduleIssues([draft('a', 'b', '2026-11-07T01:00:00Z'), draft('a', 'c', '2026-11-08T01:00:00Z', 2)], options, []);
+    expect(backToBack.filter((issue) => issue.type === 'weekly_limit').map((issue) => issue.index)).toEqual([0, 1]);
+  });
+
   it('keeps games off team unavailable dates and reports them', () => {
     const options = { ...twoSundays, teamUnavailability: [{ teamId: 'a', dates: ['2026-11-01'] }] };
     const games = scheduleMatches([fixture('a', 'b'), fixture('c', 'd')], options, []);
@@ -240,6 +250,14 @@ describe('conflict details', () => {
       { index: 1, type: 'round', teamId: 'a', message: expect.stringMatching(/round sequence/i), with: { kind: 'draft', index: 0 } },
     ]));
     expect(scheduleIssues([draft('a', 'b', '2026-11-01T07:00:00Z')], options, [])).toEqual([{ index: 0, type: 'window', message: 'Game outside availability window' }]);
+  });
+
+  it('keeps the issue list bounded when many games overlap', () => {
+    const options = { ...twoSundays, venueIds: ['court-a'] };
+    const games = Array.from({ length: 120 }, (_, i) => draft('h' + i, 'a' + i, '2026-11-01T01:00:00Z'));
+    const issues = scheduleIssues(games, options, []);
+    expect(new Set(issues.map((issue) => issue.index)).size).toBe(120);
+    for (let index = 0; index < 120; index++) expect(issues.filter((issue) => issue.index === index && issue.type === 'venue').length).toBeLessThanOrEqual(3);
   });
 });
 
