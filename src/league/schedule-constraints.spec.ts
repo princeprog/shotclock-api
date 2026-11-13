@@ -214,6 +214,13 @@ describe('partial placement', () => {
     expect(plan.unplaced.map(({ index, reason }) => [index, reason])).toEqual([[2, expect.stringMatching(/at most 2 games/i)], [3, expect.stringMatching(/at most 2 games/i)]]);
     expect(() => scheduleMatches([fixture('a', 'b'), fixture('c', 'd'), fixture('e', 'f')], options, [])).toThrow(/2 of 3 games placed/i);
   });
+
+  it('places the remaining games around pinned games', () => {
+    const options = { ...base, endDate: '2026-11-01', restMinutes: 0, venueIds: ['court-a'] };
+    const pinned = [draft('a', 'b', '2026-11-01T02:00:00Z', 1)];
+    const plan = planSchedule([fixture('c', 'd', 1), fixture('a', 'c', 2)], options, [], pinned);
+    expect(plan.games.map(({ index, game }) => [index, game.scheduledAt])).toEqual([[0, '2026-11-01T01:00:00.000Z'], [1, '2026-11-01T03:00:00.000Z']]);
+  });
 });
 
 describe('conflict details', () => {

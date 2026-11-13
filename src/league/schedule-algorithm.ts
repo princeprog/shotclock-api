@@ -625,25 +625,33 @@ function place(
   availability: ScheduleAvailability,
   existing: ExistingGame[],
   stopAtFirst: boolean,
+  pinned: ScheduleGame[] = [],
 ): Placement {
   const config = settings(availability);
   if (!Array.isArray(matches) || matches.length > MAX_GAMES)
     throw new Error('Invalid matches (maximum 10000)');
   matches.forEach(validateMatch);
   const busy = busyGames(existing, availability);
+  if (!Array.isArray(pinned) || pinned.length > MAX_GAMES) throw new Error('Invalid pinned games (maximum 10000)');
+  const fixed = pinned.map((game) => {
+    validateMatch(game);
+    duration(game.durationMinutes, 'pinned durationMinutes', 1, 1440);
+    const start = instant(game.scheduledAt);
+    return { game: { homeTeamId: game.homeTeamId, awayTeamId: game.awayTeamId, venueId: game.venueId, start, end: start + game.durationMinutes * MINUTE }, round: game.round };
+  });
   if (!matches.length) return { games: [], unplaced: [] };
   if (
     matches.length *
-      (busy.length + matches.length) *
+      (busy.length + fixed.length + matches.length) *
       availability.venueIds.length >
     MAX_COMPARISONS
   )
     throw new Error('Scheduling input exceeds work limit');
   const intervals = playIntervals(config);
-  const fair = attempt(matches, availability, config, intervals, busy, stopAtFirst, config.pace !== 'compact');
+  const fair = attempt(matches, availability, config, intervals, busy, fixed, stopAtFirst, config.pace !== 'compact');
   if (!fair.unplaced.length || config.pace === 'compact') return fair;
   // Balancing can take a slot a later game needed; retry with earliest slots and keep the better attempt.
-  const earliest = attempt(matches, availability, config, intervals, busy, stopAtFirst, false);
+  const earliest = attempt(matches, availability, config, intervals, busy, fixed, stopAtFirst, false);
   return earliest.unplaced.length < fair.unplaced.length ? earliest : fair;
 }
 
@@ -653,11 +661,13 @@ function attempt(
   config: Config,
   intervals: PlayInterval[],
   busy: BusyGame[],
+  fixed: { game: BusyGame; round: number }[],
   stopAtFirst: boolean,
   fair: boolean,
 ): Placement {
   const state = new PlacementState(config);
   for (const game of busy) state.add(game);
+  for (const { game, round } of fixed) state.add(game, round);
   const rest = availability.restMinutes * MINUTE;
   const ordered = matches
     .map((match, index) => ({ match, index }))
@@ -706,13 +716,14 @@ export type SchedulePlan = {
   unplaced: { index: number; match: ScheduleMatch; reason: string }[];
 };
 
-// Places every game it can and explains each one that does not fit, so the organizer can place it by hand.
+// Places every game it can around pinned games and explains each one that does not fit, so the organizer can place it by hand.
 export function planSchedule(
   matches: ScheduleMatch[],
   availability: ScheduleAvailability,
   existing: ExistingGame[],
+  pinned: ScheduleGame[] = [],
 ): SchedulePlan {
-  const { games, unplaced } = place(matches, availability, existing, false);
+  const { games, unplaced } = place(matches, availability, existing, false, pinned);
   return {
     games: games.flatMap((game, index) => game ? [{ index, game }] : []),
     unplaced: unplaced.sort((a, b) => a.index - b.index).map(({ index, match, reason }) => ({ index, match, reason })),

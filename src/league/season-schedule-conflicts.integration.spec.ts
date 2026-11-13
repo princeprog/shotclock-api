@@ -97,6 +97,22 @@ databaseTests('season schedule conflict handling against disposable PostgreSQL',
     await f.post(`${f.base}/suggest`, { ...body, target: { index: 5 } }).expect(400);
   });
 
+  it('regenerates around kept games and lists division teams', async () => {
+    const f = await fixture();
+    const status = (await f.get(`${f.base}/status`).expect(200)).body;
+    expect(status.divisions[0].teams).toEqual(expect.arrayContaining(f.teams.map(({ id, name }) => ({ id, name }))));
+    const input = { ...f.input, availability: { ...f.availability, endDate: '2026-11-24' } };
+    const first = (await f.post(`${f.base}/preview`, input).expect(201)).body;
+    const last = first.games.find((game: PreviewGame) => game.round === 3);
+    const kept = { ...forSave(last), scheduledAt: '2026-11-24T09:00:00.000Z' };
+    const again = (await f.post(`${f.base}/preview`, { ...input, pinned: [kept] }).expect(201)).body;
+    expect(again.games).toEqual(expect.arrayContaining([expect.objectContaining({ homeTeamId: kept.homeTeamId, awayTeamId: kept.awayTeamId, round: 3, scheduledAt: kept.scheduledAt })]));
+    expect(again.games.length + again.unplaced.length).toBe(6);
+    expect(again.games.filter((game: PreviewGame) => game.scheduledAt === kept.scheduledAt)).toHaveLength(1);
+    await f.post(`${f.base}/preview`, { ...input, pinned: [kept, kept] }).expect(400);
+    await f.post(`${f.base}/preview`, { ...input, pinned: [{ ...kept, venueId: randomUUID() }] }).expect(400);
+  });
+
   it('rejects team availability for teams outside the season', async () => {
     const f = await fixture();
     await f.post(`${f.base}/preview`, { ...f.input, availability: { ...f.availability, teamUnavailability: [{ teamId: randomUUID(), dates: ['2026-11-10'] }] } }).expect(400);

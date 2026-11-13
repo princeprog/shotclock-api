@@ -174,6 +174,12 @@ export class SeasonPlayoffSaveDto extends ScheduleAvailabilityRequestDto {
   @IsArray() @ArrayNotEmpty() @ArrayUnique() @ArrayMaxSize(5000) @IsUUID('all', { each: true }) divisionIds!: string[];
   @IsArray() @ArrayNotEmpty() @ArrayMaxSize(5000) @ValidateNested({ each: true }) @Type(() => SeasonScheduleGameDto) games!: SeasonScheduleGameDto[];
 }
+export class SeasonSchedulePreviewDto extends SchedulePreviewDto {
+  @IsOptional() @IsArray() @ArrayMaxSize(5000) @ValidateNested({ each: true }) @Type(() => SeasonScheduleGameDto) pinned?: SeasonScheduleGameDto[];
+}
+export class SeasonPlayoffPreviewDto extends ScheduleAvailabilityRequestDto {
+  @IsOptional() @IsArray() @ArrayMaxSize(5000) @ValidateNested({ each: true }) @Type(() => SeasonScheduleGameDto) pinned?: SeasonScheduleGameDto[];
+}
 export class ScheduleFixtureDto {
   @IsUUID() divisionId!: string;
   @IsUUID() homeTeamId!: string;

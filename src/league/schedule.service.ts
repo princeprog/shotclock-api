@@ -2,7 +2,7 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { sql, type Kysely, type Transaction } from 'kysely';
 import { DatabaseService } from '../database/database.service';
 import type { DB } from '../database/db';
-import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffSaveDto, SeasonPlayoffSuggestDto, SeasonScheduleSaveDto, SeasonScheduleSuggestDto } from './league.dto';
+import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffPreviewDto, SeasonPlayoffSaveDto, SeasonPlayoffSuggestDto, SeasonSchedulePreviewDto, SeasonScheduleSaveDto, SeasonScheduleSuggestDto } from './league.dto';
 import { estimateCourtCapacity, planSchedule, roundRobin, scheduleIssues, scheduleMatches, SchedulePlacementError, suggestSlots, validateSchedule, type ExistingGame, type ScheduleAvailability, type ScheduleGame, type ScheduleMatch } from './schedule-algorithm';
 import { calculateStandings } from './standings';
 
@@ -186,7 +186,7 @@ export class ScheduleService {
   async seasonStatus(user: string, seasonId: string) {
     const season = await this.seasonContext(user, seasonId, this.db);
     const divisions = await this.seasonDivisions(this.db, season);
-    return { divisions: divisions.map(({ context: _context, teams: _teams, playoff: _playoff, ...division }) => division) };
+    return { divisions: divisions.map(({ context: _context, playoff: _playoff, ...division }) => division) };
   }
 
   private async seasonPlan(db: Database, season: Awaited<ReturnType<ScheduleService['seasonContext']>>, input: ScheduleAvailabilityRequestDto | SchedulePreviewDto, mode: 'preliminary' | 'playoffs', allowEmpty = false) {
@@ -213,12 +213,29 @@ export class ScheduleService {
     return { included, details, matches };
   }
 
-  private seasonPlacement(matches: (ScheduleMatch & { divisionId: string })[], availability: ScheduleAvailability, existing: ExistingGame[], divisions: { id: string; name: string; teams: { id: string; name: string }[] }[], mode: 'preliminary' | 'playoffs') {
+  private seasonPlacement(matches: (ScheduleMatch & { divisionId: string })[], availability: ScheduleAvailability, existing: ExistingGame[], divisions: { id: string; name: string; teams: { id: string; name: string }[] }[], mode: 'preliminary' | 'playoffs', pinned: (ScheduleGame & { divisionId: string })[] = []) {
+    // Pinned games keep their time and venue; they must be expected fixtures, each used once.
+    const key = (match: ScheduleMatch & { divisionId: string }) => [match.divisionId, match.stage, match.round, match.homeTeamId, match.awayTeamId].join(':');
+    const pool = new Map<string, (ScheduleGame & { divisionId: string })[]>();
+    for (const game of pinned) {
+      if (!availability.venueIds.includes(game.venueId) || game.durationMinutes !== availability.durationMinutes) throw new BadRequestException('Kept games must use the selected venues and game duration');
+      pool.set(key(game), [...(pool.get(key(game)) ?? []), game]);
+    }
+    const kept = new Map<number, ScheduleGame & { divisionId: string }>();
+    const open: number[] = [];
+    matches.forEach((match, index) => {
+      const game = pool.get(key(match))?.shift();
+      if (game) kept.set(index, game); else open.push(index);
+    });
+    if ([...pool.values()].some((games) => games.length)) throw new BadRequestException('The schedule has changed; generate a new preview');
     // Playoff divisions can be at different stages, so they do not share round order.
-    const placementMatches = mode === 'playoffs' ? matches.map((match) => ({ ...match, round: 1 })) : matches;
-    const plan = this.trySchedule(() => planSchedule(placementMatches, availability, existing));
+    const round = (item: { round: number }) => mode === 'playoffs' ? 1 : item.round;
+    const toPlace = open.map((index) => matches[index]);
+    const fixed = [...kept.values()].map((game) => ({ homeTeamId: game.homeTeamId, awayTeamId: game.awayTeamId, stage: game.stage,
+      scheduledAt: game.scheduledAt, venueId: game.venueId, durationMinutes: game.durationMinutes, round: round(game) }));
+    const plan = this.trySchedule(() => planSchedule(toPlace.map((match) => ({ ...match, round: round(match) })), availability, existing, fixed));
     const unplaced = plan.unplaced.map(({ index, reason }) => {
-      const match = matches[index];
+      const match = toPlace[index];
       const division = divisions.find((item) => item.id === match.divisionId);
       const home = division?.teams.find((team) => team.id === match.homeTeamId)?.name;
       const away = division?.teams.find((team) => team.id === match.awayTeamId)?.name;
@@ -226,16 +243,21 @@ export class ScheduleService {
         homeName: home ?? '', awayName: away ?? '', round: match.round, stage: match.stage, reason, message: new SchedulePlacementError(match, plan.games.length, matches.length, reason).withTeamNames(home, away) };
     });
     // When nothing fits, the settings are the problem; explain that instead of listing every game.
-    if (!plan.games.length && unplaced.length) throw new BadRequestException(`${unplaced[0].divisionName || 'Division'}: ${unplaced[0].message}`);
-    const games = plan.games.map(({ index, game }) => ({ ...game, round: matches[index].round, divisionId: matches[index].divisionId }));
+    if (!plan.games.length && !kept.size && unplaced.length) throw new BadRequestException(`${unplaced[0].divisionName || 'Division'}: ${unplaced[0].message}`);
+    const placed = new Map(plan.games.map(({ index, game }) => [open[index], game]));
+    const games = matches.flatMap((match, index) => {
+      const game = kept.get(index) ?? placed.get(index);
+      return game ? [{ homeTeamId: game.homeTeamId, awayTeamId: game.awayTeamId, stage: game.stage, scheduledAt: game.scheduledAt, venueId: game.venueId,
+        durationMinutes: game.durationMinutes, round: match.round, divisionId: match.divisionId }] : [];
+    });
     return { games, unplaced: unplaced.map(({ message: _message, ...item }) => item) };
   }
 
-  async previewSeason(user: string, seasonId: string, input: ScheduleAvailabilityRequestDto | SchedulePreviewDto, mode: 'preliminary' | 'playoffs') {
+  async previewSeason(user: string, seasonId: string, input: SeasonPlayoffPreviewDto | SeasonSchedulePreviewDto, mode: 'preliminary' | 'playoffs') {
     const season = await this.seasonContext(user, seasonId, this.db);
     const plan = await this.seasonPlan(this.db, season, input, mode);
     const existing = await this.existing(this.db, season.leagueId);
-    const { games, unplaced } = this.seasonPlacement(plan.matches, input.availability, existing, plan.included, mode);
+    const { games, unplaced } = this.seasonPlacement(plan.matches, input.availability, existing, plan.included, mode, input.pinned ?? []);
     const names = new Map(plan.included.flatMap((division) => division.teams.map((team) => [team.id, team.name] as const)));
     const divisionNames = new Map(plan.included.map((division) => [division.id, division.name]));
     return { games: games.map((game) => ({ ...game, homeName: names.get(game.homeTeamId), awayName: names.get(game.awayTeamId), divisionName: divisionNames.get(game.divisionId) })),
