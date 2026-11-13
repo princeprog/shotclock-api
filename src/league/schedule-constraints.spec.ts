@@ -216,3 +216,23 @@ describe('partial placement', () => {
   });
 });
 
+describe('conflict details', () => {
+  it('names the conflict type, the team and the related game', () => {
+    const options = { ...twoSundays, maxGamesPerTeamPerDay: 1, teamUnavailability: [{ teamId: 'c', dates: ['2026-11-01'] }] };
+    const existing = [{ id: 'old-1', homeTeamId: 'x', awayTeamId: 'y', scheduledAt: '2026-11-01T01:00:00Z', venueId: 'court-b', durationMinutes: 60 }];
+    const issues = scheduleIssues([
+      draft('a', 'b', '2026-11-01T01:00:00Z'),
+      draft('a', 'c', '2026-11-01T01:30:00Z', 2, 'court-b'),
+    ], options, existing);
+    expect(issues).toEqual(expect.arrayContaining([
+      { index: 0, type: 'team', teamId: 'a', message: expect.stringMatching(/team conflict/i), with: { kind: 'draft', index: 1 } },
+      { index: 1, type: 'team', teamId: 'a', message: expect.stringMatching(/team conflict/i), with: { kind: 'draft', index: 0 } },
+      { index: 1, type: 'venue', message: expect.stringMatching(/already booked/i), with: { kind: 'existing', id: 'old-1' } },
+      { index: 1, type: 'unavailable', teamId: 'c', message: expect.stringMatching(/unavailable/i) },
+      { index: 0, type: 'daily_limit', teamId: 'a', message: expect.stringMatching(/daily limit/i) },
+      { index: 1, type: 'round', teamId: 'a', message: expect.stringMatching(/round sequence/i), with: { kind: 'draft', index: 0 } },
+    ]));
+    expect(scheduleIssues([draft('a', 'b', '2026-11-01T07:00:00Z')], options, [])).toEqual([{ index: 0, type: 'window', message: 'Game outside availability window' }]);
+  });
+});
+

@@ -488,29 +488,30 @@ function firstFit(blocked: Interval[], from: number, to: number, length: number)
   return start + length <= to ? start : undefined;
 }
 
+type Conflict = { type: 'team' | 'venue'; message: string; teamId?: string };
+
 function conflictReasons(
   candidate: BusyGame,
   previous: BusyGame,
   rest: number,
   changeover: number,
-): string[] {
-  const reasons: string[] = [];
-  const sameTeam =
-    involves(previous, candidate.homeTeamId) || involves(previous, candidate.awayTeamId);
+): Conflict[] {
+  const reasons: Conflict[] = [];
+  const sharedTeam = [candidate.homeTeamId, candidate.awayTeamId].find((team) => involves(previous, team));
   if (
-    sameTeam &&
+    sharedTeam &&
     candidate.start < previous.end + rest &&
     previous.start < candidate.end + rest
   )
-    reasons.push('Team conflict: a team is playing or has insufficient rest. Choose another time.');
+    reasons.push({ type: 'team', teamId: sharedTeam, message: 'Team conflict: a team is playing or has insufficient rest. Choose another time.' });
   if (
     candidate.venueId !== null &&
     candidate.venueId === previous.venueId &&
     candidate.start < previous.end + changeover &&
     previous.start < candidate.end + changeover
-  ) reasons.push(candidate.start < previous.end && previous.start < candidate.end
+  ) reasons.push({ type: 'venue', message: candidate.start < previous.end && previous.start < candidate.end
     ? 'Venue conflict: this court is already booked. Choose another time or venue.'
-    : 'Venue conflict: this court needs changeover time between games. Choose another time or venue.');
+    : 'Venue conflict: this court needs changeover time between games. Choose another time or venue.' });
   return reasons;
 }
 
@@ -727,11 +728,20 @@ export function validateSchedule(
   if (issues.length) throw new Error(issues[0].message);
 }
 
+export type ScheduleIssueType = 'team' | 'venue' | 'window' | 'round' | 'blackout' | 'unavailable' | 'daily_limit' | 'weekly_limit';
+export type ScheduleIssue = {
+  index: number;
+  type: ScheduleIssueType;
+  message: string;
+  teamId?: string;
+  with?: { kind: 'draft'; index: number } | { kind: 'existing'; id: string };
+};
+
 export function scheduleIssues(
   games: ScheduleGame[],
   availability: ScheduleAvailability,
   existing: ExistingGame[],
-): { index: number; message: string }[] {
+): ScheduleIssue[] {
   const config = settings(availability);
   if (!Array.isArray(games) || games.length > MAX_GAMES)
     throw new Error('Invalid games (maximum 10000)');
@@ -741,13 +751,15 @@ export function scheduleIssues(
     throw new Error('Schedule validation input exceeds work limit');
   const intervals = windows(config);
   const rest = availability.restMinutes * MINUTE;
-  const issues: { index: number; message: string }[] = [];
+  const issues: ScheduleIssue[] = [];
   const issueKeys = new Set<string>();
   const drafts: (BusyGame & { round: number; date: string })[] = [];
-  const addIssue = (index: number, message: string) => {
-    const key = `${index}:${message}`;
-    if (!issueKeys.has(key)) { issueKeys.add(key); issues.push({ index, message }); }
+  const addIssue = (issue: ScheduleIssue) => {
+    const key = JSON.stringify([issue.index, issue.type, issue.message, issue.teamId, issue.with]);
+    if (!issueKeys.has(key)) { issueKeys.add(key); issues.push(issue); }
   };
+  const related = (index: number, conflict: Conflict, other: ScheduleIssue['with']) =>
+    addIssue({ index, ...conflict, ...(other ? { with: other } : {}) });
   for (const [index, game] of games.entries()) {
     validateMatch(game);
     if (!availability.venueIds.includes(game.venueId))
@@ -764,55 +776,61 @@ export function scheduleIssues(
       end: start + game.durationMinutes * MINUTE,
       date: localParts(config.formatter, start).date,
     };
-    if (config.blackouts.has(candidate.date)) addIssue(index, 'Blackout date: games cannot be scheduled on this date. Choose another date.');
+    if (config.blackouts.has(candidate.date)) addIssue({ index, type: 'blackout', message: 'Blackout date: games cannot be scheduled on this date. Choose another date.' });
     else if (
       !intervals.some(
         (interval) =>
           candidate.start >= interval.start && candidate.end <= interval.end,
       )
     )
-      addIssue(index, 'Game outside availability window');
-    if ([game.homeTeamId, game.awayTeamId].some((team) => config.unavailable.get(team)?.has(candidate.date)))
-      addIssue(index, 'Team availability: a team is unavailable on this date. Choose another date.');
-    for (const item of busy) for (const message of conflictReasons(candidate, item, rest, config.changeover)) addIssue(index, message);
+      addIssue({ index, type: 'window', message: 'Game outside availability window' });
+    for (const team of [game.homeTeamId, game.awayTeamId]) {
+      if (config.unavailable.get(team)?.has(candidate.date))
+        addIssue({ index, type: 'unavailable', teamId: team, message: 'Team availability: a team is unavailable on this date. Choose another date.' });
+    }
+    for (const item of busy) for (const conflict of conflictReasons(candidate, item, rest, config.changeover)) related(index, conflict, item.id ? { kind: 'existing', id: item.id } : undefined);
     for (const [otherIndex, item] of drafts.entries()) {
-      for (const message of conflictReasons(candidate, item, rest, config.changeover)) {
-        addIssue(index, message);
-        addIssue(otherIndex, message);
+      for (const conflict of conflictReasons(candidate, item, rest, config.changeover)) {
+        related(index, conflict, { kind: 'draft', index: otherIndex });
+        related(otherIndex, conflict, { kind: 'draft', index });
       }
     }
     drafts.push(candidate);
   }
-  const limitRules: { key: (team: string, date: string) => string; limit: number; message: string }[] = [];
-  if (Number.isFinite(config.maxPerDay)) limitRules.push({ key: (team, date) => `${team}\u0000${date}`, limit: config.maxPerDay,
+  const limitRules: { type: ScheduleIssueType; key: (date: string) => string; limit: number; message: string }[] = [];
+  if (Number.isFinite(config.maxPerDay)) limitRules.push({ type: 'daily_limit', key: (date) => date, limit: config.maxPerDay,
     message: `Daily limit: a team has more than ${config.maxPerDay} ${config.maxPerDay === 1 ? 'game' : 'games'} on this day. Choose another date.` });
-  if (config.pace === 'weekly') limitRules.push({ key: (team, date) => `${team}\u0000${config.weekOf(date)}`, limit: 1,
+  if (config.pace === 'weekly') limitRules.push({ type: 'weekly_limit', key: (date) => String(config.weekOf(date)), limit: 1,
     message: 'Weekly pacing: a team plays more than once this week. Choose another week.' });
   if (limitRules.length) {
     const existingDates = busy.map((item) => ({ item, date: localParts(config.formatter, item.start).date }));
     for (const rule of limitRules) {
-      const counts = new Map<string, { total: number; indexes: number[] }>();
+      const counts = new Map<string, { team: string; total: number; indexes: number[] }>();
       const count = (team: string, date: string, index?: number) => {
-        const entry = counts.get(rule.key(team, date)) ?? { total: 0, indexes: [] };
+        const key = `${team}\u0000${rule.key(date)}`;
+        const entry = counts.get(key) ?? { team, total: 0, indexes: [] };
         entry.total++;
         if (index !== undefined) entry.indexes.push(index);
-        counts.set(rule.key(team, date), entry);
+        counts.set(key, entry);
       };
       for (const { item, date } of existingDates) for (const team of [item.homeTeamId, item.awayTeamId]) count(team, date);
       for (const [index, item] of drafts.entries()) for (const team of [item.homeTeamId, item.awayTeamId]) count(team, item.date, index);
-      for (const entry of counts.values()) if (entry.total > rule.limit) for (const index of entry.indexes) addIssue(index, rule.message);
+      for (const entry of counts.values()) {
+        if (entry.total > rule.limit) for (const index of entry.indexes) addIssue({ index, type: rule.type, teamId: entry.team, message: rule.message });
+      }
     }
   }
   const byTeam = new Map<string, number[]>();
   for (const [index, item] of drafts.entries()) for (const team of [item.homeTeamId, item.awayTeamId]) byTeam.set(team, [...(byTeam.get(team) ?? []), index]);
-  for (const indexes of byTeam.values()) {
+  for (const [team, indexes] of byTeam) {
     for (const first of indexes) {
       for (const second of indexes) {
         const earlier = drafts[first];
         const later = drafts[second];
         if (earlier.round < later.round && later.start < earlier.end) {
-          addIssue(first, 'Round sequence conflict: a later round starts before an earlier round ends');
-          addIssue(second, 'Round sequence conflict: a later round starts before an earlier round ends');
+          const message = 'Round sequence conflict: a later round starts before an earlier round ends';
+          addIssue({ index: first, type: 'round', teamId: team, message, with: { kind: 'draft', index: second } });
+          addIssue({ index: second, type: 'round', teamId: team, message, with: { kind: 'draft', index: first } });
         }
       }
     }

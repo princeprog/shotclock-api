@@ -259,7 +259,23 @@ export class ScheduleService {
     for (const division of plan.included) this.partOfMatches(plan.matches.filter((match) => match.divisionId === division.id), input.games.filter((game) => game.divisionId === division.id));
     if (input.games.some((game) => !expectedIds.includes(game.divisionId))) throw new BadRequestException('The schedule has changed; generate a new preview');
     const existing = await this.existing(this.db, season.leagueId);
-    return { issues: this.trySchedule(() => scheduleIssues(mode === 'playoffs' ? input.games.map((game) => ({ ...game, round: 1 })) : input.games, input.availability, existing)) };
+    const issues = this.trySchedule(() => scheduleIssues(mode === 'playoffs' ? input.games.map((game) => ({ ...game, round: 1 })) : input.games, input.availability, existing));
+    const ids = [...new Set(issues.flatMap((issue) => issue.with?.kind === 'existing' ? [issue.with.id] : []))];
+    return { issues, existingGames: await this.existingDetails(season.leagueId, ids) };
+  }
+
+  // Names, time and place of existing games that a draft conflicts with, so the organizer can see what is in the way.
+  private async existingDetails(leagueId: string, ids: string[]) {
+    if (!ids.length) return [];
+    const games = await this.db.selectFrom('league.games as g').innerJoin('league.seasons as s', 's.id', 'g.season_id')
+      .innerJoin('league.divisions as d', 'd.id', 'g.division_id')
+      .innerJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').innerJoin('league.teams as ht', 'ht.id', 'h.team_id')
+      .innerJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').innerJoin('league.teams as at', 'at.id', 'a.team_id')
+      .leftJoin('league.venues as v', 'v.id', 'g.venue_id')
+      .select(['g.id', 'g.scheduled_at', 'g.duration_minutes', 'g.venue_id', 'v.name as venueName', 'ht.name as homeName', 'at.name as awayName', 'd.name as divisionName'])
+      .where('s.league_id', '=', leagueId).where('g.id', 'in', ids).execute();
+    return games.map((game) => ({ id: game.id, scheduledAt: new Date(game.scheduled_at!).toISOString(), durationMinutes: game.duration_minutes,
+      venueId: game.venue_id, venueName: game.venueName, homeName: game.homeName, awayName: game.awayName, divisionName: game.divisionName }));
   }
 
   async calendarSeason(user: string, seasonId: string, input: ScheduleAvailabilityRequestDto) {

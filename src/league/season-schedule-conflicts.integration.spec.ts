@@ -40,7 +40,7 @@ databaseTests('season schedule conflict handling against disposable PostgreSQL',
     const teams: { id: string; name: string }[] = (await get(`/seasons/${season.id}/teams?divisionId=${division.id}`).expect(200)).body;
     const availability = { startDate: '2026-11-10', endDate: '2026-11-10', windows: [{ weekdays: [2], startTime: '08:00', endTime: '10:00' }], timeZone: 'UTC', venueIds: [venue.id], durationMinutes: 60, restMinutes: 0 };
     const input = { format: 'single', playoffs: false, thirdPlace: false, availability };
-    return { post, get, season, division, venue, teams, availability, input, base: `/seasons/${season.id}/schedule` };
+    return { post, get, league, season, division, venue, teams, availability, input, base: `/seasons/${season.id}/schedule` };
   }
 
   it('returns unplaced games with reasons and validates the partial draft without saving it', async () => {
@@ -53,6 +53,20 @@ databaseTests('season schedule conflict handling against disposable PostgreSQL',
     expect((await f.post(`${f.base}/validate`, body).expect(201)).body.issues).toEqual([]);
     await f.post(`${f.base}/validate`, { ...body, games: [...body.games, body.games[0]] }).expect(400);
     await f.post(f.base, body).expect(400);
+  });
+
+  it('describes conflicts with the related draft and existing games', async () => {
+    const f = await fixture();
+    const other = (await f.post(`/seasons/${f.season.id}/divisions`, { name: 'Other' }).expect(201)).body;
+    for (let i = 0; i < 2; i++) await f.post(`/leagues/${f.league.id}/teams`, { name: `Other ${i}`, seasonId: f.season.id, divisionId: other.id }).expect(201);
+    const otherTeams: { id: string }[] = (await f.get(`/seasons/${f.season.id}/teams?divisionId=${other.id}`).expect(200)).body;
+    const old = (await f.post(`/seasons/${f.season.id}/games`, { homeTeamId: otherTeams[0].id, awayTeamId: otherTeams[1].id, venueId: f.venue.id, scheduledAt: '2026-11-10T08:00:00Z', durationMinutes: 60 }).expect(201)).body;
+    const preview = (await f.post(`${f.base}/preview`, f.input).expect(201)).body;
+    expect(preview.games).toHaveLength(1);
+    const moved = { ...forSave(preview.games[0]), scheduledAt: '2026-11-10T08:00:00.000Z' };
+    const result = (await f.post(`${f.base}/validate`, { ...f.input, games: [moved], divisionIds: [f.division.id] }).expect(201)).body;
+    expect(result.issues).toEqual(expect.arrayContaining([expect.objectContaining({ index: 0, type: 'venue', with: { kind: 'existing', id: old.id } })]));
+    expect(result.existingGames).toEqual([expect.objectContaining({ id: old.id, homeName: 'Other 0', awayName: 'Other 1', divisionName: 'Other', venueName: 'Court', scheduledAt: '2026-11-10T08:00:00.000Z' })]);
   });
 
   it('explains the settings problem when no game fits', async () => {
