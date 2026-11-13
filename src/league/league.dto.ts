@@ -174,3 +174,24 @@ export class SeasonPlayoffSaveDto extends ScheduleAvailabilityRequestDto {
   @IsArray() @ArrayNotEmpty() @ArrayUnique() @ArrayMaxSize(5000) @IsUUID('all', { each: true }) divisionIds!: string[];
   @IsArray() @ArrayNotEmpty() @ArrayMaxSize(5000) @ValidateNested({ each: true }) @Type(() => SeasonScheduleGameDto) games!: SeasonScheduleGameDto[];
 }
+export class ScheduleFixtureDto {
+  @IsUUID() divisionId!: string;
+  @IsUUID() homeTeamId!: string;
+  @IsUUID() awayTeamId!: string;
+  @IsInt() @Min(1) @Max(500) round!: number;
+  @IsIn(['preliminary', 'semifinal', 'final', 'third_place']) stage!: 'preliminary' | 'semifinal' | 'final' | 'third_place';
+}
+export class ScheduleSuggestTargetDto {
+  @IsOptional() @IsInt() @Min(0) @Max(4999) index?: number;
+  @IsOptional() @ValidateNested() @Type(() => ScheduleFixtureDto) game?: ScheduleFixtureDto;
+}
+export class SeasonScheduleSuggestDto extends SchedulePreviewDto {
+  @IsArray() @ArrayNotEmpty() @ArrayUnique() @ArrayMaxSize(5000) @IsUUID('all', { each: true }) divisionIds!: string[];
+  @IsArray() @ArrayMaxSize(5000) @ValidateNested({ each: true }) @Type(() => SeasonScheduleGameDto) games!: SeasonScheduleGameDto[];
+  @IsDefined() @ValidateNested() @Type(() => ScheduleSuggestTargetDto) target!: ScheduleSuggestTargetDto;
+}
+export class SeasonPlayoffSuggestDto extends ScheduleAvailabilityRequestDto {
+  @IsArray() @ArrayNotEmpty() @ArrayUnique() @ArrayMaxSize(5000) @IsUUID('all', { each: true }) divisionIds!: string[];
+  @IsArray() @ArrayMaxSize(5000) @ValidateNested({ each: true }) @Type(() => SeasonScheduleGameDto) games!: SeasonScheduleGameDto[];
+  @IsDefined() @ValidateNested() @Type(() => ScheduleSuggestTargetDto) target!: ScheduleSuggestTargetDto;
+}

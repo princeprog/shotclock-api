@@ -1,4 +1,4 @@
-import { estimateCourtCapacity, planSchedule, playingIntervals, roundRobin, scheduleIssues, scheduleMatches } from './schedule-algorithm';
+import { estimateCourtCapacity, planSchedule, playingIntervals, roundRobin, scheduleIssues, scheduleMatches, suggestSlots } from './schedule-algorithm';
 import type { ScheduleAvailability } from './schedule-algorithm';
 
 const MINUTE = 60_000;
@@ -233,6 +233,35 @@ describe('conflict details', () => {
       { index: 1, type: 'round', teamId: 'a', message: expect.stringMatching(/round sequence/i), with: { kind: 'draft', index: 0 } },
     ]));
     expect(scheduleIssues([draft('a', 'b', '2026-11-01T07:00:00Z')], options, [])).toEqual([{ index: 0, type: 'window', message: 'Game outside availability window' }]);
+  });
+});
+
+describe('slot suggestions', () => {
+  const options: ScheduleAvailability = { ...twoSundays, restMinutes: 30, maxGamesPerTeamPerDay: 1 };
+
+  it('suggests the next open times that pass every check', () => {
+    const drafts = [draft('a', 'b', '2026-11-01T01:00:00Z'), draft('c', 'd', '2026-11-01T01:00:00Z', 1, 'court-b'), draft('c', 'e', '2026-11-08T01:00:00Z', 2)];
+    const existing = [{ id: 'old', homeTeamId: 'x', awayTeamId: 'y', scheduledAt: '2026-11-01T02:00:00Z', venueId: 'court-a', durationMinutes: 60 }];
+    const slots = suggestSlots(fixture('e', 'f'), drafts, options, existing);
+    expect(slots).toEqual([
+      { scheduledAt: '2026-11-01T02:00:00.000Z', venueId: 'court-b' },
+      { scheduledAt: '2026-11-01T03:00:00.000Z', venueId: 'court-a' },
+      { scheduledAt: '2026-11-01T04:00:00.000Z', venueId: 'court-a' },
+    ]);
+    for (const slot of slots) {
+      expect(scheduleIssues([...drafts, { ...fixture('e', 'f'), ...slot, durationMinutes: 60 }], options, existing).filter((issue) => issue.index === 3)).toEqual([]);
+    }
+  });
+
+  it('keeps a team round order and its daily limit', () => {
+    const drafts = [draft('a', 'b', '2026-11-01T01:00:00Z', 1)];
+    const slots = suggestSlots(fixture('a', 'c', 2), drafts, options, []);
+    expect(slots.every((slot) => slot.scheduledAt.startsWith('2026-11-08'))).toBe(true);
+    expect(slots).toHaveLength(3);
+  });
+
+  it('returns no suggestions when nothing is open', () => {
+    expect(suggestSlots(fixture('a', 'b'), [], { ...options, blackoutDates: ['2026-11-01', '2026-11-08'] }, [])).toEqual([]);
   });
 });
 

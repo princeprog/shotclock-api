@@ -719,6 +719,51 @@ export function planSchedule(
   };
 }
 
+// Open slots for one game around the rest of a draft, in time order with one venue per start time.
+export function suggestSlots(
+  match: ScheduleMatch,
+  drafts: ScheduleGame[],
+  availability: ScheduleAvailability,
+  existing: ExistingGame[],
+  limit = 3,
+): { scheduledAt: string; venueId: string }[] {
+  const config = settings(availability);
+  validateMatch(match);
+  if (!Array.isArray(drafts) || drafts.length > MAX_GAMES) throw new Error('Invalid games (maximum 10000)');
+  const busy = busyGames(existing, availability);
+  if ((busy.length + drafts.length) * availability.venueIds.length > MAX_COMPARISONS) throw new Error('Scheduling input exceeds work limit');
+  const state = new PlacementState(config);
+  for (const game of busy) state.add(game);
+  for (const game of drafts) {
+    validateMatch(game);
+    const start = instant(game.scheduledAt);
+    state.add({ homeTeamId: game.homeTeamId, awayTeamId: game.awayTeamId, venueId: game.venueId, start, end: start + game.durationMinutes * MINUTE }, game.round);
+  }
+  const teams = [match.homeTeamId, match.awayTeamId];
+  const rest = availability.restMinutes * MINUTE;
+  const { earliest, latest } = state.bounds(match);
+  const teamBlocked = state.busy.filter((item) => teams.some((team) => involves(item, team))).map((item) => ({ start: item.start - rest, end: item.end + rest }));
+  const blockedByVenue = config.venueIds.map((venueId) => [...teamBlocked, ...state.busy.filter((item) => item.venueId === venueId)
+    .map((item) => ({ start: item.start - config.changeover, end: item.end + config.changeover }))].sort((a, b) => a.start - b.start));
+  const from = Math.ceil(earliest / MINUTE) * MINUTE;
+  const slots: { start: number; venueId: string }[] = [];
+  for (const interval of playIntervals(config)) {
+    if (slots.length >= limit) break;
+    if (interval.end <= from || !state.allows(teams, interval.date, interval.week)) continue;
+    const found = new Map<number, string>();
+    for (const [venueIndex, venueId] of config.venueIds.entries()) {
+      const to = Math.min(interval.end, latest);
+      let next = Math.max(interval.start, from);
+      for (let start = firstFit(blockedByVenue[venueIndex], next, to, config.length); start !== undefined; start = firstFit(blockedByVenue[venueIndex], next, to, config.length)) {
+        if (!found.has(start)) found.set(start, venueId);
+        next = start + config.length + config.changeover;
+      }
+    }
+    for (const start of [...found.keys()].sort((a, b) => a - b)) slots.push({ start, venueId: found.get(start)! });
+  }
+  return slots.slice(0, limit).map(({ start, venueId }) => ({ scheduledAt: new Date(start).toISOString(), venueId }));
+}
+
 export function validateSchedule(
   games: ScheduleGame[],
   availability: ScheduleAvailability,

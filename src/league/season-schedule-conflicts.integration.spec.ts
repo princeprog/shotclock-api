@@ -75,6 +75,28 @@ databaseTests('season schedule conflict handling against disposable PostgreSQL',
     expect(response.body.message).toMatch(/blackout/i);
   });
 
+  it('suggests open slots for unplaced and draft games', async () => {
+    const f = await fixture();
+    const preview = (await f.post(`${f.base}/preview`, f.input).expect(201)).body;
+    const games = preview.games.map(forSave);
+    const { divisionId, homeTeamId, awayTeamId, round, stage } = preview.unplaced[0];
+    const wider = { ...f.availability, endDate: '2026-11-17' };
+    const body = { ...f.input, availability: wider, games, divisionIds: [f.division.id] };
+    const unplaced = (await f.post(`${f.base}/suggest`, { ...body, target: { game: { divisionId, homeTeamId, awayTeamId, round, stage } } }).expect(201)).body;
+    expect(unplaced.suggestions).toEqual([
+      { scheduledAt: '2026-11-17T08:00:00.000Z', venueId: f.venue.id },
+      { scheduledAt: '2026-11-17T09:00:00.000Z', venueId: f.venue.id },
+    ]);
+    const draft = (await f.post(`${f.base}/suggest`, { ...body, target: { index: 0 } }).expect(201)).body;
+    expect(draft.suggestions).toEqual([
+      { scheduledAt: '2026-11-17T08:00:00.000Z', venueId: f.venue.id },
+      { scheduledAt: '2026-11-17T09:00:00.000Z', venueId: f.venue.id },
+    ]);
+    await f.post(`${f.base}/suggest`, { ...body, target: { index: 0, game: { divisionId, homeTeamId, awayTeamId, round, stage } } }).expect(400);
+    await f.post(`${f.base}/suggest`, { ...body, target: { game: { divisionId, homeTeamId, awayTeamId: homeTeamId, round, stage } } }).expect(400);
+    await f.post(`${f.base}/suggest`, { ...body, target: { index: 5 } }).expect(400);
+  });
+
   it('rejects team availability for teams outside the season', async () => {
     const f = await fixture();
     await f.post(`${f.base}/preview`, { ...f.input, availability: { ...f.availability, teamUnavailability: [{ teamId: randomUUID(), dates: ['2026-11-10'] }] } }).expect(400);

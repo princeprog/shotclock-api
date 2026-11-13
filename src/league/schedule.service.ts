@@ -2,8 +2,8 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { sql, type Kysely, type Transaction } from 'kysely';
 import { DatabaseService } from '../database/database.service';
 import type { DB } from '../database/db';
-import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffSaveDto, SeasonScheduleSaveDto } from './league.dto';
-import { estimateCourtCapacity, planSchedule, roundRobin, scheduleIssues, scheduleMatches, SchedulePlacementError, validateSchedule, type ExistingGame, type ScheduleAvailability, type ScheduleGame, type ScheduleMatch } from './schedule-algorithm';
+import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffSaveDto, SeasonPlayoffSuggestDto, SeasonScheduleSaveDto, SeasonScheduleSuggestDto } from './league.dto';
+import { estimateCourtCapacity, planSchedule, roundRobin, scheduleIssues, scheduleMatches, SchedulePlacementError, suggestSlots, validateSchedule, type ExistingGame, type ScheduleAvailability, type ScheduleGame, type ScheduleMatch } from './schedule-algorithm';
 import { calculateStandings } from './standings';
 
 type Database = Kysely<DB> | Transaction<DB>;
@@ -276,6 +276,30 @@ export class ScheduleService {
       .where('s.league_id', '=', leagueId).where('g.id', 'in', ids).execute();
     return games.map((game) => ({ id: game.id, scheduledAt: new Date(game.scheduled_at!).toISOString(), durationMinutes: game.duration_minutes,
       venueId: game.venue_id, venueName: game.venueName, homeName: game.homeName, awayName: game.awayName, divisionName: game.divisionName }));
+  }
+
+  async suggestSeason(user: string, seasonId: string, input: SeasonScheduleSuggestDto | SeasonPlayoffSuggestDto, mode: 'preliminary' | 'playoffs') {
+    const season = await this.seasonContext(user, seasonId, this.db);
+    const plan = await this.seasonPlan(this.db, season, input, mode);
+    const expectedIds = plan.included.map((division) => division.id).sort();
+    const submittedIds = [...input.divisionIds].sort();
+    if (expectedIds.length !== submittedIds.length || expectedIds.some((id, index) => id !== submittedIds[index])) throw new BadRequestException('Eligible divisions changed; generate a new preview');
+    const { index, game } = input.target;
+    if ((index === undefined) === (game === undefined)) throw new BadRequestException('Choose either a draft game or an unplaced game');
+    if (index !== undefined && index >= input.games.length) throw new BadRequestException('The schedule has changed; generate a new preview');
+    const target = index !== undefined ? input.games[index] : game!;
+    const others = input.games.filter((_, position) => position !== index);
+    const all = index !== undefined ? input.games : [...input.games, { ...game!, scheduledAt: '', venueId: '', durationMinutes: input.availability.durationMinutes }];
+    if (all.some((item) => !expectedIds.includes(item.divisionId))) throw new BadRequestException('The schedule has changed; generate a new preview');
+    for (const division of plan.included) this.partOfMatches(plan.matches.filter((match) => match.divisionId === division.id), all.filter((item) => item.divisionId === division.id));
+    const existing = await this.existing(this.db, season.leagueId);
+    // Playoff divisions can be at different stages, so they do not share round order.
+    const round = (item: { round: number }) => mode === 'playoffs' ? 1 : item.round;
+    const match: ScheduleMatch = { homeTeamId: target.homeTeamId, awayTeamId: target.awayTeamId, round: round(target), stage: target.stage };
+    const current = index !== undefined ? { at: Date.parse(input.games[index].scheduledAt), venueId: input.games[index].venueId } : undefined;
+    const slots = this.trySchedule(() => suggestSlots(match, others.map((item) => ({ ...item, round: round(item) })), input.availability, existing, 4));
+    // The game's own slot is not a suggestion.
+    return { suggestions: slots.filter((slot) => !current || Date.parse(slot.scheduledAt) !== current.at || slot.venueId !== current.venueId).slice(0, 3) };
   }
 
   async calendarSeason(user: string, seasonId: string, input: ScheduleAvailabilityRequestDto) {

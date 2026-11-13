@@ -4,7 +4,7 @@ import { CreateTeamDto, MoveTeamRegistrationDto, DivisionDto, DivisionFilterDto,
 import { LeagueService } from './league.service';
 import { ScheduleService } from './schedule.service';
 import { ForfeitDto } from './forfeit.dto';
-import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffSaveDto, SeasonScheduleSaveDto } from './league.dto';
+import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffSaveDto, SeasonPlayoffSuggestDto, SeasonScheduleSaveDto, SeasonScheduleSuggestDto } from './league.dto';
 
 @Controller('league')
 export class LeagueController {
@@ -44,10 +44,12 @@ export class LeagueController {
   @Post('seasons/:id/schedule/estimate') async estimateSeasonSchedule(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: SchedulePreviewDto) { return this.schedule.estimateSeason(await this.user(h), id, dto, 'preliminary'); }
   @Post('seasons/:id/schedule/validate') async validateSeasonSchedule(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: SeasonScheduleSaveDto) { return this.schedule.validateSeason(await this.user(h), id, dto, 'preliminary'); }
   @Post('seasons/:id/schedule/calendar') async calendarSeasonSchedule(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: ScheduleAvailabilityRequestDto) { return this.schedule.calendarSeason(await this.user(h), id, dto); }
+  @Post('seasons/:id/schedule/suggest') async suggestSeasonSchedule(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: SeasonScheduleSuggestDto) { return this.schedule.suggestSeason(await this.user(h), id, dto, 'preliminary'); }
   @Post('seasons/:id/schedule') async saveSeasonSchedule(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: SeasonScheduleSaveDto) { return this.schedule.saveSeason(await this.user(h), id, dto, 'preliminary'); }
   @Post('seasons/:id/playoffs/preview') async previewSeasonPlayoffs(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: ScheduleAvailabilityRequestDto) { return this.schedule.previewSeason(await this.user(h), id, dto, 'playoffs'); }
   @Post('seasons/:id/playoffs/estimate') async estimateSeasonPlayoffs(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: ScheduleAvailabilityRequestDto) { return this.schedule.estimateSeason(await this.user(h), id, dto, 'playoffs'); }
   @Post('seasons/:id/playoffs/validate') async validateSeasonPlayoffs(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: SeasonPlayoffSaveDto) { return this.schedule.validateSeason(await this.user(h), id, dto, 'playoffs'); }
+  @Post('seasons/:id/playoffs/suggest') async suggestSeasonPlayoffs(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: SeasonPlayoffSuggestDto) { return this.schedule.suggestSeason(await this.user(h), id, dto, 'playoffs'); }
   @Post('seasons/:id/playoffs') async saveSeasonPlayoffs(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: SeasonPlayoffSaveDto) { return this.schedule.saveSeason(await this.user(h), id, dto, 'playoffs'); }
   @Post('seasons/:id/status') async status(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: StatusDto) { return this.league.transition(await this.user(h), id, dto.status); }
   @Get('leagues/:id/teams') async teams(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.league.teams(await this.user(h), id); }
