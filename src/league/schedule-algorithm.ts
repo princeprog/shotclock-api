@@ -700,6 +700,24 @@ export function scheduleMatches(
   return games as ScheduleGame[];
 }
 
+export type SchedulePlan = {
+  games: { index: number; game: ScheduleGame }[];
+  unplaced: { index: number; match: ScheduleMatch; reason: string }[];
+};
+
+// Places every game it can and explains each one that does not fit, so the organizer can place it by hand.
+export function planSchedule(
+  matches: ScheduleMatch[],
+  availability: ScheduleAvailability,
+  existing: ExistingGame[],
+): SchedulePlan {
+  const { games, unplaced } = place(matches, availability, existing, false);
+  return {
+    games: games.flatMap((game, index) => game ? [{ index, game }] : []),
+    unplaced: unplaced.sort((a, b) => a.index - b.index).map(({ index, match, reason }) => ({ index, match, reason })),
+  };
+}
+
 export function validateSchedule(
   games: ScheduleGame[],
   availability: ScheduleAvailability,

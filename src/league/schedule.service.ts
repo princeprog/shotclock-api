@@ -3,7 +3,7 @@ import { sql, type Kysely, type Transaction } from 'kysely';
 import { DatabaseService } from '../database/database.service';
 import type { DB } from '../database/db';
 import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffSaveDto, SeasonScheduleSaveDto } from './league.dto';
-import { estimateCourtCapacity, roundRobin, scheduleIssues, scheduleMatches, SchedulePlacementError, validateSchedule, type ExistingGame, type ScheduleAvailability, type ScheduleGame, type ScheduleMatch } from './schedule-algorithm';
+import { estimateCourtCapacity, planSchedule, roundRobin, scheduleIssues, scheduleMatches, SchedulePlacementError, validateSchedule, type ExistingGame, type ScheduleAvailability, type ScheduleGame, type ScheduleMatch } from './schedule-algorithm';
 import { calculateStandings } from './standings';
 
 type Database = Kysely<DB> | Transaction<DB>;
@@ -81,6 +81,18 @@ export class ScheduleService {
     const left = expected.map(key).sort();
     const right = actual.map(key).sort();
     if (left.length !== right.length || left.some((value, index) => value !== right[index])) throw new BadRequestException('The schedule has changed; generate a new preview');
+  }
+
+  // A draft may still be missing games the organizer has not placed, but it cannot add or repeat fixtures.
+  private partOfMatches(expected: ScheduleMatch[], actual: ScheduleGame[]) {
+    const key = (match: ScheduleMatch) => [match.stage, match.round, match.homeTeamId, match.awayTeamId].join(':');
+    const remaining = new Map<string, number>();
+    for (const match of expected) remaining.set(key(match), (remaining.get(key(match)) ?? 0) + 1);
+    for (const game of actual) {
+      const count = remaining.get(key(game)) ?? 0;
+      if (!count) throw new BadRequestException('The schedule has changed; generate a new preview');
+      remaining.set(key(game), count - 1);
+    }
   }
 
   private trySchedule<T>(fn: () => T, teams: { id: string; name: string }[] = []): T {
@@ -202,31 +214,32 @@ export class ScheduleService {
   }
 
   private seasonPlacement(matches: (ScheduleMatch & { divisionId: string })[], availability: ScheduleAvailability, existing: ExistingGame[], divisions: { id: string; name: string; teams: { id: string; name: string }[] }[], mode: 'preliminary' | 'playoffs') {
-    // Playoff divisions can be at different stages, so only preliminary rounds share an ordering barrier.
+    // Playoff divisions can be at different stages, so they do not share round order.
     const placementMatches = mode === 'playoffs' ? matches.map((match) => ({ ...match, round: 1 })) : matches;
-    try {
-      return scheduleMatches(placementMatches, availability, existing).map((game, index) => ({ ...game, round: matches[index].round, divisionId: matches[index].divisionId }));
-    } catch (error) {
-      if (error instanceof SchedulePlacementError) {
-        const division = divisions.find((item) => item.teams.some((team) => team.id === error.match.homeTeamId));
-        const home = division?.teams.find((team) => team.id === error.match.homeTeamId)?.name;
-        const away = division?.teams.find((team) => team.id === error.match.awayTeamId)?.name;
-        throw new BadRequestException(`${division?.name ?? 'Division'}: ${error.withTeamNames(home, away)}`);
-      }
-      if (error instanceof Error && /work limit/i.test(error.message)) throw new BadRequestException('This schedule is too large to process safely. Try a single round robin or fewer venues. No games were saved.');
-      throw new BadRequestException(error instanceof Error ? error.message : 'Invalid schedule');
-    }
+    const plan = this.trySchedule(() => planSchedule(placementMatches, availability, existing));
+    const unplaced = plan.unplaced.map(({ index, reason }) => {
+      const match = matches[index];
+      const division = divisions.find((item) => item.id === match.divisionId);
+      const home = division?.teams.find((team) => team.id === match.homeTeamId)?.name;
+      const away = division?.teams.find((team) => team.id === match.awayTeamId)?.name;
+      return { divisionId: match.divisionId, divisionName: division?.name ?? '', homeTeamId: match.homeTeamId, awayTeamId: match.awayTeamId,
+        homeName: home ?? '', awayName: away ?? '', round: match.round, stage: match.stage, reason, message: new SchedulePlacementError(match, plan.games.length, matches.length, reason).withTeamNames(home, away) };
+    });
+    // When nothing fits, the settings are the problem; explain that instead of listing every game.
+    if (!plan.games.length && unplaced.length) throw new BadRequestException(`${unplaced[0].divisionName || 'Division'}: ${unplaced[0].message}`);
+    const games = plan.games.map(({ index, game }) => ({ ...game, round: matches[index].round, divisionId: matches[index].divisionId }));
+    return { games, unplaced: unplaced.map(({ message: _message, ...item }) => item) };
   }
 
   async previewSeason(user: string, seasonId: string, input: ScheduleAvailabilityRequestDto | SchedulePreviewDto, mode: 'preliminary' | 'playoffs') {
     const season = await this.seasonContext(user, seasonId, this.db);
     const plan = await this.seasonPlan(this.db, season, input, mode);
     const existing = await this.existing(this.db, season.leagueId);
-    const games = this.seasonPlacement(plan.matches, input.availability, existing, plan.included, mode);
+    const { games, unplaced } = this.seasonPlacement(plan.matches, input.availability, existing, plan.included, mode);
     const names = new Map(plan.included.flatMap((division) => division.teams.map((team) => [team.id, team.name] as const)));
     const divisionNames = new Map(plan.included.map((division) => [division.id, division.name]));
     return { games: games.map((game) => ({ ...game, homeName: names.get(game.homeTeamId), awayName: names.get(game.awayTeamId), divisionName: divisionNames.get(game.divisionId) })),
-      warnings: this.warnings(games, plan.included[0].context, input.availability.timeZone), divisions: plan.details };
+      unplaced, warnings: this.warnings(games, plan.included[0].context, input.availability.timeZone), divisions: plan.details };
   }
 
   async estimateSeason(user: string, seasonId: string, input: ScheduleAvailabilityRequestDto | SchedulePreviewDto, mode: 'preliminary' | 'playoffs') {
@@ -243,7 +256,7 @@ export class ScheduleService {
     const expectedIds = plan.included.map((division) => division.id).sort();
     const submittedIds = [...input.divisionIds].sort();
     if (expectedIds.length !== submittedIds.length || expectedIds.some((id, index) => id !== submittedIds[index])) throw new BadRequestException('Eligible divisions changed; generate a new preview');
-    for (const division of plan.included) this.sameMatches(plan.matches.filter((match) => match.divisionId === division.id), input.games.filter((game) => game.divisionId === division.id));
+    for (const division of plan.included) this.partOfMatches(plan.matches.filter((match) => match.divisionId === division.id), input.games.filter((game) => game.divisionId === division.id));
     if (input.games.some((game) => !expectedIds.includes(game.divisionId))) throw new BadRequestException('The schedule has changed; generate a new preview');
     const existing = await this.existing(this.db, season.leagueId);
     return { issues: this.trySchedule(() => scheduleIssues(mode === 'playoffs' ? input.games.map((game) => ({ ...game, round: 1 })) : input.games, input.availability, existing)) };

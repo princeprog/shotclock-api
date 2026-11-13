@@ -1,4 +1,4 @@
-import { estimateCourtCapacity, playingIntervals, roundRobin, scheduleIssues, scheduleMatches } from './schedule-algorithm';
+import { estimateCourtCapacity, planSchedule, playingIntervals, roundRobin, scheduleIssues, scheduleMatches } from './schedule-algorithm';
 import type { ScheduleAvailability } from './schedule-algorithm';
 
 const MINUTE = 60_000;
@@ -203,6 +203,16 @@ describe('constraint settings validation', () => {
     expect(() => estimateCourtCapacity({ ...base, changeoverMinutes: 241 }, [])).toThrow(/changeoverMinutes/);
     expect(() => estimateCourtCapacity({ ...base, teamUnavailability: [{ teamId: 'a', dates: [] }, { teamId: 'a', dates: [] }] }, [])).toThrow(/teamUnavailability/);
     expect(() => estimateCourtCapacity({ ...base, teamUnavailability: [{ teamId: 'a', dates: ['2026-13-01'] }] }, [])).toThrow(/teamUnavailability/);
+  });
+});
+
+describe('partial placement', () => {
+  it('places what fits and explains each unplaced game', () => {
+    const options = { ...base, venueIds: ['court-a'], endDate: '2026-11-01', windows: [{ weekdays: [0], startTime: '09:00', endTime: '11:00' }] };
+    const plan = planSchedule([fixture('a', 'b'), fixture('c', 'd'), fixture('e', 'f'), fixture('g', 'h')], options, []);
+    expect(plan.games.map(({ index, game }) => [index, game.scheduledAt])).toEqual([[0, '2026-11-01T01:00:00.000Z'], [1, '2026-11-01T02:00:00.000Z']]);
+    expect(plan.unplaced.map(({ index, reason }) => [index, reason])).toEqual([[2, expect.stringMatching(/at most 2 games/i)], [3, expect.stringMatching(/at most 2 games/i)]]);
+    expect(() => scheduleMatches([fixture('a', 'b'), fixture('c', 'd'), fixture('e', 'f')], options, [])).toThrow(/2 of 3 games placed/i);
   });
 });
 
