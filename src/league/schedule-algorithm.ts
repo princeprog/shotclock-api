@@ -615,11 +615,16 @@ function place(
   const ordered = matches
     .map((match, index) => ({ match, index }))
     .sort((a, b) => a.match.round - b.match.round || a.index - b.index);
+  // Spread pacing gives round r of a group with R rounds the playing days from floor((r - 1) * days / R) onward.
+  const playingDays = intervals.length ? intervals[intervals.length - 1].day + 1 : 0;
+  const groupRounds = new Map<string, number>();
+  for (const match of matches) groupRounds.set(match.groupId ?? '', Math.max(groupRounds.get(match.groupId ?? '') ?? 0, match.round));
   const games: (ScheduleGame | undefined)[] = new Array(matches.length);
   const unplaced: Unplaced[] = [];
   let placed = 0;
   for (const { match, index } of ordered) {
-    const options: PlacementOptions = { checkTeams: true, checkVenues: true, checkDays: true, rest, minDay: 0, ...state.bounds(match) };
+    const minDay = config.pace === 'spread' ? Math.floor((match.round - 1) * playingDays / groupRounds.get(match.groupId ?? '')!) : 0;
+    const options: PlacementOptions = { checkTeams: true, checkVenues: true, checkDays: true, rest, minDay, ...state.bounds(match) };
     const selected = findPlacement(match, config, intervals, state, options);
     if (!selected) {
       unplaced.push({ index, match, placed, reason: placementReason(match, matches.length, availability, config, intervals, state, options) });
@@ -628,8 +633,9 @@ function place(
     }
     state.add(selected, match.round);
     placed++;
+    const { groupId: _groupId, ...fixture } = match;
     games[index] = {
-      ...match,
+      ...fixture,
       scheduledAt: new Date(selected.start).toISOString(),
       venueId: selected.venueId!,
       durationMinutes: availability.durationMinutes,

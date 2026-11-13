@@ -1,4 +1,4 @@
-import { estimateCourtCapacity, playingIntervals, scheduleIssues, scheduleMatches } from './schedule-algorithm';
+import { estimateCourtCapacity, playingIntervals, roundRobin, scheduleIssues, scheduleMatches } from './schedule-algorithm';
 import type { ScheduleAvailability } from './schedule-algorithm';
 
 const MINUTE = 60_000;
@@ -139,6 +139,26 @@ describe('team limits', () => {
   it('reports games on blackout dates', () => {
     const issues = scheduleIssues([draft('a', 'b', '2026-11-08T01:00:00Z')], { ...twoSundays, blackoutDates: ['2026-11-08'] }, []);
     expect(issues.map((issue) => issue.message)).toEqual([expect.stringMatching(/blackout date/i)]);
+  });
+});
+
+describe('spread pacing', () => {
+  const sixSundays: ScheduleAvailability = { ...base, endDate: '2026-12-06', pace: 'spread' };
+
+  it('spaces each division round evenly across the playing days', () => {
+    const games = scheduleMatches(roundRobin(['a', 'b', 'c', 'd'], 'single').map((match) => ({ ...match, groupId: 'x' })), sixSundays, []);
+    const firstDay = (round: number) => games.filter((game) => game.round === round).map((game) => game.scheduledAt.slice(0, 10)).sort()[0];
+    expect([firstDay(1), firstDay(2), firstDay(3)]).toEqual(['2026-11-01', '2026-11-15', '2026-11-29']);
+    expect(games.every((game) => !('groupId' in game))).toBe(true);
+  });
+
+  it('spaces each division by its own number of rounds', () => {
+    const matches = [
+      ...roundRobin(['a', 'b', 'c', 'd'], 'single').map((match) => ({ ...match, groupId: 'x' })),
+      ...roundRobin(['e', 'f'], 'double').map((match) => ({ ...match, groupId: 'y' })),
+    ];
+    const games = scheduleMatches(matches, sixSundays, []);
+    expect(games.filter((game) => game.homeTeamId === 'e' || game.awayTeamId === 'e').map((game) => game.scheduledAt.slice(0, 10))).toEqual(['2026-11-01', '2026-11-22']);
   });
 });
 

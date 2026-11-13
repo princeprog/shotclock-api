@@ -195,7 +195,7 @@ export class ScheduleService {
     if (!included.length && !allowEmpty) throw new BadRequestException(mode === 'preliminary' ? 'No divisions are eligible for schedule generation.' : 'No divisions are ready to schedule playoff games.');
     const matches = included.flatMap((division) => {
       const fixtures = mode === 'preliminary' ? roundRobin(division.teams.map((team) => team.id), (input as SchedulePreviewDto).format) : division.playoff!.matches;
-      return fixtures.map((match) => ({ ...match, divisionId: division.id }));
+      return fixtures.map((match) => ({ ...match, divisionId: division.id, groupId: division.id }));
     });
     if (matches.length > 5000) throw new BadRequestException('This schedule exceeds the 5,000-game batch limit.');
     return { included, details, matches };
