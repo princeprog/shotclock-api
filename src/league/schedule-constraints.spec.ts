@@ -1,4 +1,4 @@
-import { estimateCourtCapacity, planSchedule, playingIntervals, roundRobin, scheduleIssues, scheduleMatches, suggestSlots } from './schedule-algorithm';
+import { estimateCourtCapacity, planSchedule, playingIntervals, roundRobin, scheduleIssues, scheduleMatches, suggestSlots, teamGameCapacity } from './schedule-algorithm';
 import type { ScheduleAvailability } from './schedule-algorithm';
 
 const MINUTE = 60_000;
@@ -287,6 +287,25 @@ describe('slot suggestions', () => {
 
   it('returns no suggestions when nothing is open', () => {
     expect(suggestSlots(fixture('a', 'b'), [], { ...options, blackoutDates: ['2026-11-01', '2026-11-08'] }, [])).toEqual([]);
+  });
+});
+
+describe('per-team capacity', () => {
+  const weekends: ScheduleAvailability = { ...base, startDate: '2028-11-15', endDate: '2028-11-30', windows: [{ weekdays: [0, 6], startTime: '09:00', endTime: '17:00' }] };
+
+  it('counts how many games each team can play under weekly pacing', () => {
+    // Weekend dates Nov 18–26 and 7 days apart: the 18th, the 25th, then nothing a week after the 25th.
+    expect(teamGameCapacity({ ...weekends, pace: 'weekly' })).toEqual({ maxGamesPerTeam: 2, limitedBy: 'weekly' });
+    expect(teamGameCapacity({ ...weekends, pace: 'compact', maxGamesPerTeamPerDay: 1 })).toEqual({ maxGamesPerTeam: 4, limitedBy: 'daily' });
+    expect(teamGameCapacity({ ...weekends, pace: 'compact' })).toEqual({ maxGamesPerTeam: null, limitedBy: null });
+  });
+
+  it('reports a short reason code for each unplaced game', () => {
+    const plan = planSchedule(roundRobin(['a', 'b', 'c', 'd'], 'single'), { ...weekends, pace: 'weekly' }, []);
+    expect(plan.unplaced.length).toBeGreaterThan(0);
+    expect(new Set(plan.unplaced.map((item) => item.code))).toEqual(new Set(['limits']));
+    const crowded = planSchedule([fixture('a', 'b'), fixture('c', 'd'), fixture('e', 'f')], { ...base, venueIds: ['court-a'], endDate: '2026-11-01', windows: [{ weekdays: [0], startTime: '09:00', endTime: '11:00' }] }, []);
+    expect(crowded.unplaced.map((item) => item.code)).toEqual(['capacity']);
   });
 });
 

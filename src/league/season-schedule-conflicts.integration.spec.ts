@@ -75,6 +75,15 @@ databaseTests('season schedule conflict handling against disposable PostgreSQL',
     expect(response.body.message).toMatch(/blackout/i);
   });
 
+  it('estimates how many games each team can play under pacing', async () => {
+    const f = await fixture();
+    const estimate = (await f.post(`${f.base}/estimate`, { ...f.input, availability: { ...f.availability, endDate: '2026-11-17', pace: 'weekly' } }).expect(201)).body;
+    expect(estimate).toMatchObject({ maxGamesPerTeam: 2, limitedBy: 'weekly' });
+    expect(estimate.divisions).toEqual([expect.objectContaining({ id: f.division.id, gameCount: 6, gamesPerTeam: 3 })]);
+    const preview = (await f.post(`${f.base}/preview`, f.input).expect(201)).body;
+    expect(preview.unplaced.every((item: { reasonCode: string }) => typeof item.reasonCode === 'string')).toBe(true);
+  });
+
   it('suggests open slots for unplaced and draft games', async () => {
     const f = await fixture();
     const preview = (await f.post(`${f.base}/preview`, f.input).expect(201)).body;

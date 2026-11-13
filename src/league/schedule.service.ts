@@ -3,7 +3,7 @@ import { sql, type Kysely, type Transaction } from 'kysely';
 import { DatabaseService } from '../database/database.service';
 import type { DB } from '../database/db';
 import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffPreviewDto, SeasonPlayoffSaveDto, SeasonPlayoffSuggestDto, SeasonSchedulePreviewDto, SeasonScheduleSaveDto, SeasonScheduleSuggestDto } from './league.dto';
-import { estimateCourtCapacity, planSchedule, roundRobin, scheduleIssues, scheduleMatches, SchedulePlacementError, suggestSlots, validateSchedule, type ExistingGame, type ScheduleAvailability, type ScheduleGame, type ScheduleMatch } from './schedule-algorithm';
+import { estimateCourtCapacity, planSchedule, teamGameCapacity, roundRobin, scheduleIssues, scheduleMatches, SchedulePlacementError, suggestSlots, validateSchedule, type ExistingGame, type ScheduleAvailability, type ScheduleGame, type ScheduleMatch } from './schedule-algorithm';
 import { calculateStandings } from './standings';
 
 type Database = Kysely<DB> | Transaction<DB>;
@@ -239,13 +239,13 @@ export class ScheduleService {
     const fixed = [...kept.values()].map((game) => ({ homeTeamId: game.homeTeamId, awayTeamId: game.awayTeamId, stage: game.stage,
       scheduledAt: game.scheduledAt, venueId: game.venueId, durationMinutes: game.durationMinutes, round: round(game) }));
     const plan = this.trySchedule(() => planSchedule(toPlace.map((match) => ({ ...match, round: round(match) })), availability, existing, fixed));
-    const unplaced = plan.unplaced.map(({ index, reason }) => {
+    const unplaced = plan.unplaced.map(({ index, reason, code }) => {
       const match = toPlace[index];
       const division = divisions.find((item) => item.id === match.divisionId);
       const home = division?.teams.find((team) => team.id === match.homeTeamId)?.name;
       const away = division?.teams.find((team) => team.id === match.awayTeamId)?.name;
       return { divisionId: match.divisionId, divisionName: division?.name ?? '', homeTeamId: match.homeTeamId, awayTeamId: match.awayTeamId,
-        homeName: home ?? '', awayName: away ?? '', round: match.round, stage: match.stage, reason, message: new SchedulePlacementError(match, plan.games.length, matches.length, reason).withTeamNames(home, away) };
+        homeName: home ?? '', awayName: away ?? '', round: match.round, stage: match.stage, reason, reasonCode: code, message: new SchedulePlacementError(match, plan.games.length, matches.length, reason).withTeamNames(home, away) };
     });
     // When nothing fits, the settings are the problem; explain that instead of listing every game.
     if (!plan.games.length && !kept.size && unplaced.length) throw new BadRequestException(`${unplaced[0].divisionName || 'Division'}: ${unplaced[0].message}`);
@@ -274,7 +274,14 @@ export class ScheduleService {
     const plan = await this.seasonPlan(this.db, season, input, mode, true);
     const existing = await this.existing(this.db, season.leagueId, input.availability);
     const capacity = this.trySchedule(() => estimateCourtCapacity(input.availability, existing));
-    return { capacity, required: plan.matches.length, divisions: plan.details.map((division) => ({ ...division, gameCount: plan.matches.filter((match) => match.divisionId === division.id).length })) };
+    const teamCapacity = this.trySchedule(() => teamGameCapacity(input.availability));
+    // The most games any one team plays in the division, compared with what pacing and daily limits allow.
+    const gamesPerTeam = (divisionId: string) => {
+      const counts = new Map<string, number>();
+      for (const match of plan.matches) if (match.divisionId === divisionId) for (const team of [match.homeTeamId, match.awayTeamId]) counts.set(team, (counts.get(team) ?? 0) + 1);
+      return Math.max(0, ...counts.values());
+    };
+    return { capacity, required: plan.matches.length, ...teamCapacity, divisions: plan.details.map((division) => ({ ...division, gameCount: plan.matches.filter((match) => match.divisionId === division.id).length, gamesPerTeam: gamesPerTeam(division.id) })) };
   }
 
   async validateSeason(user: string, seasonId: string, input: SeasonScheduleSaveDto | SeasonPlayoffSaveDto, mode: 'preliminary' | 'playoffs') {

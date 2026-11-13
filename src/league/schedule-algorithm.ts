@@ -493,6 +493,19 @@ function firstFit(blocked: Interval[], from: number, to: number, length: number)
 
 type Conflict = { type: 'team' | 'venue'; message: string; teamId?: string };
 
+// The most games one team can play in the range under the pacing and daily limits, ignoring courts and opponents.
+export function teamGameCapacity(availability: ScheduleAvailability): { maxGamesPerTeam: number | null; limitedBy: 'weekly' | 'daily' | null } {
+  const config = settings(availability);
+  const days = [...new Set(playIntervals(config).map((interval) => interval.dayNumber))].sort((a, b) => a - b);
+  if (config.pace === 'weekly') {
+    let count = 0;
+    let last = -Infinity;
+    for (const day of days) if (day - last >= 7) { count++; last = day; }
+    return { maxGamesPerTeam: count, limitedBy: 'weekly' };
+  }
+  if (Number.isFinite(config.maxPerDay)) return { maxGamesPerTeam: days.length * config.maxPerDay, limitedBy: 'daily' };
+  return { maxGamesPerTeam: null, limitedBy: null };
+}
 function conflictReasons(
   candidate: BusyGame,
   previous: BusyGame,
@@ -565,6 +578,9 @@ function findPlacement(
   return best.game;
 }
 
+// Short codes let the review screen show a brief reason; the message explains it in full.
+export type PlacementReasonCode = 'no_days' | 'short_windows' | 'capacity' | 'rest' | 'limits' | 'round_order' | 'spread' | 'teams_busy' | 'venues_busy' | 'mixed';
+
 function placementReason(
   match: ScheduleMatch,
   total: number,
@@ -573,7 +589,7 @@ function placementReason(
   intervals: PlayInterval[],
   state: PlacementState,
   options: PlacementOptions,
-): string {
+): { code: PlacementReasonCode; message: string } {
   if (!intervals.length) {
     let hasSelectedDay = false;
     let hasBlackoutDay = false;
@@ -582,44 +598,44 @@ function placementReason(
       if (config.blackouts.has(new Date(day).toISOString().slice(0, 10))) hasBlackoutDay = true;
       else { hasSelectedDay = true; break; }
     }
-    if (!hasSelectedDay && hasBlackoutDay) return 'Every selected playing day in the date range is a blackout date. Remove a blackout date or extend the date range.';
-    return hasSelectedDay
+    if (!hasSelectedDay && hasBlackoutDay) return { code: 'no_days', message: 'Every selected playing day in the date range is a blackout date. Remove a blackout date or extend the date range.' };
+    return { code: 'no_days', message: hasSelectedDay
       ? 'The selected playing windows do not occur on those dates in the chosen time zone; check for a daylight-saving gap or choose different hours.'
-      : 'No selected playing days fall within the date range. Add a playing day or extend the date range.';
+      : 'No selected playing days fall within the date range. Add a playing day or extend the date range.' };
   }
   const longest = Math.max(...intervals.map((interval) => (interval.end - interval.start) / MINUTE));
   if (longest < availability.durationMinutes) {
-    return `The longest playing window is ${longest} minutes, shorter than the ${availability.durationMinutes}-minute game. Extend a playing window or reduce the game duration.`;
+    return { code: 'short_windows', message: `The longest playing window is ${longest} minutes, shorter than the ${availability.durationMinutes}-minute game. Extend a playing window or reduce the game duration.` };
   }
   const capacity = intervals.reduce((count, interval) => count + Math.floor((interval.end - interval.start + config.changeover) / (config.length + config.changeover)), 0) * availability.venueIds.length;
   if (capacity < total) {
     const shortfall = total - capacity;
-    return `The selected windows and venues can fit at most ${capacity} ${capacity === 1 ? 'game' : 'games'}, but ${total} games are needed, even before conflicts and rest are considered. Add at least ${shortfall} more game ${shortfall === 1 ? 'slot' : 'slots'} by extending playing time or adding venues.`;
+    return { code: 'capacity', message: `The selected windows and venues can fit at most ${capacity} ${capacity === 1 ? 'game' : 'games'}, but ${total} games are needed, even before conflicts and rest are considered. Add at least ${shortfall} more game ${shortfall === 1 ? 'slot' : 'slots'} by extending playing time or adding venues.` };
   }
   const fits = (changes: Partial<PlacementOptions>) => !!findPlacement(match, config, intervals, state, { ...options, ...changes });
   if (options.rest && fits({ rest: 0 })) {
-    return `In this attempted schedule, the minimum rest of ${availability.restMinutes} minutes leaves no available slot for this matchup. Add playing time or reduce the rest requirement. A different arrangement may also work.`;
+    return { code: 'rest', message: `In this attempted schedule, the minimum rest of ${availability.restMinutes} minutes leaves no available slot for this matchup. Add playing time or reduce the rest requirement. A different arrangement may also work.` };
   }
   const dayRules = config.unavailable.size > 0 || Number.isFinite(config.maxPerDay) || config.pace === 'weekly';
   if (dayRules && fits({ checkDays: false })) {
-    return 'In this attempted schedule, the games-per-day limit, weekly pacing or team unavailable dates leave no slot for this matchup. Extend the date range, add playing days or relax these limits. A different arrangement may also work.';
+    return { code: 'limits', message: 'In this attempted schedule, the games-per-day limit, weekly pacing or team unavailable dates leave no slot for this matchup. Extend the date range, add playing days or relax these limits. A different arrangement may also work.' };
   }
   if ((Number.isFinite(options.earliest) || Number.isFinite(options.latest)) && fits({ earliest: -Infinity, latest: Infinity })) {
-    return 'A suitable slot exists earlier, but each team must finish its previous round first. Add more playing time or extend the date range. A different arrangement may also work.';
+    return { code: 'round_order', message: 'A suitable slot exists earlier, but each team must finish its previous round first. Add more playing time or extend the date range. A different arrangement may also work.' };
   }
   if (options.minDay > 0 && fits({ minDay: 0 })) {
-    return 'Spread pacing reserves later dates for this round, and those dates are full. Add playing time or choose weekly pacing. A different arrangement may also work.';
+    return { code: 'spread', message: 'Spread pacing reserves later dates for this round, and those dates are full. Add playing time or choose weekly pacing. A different arrangement may also work.' };
   }
   if (fits({ checkTeams: false })) {
-    return 'In this attempted schedule, one or both teams are already playing or resting whenever a suitable slot is available. Add playing time or adjust the rest requirement. A different arrangement may also work.';
+    return { code: 'teams_busy', message: 'In this attempted schedule, one or both teams are already playing or resting whenever a suitable slot is available. Add playing time or adjust the rest requirement. A different arrangement may also work.' };
   }
   if (fits({ checkVenues: false })) {
-    return 'In this attempted schedule, the selected venues are occupied when this matchup could otherwise play. Add a venue or more playing time. A different arrangement may also work.';
+    return { code: 'venues_busy', message: 'In this attempted schedule, the selected venues are occupied when this matchup could otherwise play. Add a venue or more playing time. A different arrangement may also work.' };
   }
-  return 'The selected times, venues, team availability, rest and round order leave no slot in this attempt. Add playing time or venues, or reduce rest. A different arrangement may also work.';
+  return { code: 'mixed', message: 'The selected times, venues, team availability, rest and round order leave no slot in this attempt. Add playing time or venues, or reduce rest. A different arrangement may also work.' };
 }
 
-type Unplaced = { index: number; match: ScheduleMatch; placed: number; reason: string };
+type Unplaced = { index: number; match: ScheduleMatch; placed: number; reason: string; code: PlacementReasonCode };
 
 type Placement = { games: (ScheduleGame | undefined)[]; unplaced: Unplaced[] };
 
@@ -687,7 +703,8 @@ function attempt(
     const options: PlacementOptions = { checkTeams: true, checkVenues: true, checkDays: true, rest, minDay, fair, ...state.bounds(match) };
     const selected = findPlacement(match, config, intervals, state, options);
     if (!selected) {
-      unplaced.push({ index, match, placed, reason: placementReason(match, matches.length, availability, config, intervals, state, { ...options, fair: false }) });
+      const why = placementReason(match, matches.length, availability, config, intervals, state, { ...options, fair: false });
+      unplaced.push({ index, match, placed, reason: why.message, code: why.code });
       if (stopAtFirst) break;
       continue;
     }
@@ -716,7 +733,7 @@ export function scheduleMatches(
 
 export type SchedulePlan = {
   games: { index: number; game: ScheduleGame }[];
-  unplaced: { index: number; match: ScheduleMatch; reason: string }[];
+  unplaced: { index: number; match: ScheduleMatch; reason: string; code: PlacementReasonCode }[];
 };
 
 // Places every game it can around pinned games and explains each one that does not fit, so the organizer can place it by hand.
@@ -729,7 +746,7 @@ export function planSchedule(
   const { games, unplaced } = place(matches, availability, existing, false, pinned);
   return {
     games: games.flatMap((game, index) => game ? [{ index, game }] : []),
-    unplaced: unplaced.sort((a, b) => a.index - b.index).map(({ index, match, reason }) => ({ index, match, reason })),
+    unplaced: unplaced.sort((a, b) => a.index - b.index).map(({ index, match, reason, code }) => ({ index, match, reason, code })),
   };
 }
 
