@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+      - run: pnpm test
+      - run: pnpm build
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: shotclock
+          POSTGRES_PASSWORD: shotclock-ci
+          POSTGRES_DB: shotclock_auth_dev_test_c1
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U shotclock"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    # Test-only values for a throwaway CI database; never reuse them elsewhere.
+    env:
+      NODE_ENV: test
+      DB_HOST: localhost
+      DB_PORT: '5432'
+      DB_USER: shotclock
+      DB_PASSWORD: shotclock-ci
+      DB_NAME: shotclock_auth_dev_test_c1
+      AUTH_TEST_DB: '1'
+      AUTH_JWT_SECRET: ci-only-jwt-secret-with-at-least-32-bytes
+      FRONTEND_URL: http://localhost:3000
+      CORS_ORIGINS: http://localhost:3000
+      SMTP_HOST: localhost
+      SMTP_PORT: '1025'
+      SMTP_SECURE: 'false'
+      SMTP_REQUIRE_TLS: 'false'
+      SMTP_FROM: Shotclock <no-reply@example.test>
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm migrate:latest
+      - run: pnpm test --runInBand
+
