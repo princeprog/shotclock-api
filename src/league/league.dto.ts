@@ -119,6 +119,10 @@ export class ScheduleWindowDto {
   @Matches(/^([01]\d|2[0-3]):[0-5]\d$/) startTime!: string;
   @Matches(/^([01]\d|2[0-3]):[0-5]\d$/) endTime!: string;
 }
+export class TeamUnavailabilityDto {
+  @IsUUID() teamId!: string;
+  @IsArray() @ArrayMaxSize(366) @ArrayUnique() @Matches(/^\d{4}-\d{2}-\d{2}$/, { each: true }) dates!: string[];
+}
 export class ScheduleAvailabilityDto {
   @Matches(/^\d{4}-\d{2}-\d{2}$/) startDate!: string;
   @Matches(/^\d{4}-\d{2}-\d{2}$/) endDate!: string;
@@ -127,6 +131,11 @@ export class ScheduleAvailabilityDto {
   @IsArray() @ArrayNotEmpty() @ArrayUnique() @ArrayMaxSize(100) @IsUUID('all', { each: true }) venueIds!: string[];
   @IsInt() @Min(1) @Max(1440) durationMinutes!: number;
   @IsInt() @Min(0) @Max(10080) restMinutes!: number;
+  @IsOptional() @IsArray() @ArrayMaxSize(366) @ArrayUnique() @Matches(/^\d{4}-\d{2}-\d{2}$/, { each: true }) blackoutDates?: string[];
+  @IsOptional() @IsIn(['weekly', 'spread', 'compact']) pace?: 'weekly' | 'spread' | 'compact';
+  @IsOptional() @IsInt() @Min(1) @Max(10) maxGamesPerTeamPerDay?: number;
+  @IsOptional() @IsInt() @Min(0) @Max(240) changeoverMinutes?: number;
+  @IsOptional() @IsArray() @ArrayMaxSize(200) @ValidateNested({ each: true }) @Type(() => TeamUnavailabilityDto) teamUnavailability?: TeamUnavailabilityDto[];
 }
 export class ScheduleGameDto {
   @IsUUID() homeTeamId!: string;
@@ -164,4 +173,31 @@ export class SeasonScheduleSaveDto extends SchedulePreviewDto {
 export class SeasonPlayoffSaveDto extends ScheduleAvailabilityRequestDto {
   @IsArray() @ArrayNotEmpty() @ArrayUnique() @ArrayMaxSize(5000) @IsUUID('all', { each: true }) divisionIds!: string[];
   @IsArray() @ArrayNotEmpty() @ArrayMaxSize(5000) @ValidateNested({ each: true }) @Type(() => SeasonScheduleGameDto) games!: SeasonScheduleGameDto[];
+}
+export class SeasonSchedulePreviewDto extends SchedulePreviewDto {
+  @IsOptional() @IsArray() @ArrayMaxSize(5000) @ValidateNested({ each: true }) @Type(() => SeasonScheduleGameDto) pinned?: SeasonScheduleGameDto[];
+}
+export class SeasonPlayoffPreviewDto extends ScheduleAvailabilityRequestDto {
+  @IsOptional() @IsArray() @ArrayMaxSize(5000) @ValidateNested({ each: true }) @Type(() => SeasonScheduleGameDto) pinned?: SeasonScheduleGameDto[];
+}
+export class ScheduleFixtureDto {
+  @IsUUID() divisionId!: string;
+  @IsUUID() homeTeamId!: string;
+  @IsUUID() awayTeamId!: string;
+  @IsInt() @Min(1) @Max(500) round!: number;
+  @IsIn(['preliminary', 'semifinal', 'final', 'third_place']) stage!: 'preliminary' | 'semifinal' | 'final' | 'third_place';
+}
+export class ScheduleSuggestTargetDto {
+  @IsOptional() @IsInt() @Min(0) @Max(4999) index?: number;
+  @IsOptional() @ValidateNested() @Type(() => ScheduleFixtureDto) game?: ScheduleFixtureDto;
+}
+export class SeasonScheduleSuggestDto extends SchedulePreviewDto {
+  @IsArray() @ArrayNotEmpty() @ArrayUnique() @ArrayMaxSize(5000) @IsUUID('all', { each: true }) divisionIds!: string[];
+  @IsArray() @ArrayMaxSize(5000) @ValidateNested({ each: true }) @Type(() => SeasonScheduleGameDto) games!: SeasonScheduleGameDto[];
+  @IsDefined() @ValidateNested() @Type(() => ScheduleSuggestTargetDto) target!: ScheduleSuggestTargetDto;
+}
+export class SeasonPlayoffSuggestDto extends ScheduleAvailabilityRequestDto {
+  @IsArray() @ArrayNotEmpty() @ArrayUnique() @ArrayMaxSize(5000) @IsUUID('all', { each: true }) divisionIds!: string[];
+  @IsArray() @ArrayMaxSize(5000) @ValidateNested({ each: true }) @Type(() => SeasonScheduleGameDto) games!: SeasonScheduleGameDto[];
+  @IsDefined() @ValidateNested() @Type(() => ScheduleSuggestTargetDto) target!: ScheduleSuggestTargetDto;
 }

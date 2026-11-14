@@ -2,8 +2,8 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { sql, type Kysely, type Transaction } from 'kysely';
 import { DatabaseService } from '../database/database.service';
 import type { DB } from '../database/db';
-import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffSaveDto, SeasonScheduleSaveDto } from './league.dto';
-import { estimateCourtCapacity, roundRobin, scheduleIssues, scheduleMatches, SchedulePlacementError, validateSchedule, type ExistingGame, type ScheduleAvailability, type ScheduleGame, type ScheduleMatch } from './schedule-algorithm';
+import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffPreviewDto, SeasonPlayoffSaveDto, SeasonPlayoffSuggestDto, SeasonSchedulePreviewDto, SeasonScheduleSaveDto, SeasonScheduleSuggestDto } from './league.dto';
+import { estimateCourtCapacity, planSchedule, teamGameCapacity, roundRobin, scheduleIssues, scheduleMatches, SchedulePlacementError, suggestSlots, validateSchedule, type ExistingGame, type ScheduleAvailability, type ScheduleGame, type ScheduleMatch } from './schedule-algorithm';
 import { calculateStandings } from './standings';
 
 type Database = Kysely<DB> | Transaction<DB>;
@@ -47,12 +47,22 @@ export class ScheduleService {
     if (venues.length !== availability.venueIds.length) throw new BadRequestException('All venues must belong to this league');
   }
 
-  private async existing(db: Database, leagueId: string): Promise<ExistingGame[]> {
-    const games = await db.selectFrom('league.games as g').innerJoin('league.seasons as s', 's.id', 'g.season_id')
-      .select(['g.home_season_team_id', 'g.away_season_team_id', 'g.scheduled_at', 'g.venue_id', 'g.duration_minutes'])
-      .where('s.league_id', '=', leagueId).where('g.scheduled_at', 'is not', null).execute();
-    return games.map((game) => ({ homeTeamId: game.home_season_team_id, awayTeamId: game.away_season_team_id,
+  // Only games near the selected dates can conflict. The margin covers time-zone offsets, game length and the 7-day pacing rule.
+  private async existing(db: Database, leagueId: string, availability?: ScheduleAvailability): Promise<ExistingGame[]> {
+    let query = db.selectFrom('league.games as g').innerJoin('league.seasons as s', 's.id', 'g.season_id')
+      .select(['g.id', 'g.home_season_team_id', 'g.away_season_team_id', 'g.scheduled_at', 'g.venue_id', 'g.duration_minutes'])
+      .where('s.league_id', '=', leagueId).where('g.scheduled_at', 'is not', null);
+    const from = Date.parse(`${availability?.startDate}T00:00:00Z`) - 8 * 86400000;
+    const to = Date.parse(`${availability?.endDate}T00:00:00Z`) + 9 * 86400000;
+    if (Number.isFinite(from) && Number.isFinite(to)) query = query.where('g.scheduled_at', '>=', new Date(from)).where('g.scheduled_at', '<', new Date(to));
+    const games = await query.execute();
+    return games.map((game) => ({ id: game.id, homeTeamId: game.home_season_team_id, awayTeamId: game.away_season_team_id,
       scheduledAt: new Date(game.scheduled_at!).toISOString(), venueId: game.venue_id, durationMinutes: game.duration_minutes }));
+  }
+
+  private checkTeamAvailability(availability: ScheduleAvailability, teamIds: Iterable<string>) {
+    const allowed = new Set(teamIds);
+    if (availability?.teamUnavailability?.some((entry) => !allowed.has(entry.teamId))) throw new BadRequestException('Team availability includes a team outside this schedule');
   }
 
   private warnings(games: ScheduleGame[], context: DivisionContext, zone: string) {
@@ -76,6 +86,18 @@ export class ScheduleService {
     const left = expected.map(key).sort();
     const right = actual.map(key).sort();
     if (left.length !== right.length || left.some((value, index) => value !== right[index])) throw new BadRequestException('The schedule has changed; generate a new preview');
+  }
+
+  // A draft may still be missing games the organizer has not placed, but it cannot add or repeat fixtures.
+  private partOfMatches(expected: ScheduleMatch[], actual: ScheduleGame[]) {
+    const key = (match: ScheduleMatch) => [match.stage, match.round, match.homeTeamId, match.awayTeamId].join(':');
+    const remaining = new Map<string, number>();
+    for (const match of expected) remaining.set(key(match), (remaining.get(key(match)) ?? 0) + 1);
+    for (const game of actual) {
+      const count = remaining.get(key(game)) ?? 0;
+      if (!count) throw new BadRequestException('The schedule has changed; generate a new preview');
+      remaining.set(key(game), count - 1);
+    }
   }
 
   private trySchedule<T>(fn: () => T, teams: { id: string; name: string }[] = []): T {
@@ -103,6 +125,7 @@ export class ScheduleService {
     if (input.playoffs && teams.length < 4) throw new BadRequestException('Playoffs require at least four teams');
     if (input.thirdPlace && !input.playoffs) throw new BadRequestException('A third-place game requires playoffs');
     await this.validateVenues(db, context.leagueId, input.availability);
+    this.checkTeamAvailability(input.availability, teams.map((team) => team.id));
     const matches = this.trySchedule(() => roundRobin(teams.map((team) => team.id), input.format));
     return { teams, matches };
   }
@@ -168,7 +191,7 @@ export class ScheduleService {
   async seasonStatus(user: string, seasonId: string) {
     const season = await this.seasonContext(user, seasonId, this.db);
     const divisions = await this.seasonDivisions(this.db, season);
-    return { divisions: divisions.map(({ context: _context, teams: _teams, playoff: _playoff, ...division }) => division) };
+    return { divisions: divisions.map(({ context: _context, playoff: _playoff, ...division }) => division) };
   }
 
   private async seasonPlan(db: Database, season: Awaited<ReturnType<ScheduleService['seasonContext']>>, input: ScheduleAvailabilityRequestDto | SchedulePreviewDto, mode: 'preliminary' | 'playoffs', allowEmpty = false) {
@@ -176,6 +199,7 @@ export class ScheduleService {
     if (mode === 'preliminary' && 'thirdPlace' in input && input.thirdPlace && !input.playoffs) throw new BadRequestException('A third-place game requires playoffs');
     await this.validateVenues(db, season.leagueId, input.availability);
     const divisions = await this.seasonDivisions(db, season);
+    this.checkTeamAvailability(input.availability, divisions.flatMap((division) => division.teams.map((team) => team.id)));
     const included = divisions.filter((division) => mode === 'preliminary' ? division.canGeneratePreliminary : !!division.playoff);
     const details = divisions.map((division) => {
       const eligible = included.includes(division);
@@ -188,46 +212,76 @@ export class ScheduleService {
     if (!included.length && !allowEmpty) throw new BadRequestException(mode === 'preliminary' ? 'No divisions are eligible for schedule generation.' : 'No divisions are ready to schedule playoff games.');
     const matches = included.flatMap((division) => {
       const fixtures = mode === 'preliminary' ? roundRobin(division.teams.map((team) => team.id), (input as SchedulePreviewDto).format) : division.playoff!.matches;
-      return fixtures.map((match) => ({ ...match, divisionId: division.id }));
+      return fixtures.map((match) => ({ ...match, divisionId: division.id, groupId: division.id }));
     });
     if (matches.length > 5000) throw new BadRequestException('This schedule exceeds the 5,000-game batch limit.');
     return { included, details, matches };
   }
 
-  private seasonPlacement(matches: (ScheduleMatch & { divisionId: string })[], availability: ScheduleAvailability, existing: ExistingGame[], divisions: { id: string; name: string; teams: { id: string; name: string }[] }[], mode: 'preliminary' | 'playoffs') {
-    // Playoff divisions can be at different stages, so only preliminary rounds share an ordering barrier.
-    const placementMatches = mode === 'playoffs' ? matches.map((match) => ({ ...match, round: 1 })) : matches;
-    try {
-      return scheduleMatches(placementMatches, availability, existing).map((game, index) => ({ ...game, round: matches[index].round, divisionId: matches[index].divisionId }));
-    } catch (error) {
-      if (error instanceof SchedulePlacementError) {
-        const division = divisions.find((item) => item.teams.some((team) => team.id === error.match.homeTeamId));
-        const home = division?.teams.find((team) => team.id === error.match.homeTeamId)?.name;
-        const away = division?.teams.find((team) => team.id === error.match.awayTeamId)?.name;
-        throw new BadRequestException(`${division?.name ?? 'Division'}: ${error.withTeamNames(home, away)}`);
-      }
-      if (error instanceof Error && /work limit/i.test(error.message)) throw new BadRequestException('This schedule is too large to process safely. Try a single round robin or fewer venues. No games were saved.');
-      throw new BadRequestException(error instanceof Error ? error.message : 'Invalid schedule');
+  private seasonPlacement(matches: (ScheduleMatch & { divisionId: string })[], availability: ScheduleAvailability, existing: ExistingGame[], divisions: { id: string; name: string; teams: { id: string; name: string }[] }[], mode: 'preliminary' | 'playoffs', pinned: (ScheduleGame & { divisionId: string })[] = []) {
+    // Pinned games keep their time and venue; they must be expected fixtures, each used once.
+    const key = (match: ScheduleMatch & { divisionId: string }) => [match.divisionId, match.stage, match.round, match.homeTeamId, match.awayTeamId].join(':');
+    const pool = new Map<string, (ScheduleGame & { divisionId: string })[]>();
+    for (const game of pinned) {
+      if (!availability.venueIds.includes(game.venueId) || game.durationMinutes !== availability.durationMinutes) throw new BadRequestException('Kept games must use the selected venues and game duration');
+      pool.set(key(game), [...(pool.get(key(game)) ?? []), game]);
     }
+    const kept = new Map<number, ScheduleGame & { divisionId: string }>();
+    const open: number[] = [];
+    matches.forEach((match, index) => {
+      const game = pool.get(key(match))?.shift();
+      if (game) kept.set(index, game); else open.push(index);
+    });
+    if ([...pool.values()].some((games) => games.length)) throw new BadRequestException('The schedule has changed; generate a new preview');
+    // Playoff divisions can be at different stages, so they do not share round order.
+    const round = (item: { round: number }) => mode === 'playoffs' ? 1 : item.round;
+    const toPlace = open.map((index) => matches[index]);
+    const fixed = [...kept.values()].map((game) => ({ homeTeamId: game.homeTeamId, awayTeamId: game.awayTeamId, stage: game.stage,
+      scheduledAt: game.scheduledAt, venueId: game.venueId, durationMinutes: game.durationMinutes, round: round(game) }));
+    const plan = this.trySchedule(() => planSchedule(toPlace.map((match) => ({ ...match, round: round(match) })), availability, existing, fixed));
+    const unplaced = plan.unplaced.map(({ index, reason, code }) => {
+      const match = toPlace[index];
+      const division = divisions.find((item) => item.id === match.divisionId);
+      const home = division?.teams.find((team) => team.id === match.homeTeamId)?.name;
+      const away = division?.teams.find((team) => team.id === match.awayTeamId)?.name;
+      return { divisionId: match.divisionId, divisionName: division?.name ?? '', homeTeamId: match.homeTeamId, awayTeamId: match.awayTeamId,
+        homeName: home ?? '', awayName: away ?? '', round: match.round, stage: match.stage, reason, reasonCode: code, message: new SchedulePlacementError(match, plan.games.length, matches.length, reason).withTeamNames(home, away) };
+    });
+    // When nothing fits, the settings are the problem; explain that instead of listing every game.
+    if (!plan.games.length && !kept.size && unplaced.length) throw new BadRequestException(`${unplaced[0].divisionName || 'Division'}: ${unplaced[0].message}`);
+    const placed = new Map(plan.games.map(({ index, game }) => [open[index], game]));
+    const games = matches.flatMap((match, index) => {
+      const game = kept.get(index) ?? placed.get(index);
+      return game ? [{ homeTeamId: game.homeTeamId, awayTeamId: game.awayTeamId, stage: game.stage, scheduledAt: game.scheduledAt, venueId: game.venueId,
+        durationMinutes: game.durationMinutes, round: match.round, divisionId: match.divisionId }] : [];
+    });
+    return { games, unplaced: unplaced.map(({ message: _message, ...item }) => item) };
   }
 
-  async previewSeason(user: string, seasonId: string, input: ScheduleAvailabilityRequestDto | SchedulePreviewDto, mode: 'preliminary' | 'playoffs') {
+  async previewSeason(user: string, seasonId: string, input: SeasonPlayoffPreviewDto | SeasonSchedulePreviewDto, mode: 'preliminary' | 'playoffs') {
     const season = await this.seasonContext(user, seasonId, this.db);
     const plan = await this.seasonPlan(this.db, season, input, mode);
-    const existing = await this.existing(this.db, season.leagueId);
-    const games = this.seasonPlacement(plan.matches, input.availability, existing, plan.included, mode);
+    const existing = await this.existing(this.db, season.leagueId, input.availability);
+    const { games, unplaced } = this.seasonPlacement(plan.matches, input.availability, existing, plan.included, mode, input.pinned ?? []);
     const names = new Map(plan.included.flatMap((division) => division.teams.map((team) => [team.id, team.name] as const)));
     const divisionNames = new Map(plan.included.map((division) => [division.id, division.name]));
     return { games: games.map((game) => ({ ...game, homeName: names.get(game.homeTeamId), awayName: names.get(game.awayTeamId), divisionName: divisionNames.get(game.divisionId) })),
-      warnings: this.warnings(games, plan.included[0].context, input.availability.timeZone), divisions: plan.details };
+      unplaced, warnings: this.warnings(games, plan.included[0].context, input.availability.timeZone), divisions: plan.details };
   }
 
   async estimateSeason(user: string, seasonId: string, input: ScheduleAvailabilityRequestDto | SchedulePreviewDto, mode: 'preliminary' | 'playoffs') {
     const season = await this.seasonContext(user, seasonId, this.db);
     const plan = await this.seasonPlan(this.db, season, input, mode, true);
-    const existing = await this.existing(this.db, season.leagueId);
+    const existing = await this.existing(this.db, season.leagueId, input.availability);
     const capacity = this.trySchedule(() => estimateCourtCapacity(input.availability, existing));
-    return { capacity, required: plan.matches.length, divisions: plan.details.map((division) => ({ ...division, gameCount: plan.matches.filter((match) => match.divisionId === division.id).length })) };
+    const teamCapacity = this.trySchedule(() => teamGameCapacity(input.availability));
+    // The most games any one team plays in the division, compared with what pacing and daily limits allow.
+    const gamesPerTeam = (divisionId: string) => {
+      const counts = new Map<string, number>();
+      for (const match of plan.matches) if (match.divisionId === divisionId) for (const team of [match.homeTeamId, match.awayTeamId]) counts.set(team, (counts.get(team) ?? 0) + 1);
+      return Math.max(0, ...counts.values());
+    };
+    return { capacity, required: plan.matches.length, ...teamCapacity, divisions: plan.details.map((division) => ({ ...division, gameCount: plan.matches.filter((match) => match.divisionId === division.id).length, gamesPerTeam: gamesPerTeam(division.id) })) };
   }
 
   async validateSeason(user: string, seasonId: string, input: SeasonScheduleSaveDto | SeasonPlayoffSaveDto, mode: 'preliminary' | 'playoffs') {
@@ -236,10 +290,50 @@ export class ScheduleService {
     const expectedIds = plan.included.map((division) => division.id).sort();
     const submittedIds = [...input.divisionIds].sort();
     if (expectedIds.length !== submittedIds.length || expectedIds.some((id, index) => id !== submittedIds[index])) throw new BadRequestException('Eligible divisions changed; generate a new preview');
-    for (const division of plan.included) this.sameMatches(plan.matches.filter((match) => match.divisionId === division.id), input.games.filter((game) => game.divisionId === division.id));
+    for (const division of plan.included) this.partOfMatches(plan.matches.filter((match) => match.divisionId === division.id), input.games.filter((game) => game.divisionId === division.id));
     if (input.games.some((game) => !expectedIds.includes(game.divisionId))) throw new BadRequestException('The schedule has changed; generate a new preview');
-    const existing = await this.existing(this.db, season.leagueId);
-    return { issues: this.trySchedule(() => scheduleIssues(mode === 'playoffs' ? input.games.map((game) => ({ ...game, round: 1 })) : input.games, input.availability, existing)) };
+    const existing = await this.existing(this.db, season.leagueId, input.availability);
+    const issues = this.trySchedule(() => scheduleIssues(mode === 'playoffs' ? input.games.map((game) => ({ ...game, round: 1 })) : input.games, input.availability, existing));
+    const ids = [...new Set(issues.flatMap((issue) => issue.with?.kind === 'existing' ? [issue.with.id] : []))];
+    return { issues, existingGames: await this.existingDetails(season.leagueId, ids) };
+  }
+
+  // Names, time and place of existing games that a draft conflicts with, so the organizer can see what is in the way.
+  private async existingDetails(leagueId: string, ids: string[]) {
+    if (!ids.length) return [];
+    const games = await this.db.selectFrom('league.games as g').innerJoin('league.seasons as s', 's.id', 'g.season_id')
+      .innerJoin('league.divisions as d', 'd.id', 'g.division_id')
+      .innerJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').innerJoin('league.teams as ht', 'ht.id', 'h.team_id')
+      .innerJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').innerJoin('league.teams as at', 'at.id', 'a.team_id')
+      .leftJoin('league.venues as v', 'v.id', 'g.venue_id')
+      .select(['g.id', 'g.scheduled_at', 'g.duration_minutes', 'g.venue_id', 'v.name as venueName', 'ht.name as homeName', 'at.name as awayName', 'd.name as divisionName'])
+      .where('s.league_id', '=', leagueId).where('g.id', 'in', ids).execute();
+    return games.map((game) => ({ id: game.id, scheduledAt: new Date(game.scheduled_at!).toISOString(), durationMinutes: game.duration_minutes,
+      venueId: game.venue_id, venueName: game.venueName, homeName: game.homeName, awayName: game.awayName, divisionName: game.divisionName }));
+  }
+
+  async suggestSeason(user: string, seasonId: string, input: SeasonScheduleSuggestDto | SeasonPlayoffSuggestDto, mode: 'preliminary' | 'playoffs') {
+    const season = await this.seasonContext(user, seasonId, this.db);
+    const plan = await this.seasonPlan(this.db, season, input, mode);
+    const expectedIds = plan.included.map((division) => division.id).sort();
+    const submittedIds = [...input.divisionIds].sort();
+    if (expectedIds.length !== submittedIds.length || expectedIds.some((id, index) => id !== submittedIds[index])) throw new BadRequestException('Eligible divisions changed; generate a new preview');
+    const { index, game } = input.target;
+    if ((index === undefined) === (game === undefined)) throw new BadRequestException('Choose either a draft game or an unplaced game');
+    if (index !== undefined && index >= input.games.length) throw new BadRequestException('The schedule has changed; generate a new preview');
+    const target = index !== undefined ? input.games[index] : game!;
+    const others = input.games.filter((_, position) => position !== index);
+    const all = index !== undefined ? input.games : [...input.games, { ...game!, scheduledAt: '', venueId: '', durationMinutes: input.availability.durationMinutes }];
+    if (all.some((item) => !expectedIds.includes(item.divisionId))) throw new BadRequestException('The schedule has changed; generate a new preview');
+    for (const division of plan.included) this.partOfMatches(plan.matches.filter((match) => match.divisionId === division.id), all.filter((item) => item.divisionId === division.id));
+    const existing = await this.existing(this.db, season.leagueId, input.availability);
+    // Playoff divisions can be at different stages, so they do not share round order.
+    const round = (item: { round: number }) => mode === 'playoffs' ? 1 : item.round;
+    const match: ScheduleMatch = { homeTeamId: target.homeTeamId, awayTeamId: target.awayTeamId, round: round(target), stage: target.stage };
+    const current = index !== undefined ? { at: Date.parse(input.games[index].scheduledAt), venueId: input.games[index].venueId } : undefined;
+    const slots = this.trySchedule(() => suggestSlots(match, others.map((item) => ({ ...item, round: round(item) })), input.availability, existing, 4));
+    // The game's own slot is not a suggestion.
+    return { suggestions: slots.filter((slot) => !current || Date.parse(slot.scheduledAt) !== current.at || slot.venueId !== current.venueId).slice(0, 3) };
   }
 
   async calendarSeason(user: string, seasonId: string, input: ScheduleAvailabilityRequestDto) {
@@ -270,7 +364,7 @@ export class ScheduleService {
       if (expectedIds.length !== submittedIds.length || expectedIds.some((id, index) => id !== submittedIds[index])) throw new BadRequestException('Eligible divisions changed; generate a new preview');
       for (const division of plan.included) this.sameMatches(plan.matches.filter((match) => match.divisionId === division.id), input.games.filter((game) => game.divisionId === division.id));
       if (input.games.some((game) => !expectedIds.includes(game.divisionId))) throw new BadRequestException('The schedule has changed; generate a new preview');
-      const existing = await this.existing(tx, season.leagueId);
+      const existing = await this.existing(tx, season.leagueId, input.availability);
       this.trySchedule(() => validateSchedule(mode === 'playoffs' ? input.games.map((game) => ({ ...game, round: 1 })) : input.games, input.availability, existing));
       for (const division of plan.included) {
         let scheduleId = division.playoff?.schedule.id;
@@ -291,7 +385,7 @@ export class ScheduleService {
   async preview(user: string, divisionId: string, input: SchedulePreviewDto) {
     const context = await this.context(user, divisionId, this.db);
     const { teams, matches } = await this.preliminary(this.db, context, input);
-    const existing = await this.existing(this.db, context.leagueId);
+    const existing = await this.existing(this.db, context.leagueId, input.availability);
     const games = this.trySchedule(() => scheduleMatches(matches, input.availability, existing), teams);
     return { games: this.withNames(games, teams), warnings: this.warnings(games, context, input.availability.timeZone) };
   }
@@ -302,7 +396,7 @@ export class ScheduleService {
       await this.leagueLock(tx, context.leagueId);
       const { teams, matches } = await this.preliminary(tx, context, input);
       this.sameMatches(matches, input.games);
-      const existing = await this.existing(tx, context.leagueId);
+      const existing = await this.existing(tx, context.leagueId, input.availability);
       this.trySchedule(() => validateSchedule(input.games, input.availability, existing));
       const schedule = await tx.insertInto('league.division_schedules').values({ division_id: divisionId, format: input.format,
         playoffs: input.playoffs, third_place: input.thirdPlace, team_ids: teams.map((team) => team.id) }).returning('id').executeTakeFirstOrThrow();
@@ -348,7 +442,8 @@ export class ScheduleService {
     const context = await this.context(user, divisionId, this.db);
     const { teams, matches } = await this.playoffMatches(this.db, context);
     await this.validateVenues(this.db, context.leagueId, input.availability);
-    const existing = await this.existing(this.db, context.leagueId);
+    this.checkTeamAvailability(input.availability, teams.map((team) => team.id));
+    const existing = await this.existing(this.db, context.leagueId, input.availability);
     const games = this.trySchedule(() => scheduleMatches(matches, input.availability, existing), teams);
     return { games: this.withNames(games, teams), warnings: this.warnings(games, context, input.availability.timeZone) };
   }
@@ -357,10 +452,11 @@ export class ScheduleService {
     return this.db.transaction().execute(async (tx) => {
       const context = await this.context(user, divisionId, tx, true);
       await this.leagueLock(tx, context.leagueId);
-      const { matches, schedule } = await this.playoffMatches(tx, context);
+      const { teams, matches, schedule } = await this.playoffMatches(tx, context);
       await this.validateVenues(tx, context.leagueId, input.availability);
+      this.checkTeamAvailability(input.availability, teams.map((team) => team.id));
       this.sameMatches(matches, input.games);
-      const existing = await this.existing(tx, context.leagueId);
+      const existing = await this.existing(tx, context.leagueId, input.availability);
       this.trySchedule(() => validateSchedule(input.games, input.availability, existing));
       await this.insert(tx, context, schedule.id, input.games);
       return { saved: input.games.length };
