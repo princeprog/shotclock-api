@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import * as argon2 from 'argon2';
@@ -6,7 +6,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { sql, type Kysely, type Transaction } from 'kysely';
 import { DatabaseService } from '../database/database.service';
 import type { DB } from '../database/db';
-import { AuthMailer } from './auth-mailer.service';
+import { AuthMailer, type AuthEmailPurpose } from './auth-mailer.service';
 
 const DAY = 86_400_000;
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -31,9 +31,15 @@ export class AuthService {
     return { id: user.id, email: user.email, name: user.name, emailVerified: user.email_verified };
   }
 
-  private deliver(email: string, purpose: 'verify' | 'reset', raw: string) {
+  private deliver(email: string, purpose: AuthEmailPurpose, raw: string) {
     void this.mailer.send(email, purpose, raw).catch(() => {
       this.logger.error('Failed to deliver an authentication email');
+    });
+  }
+
+  private notify(email: string, subject: string, text: string) {
+    void Promise.resolve().then(() => this.mailer.notice(email, subject, text)).catch(() => {
+      this.logger.error('Failed to deliver an account notice');
     });
   }
 
@@ -126,7 +132,7 @@ export class AuthService {
     }
   }
 
-  async me(authorization?: string) {
+  private async current(authorization?: string) {
     const claims = await this.claims(authorization);
     const now = new Date();
     const user = await this.database.db.selectFrom('auth.users as u')
@@ -135,7 +141,101 @@ export class AuthService {
       .where('s.revoked_at', 'is', null).where('s.idle_expires_at', '>', now)
       .where('s.absolute_expires_at', '>', now).executeTakeFirst();
     if (!user) throw new UnauthorizedException();
+    return { claims, user };
+  }
+
+  async me(authorization?: string) {
+    const { user } = await this.current(authorization);
     return { user: this.publicUser(user) };
+  }
+
+  private async checkPassword(user: User, password: string) {
+    if (!await argon2.verify(user.password_hash, password)) throw new BadRequestException('Current password is incorrect');
+  }
+
+  async updateProfile(authorization: string | undefined, name?: string | null) {
+    const { user } = await this.current(authorization);
+    const updated = await this.database.db.updateTable('auth.users').set({ name: name?.trim() || null, updated_at: new Date() })
+      .where('id', '=', user.id).returningAll().executeTakeFirstOrThrow();
+    return { user: this.publicUser(updated) };
+  }
+
+  // Other devices are signed out; the session making the change stays signed in.
+  async changePassword(authorization: string | undefined, currentPassword: string, newPassword: string) {
+    const { claims, user } = await this.current(authorization);
+    await this.checkPassword(user, currentPassword);
+    const passwordHash = await argon2.hash(newPassword, { type: argon2.argon2id });
+    await this.database.db.transaction().execute(async (tx) => {
+      const locked = await tx.selectFrom('auth.users').select('password_hash').where('id', '=', user.id).forUpdate().executeTakeFirstOrThrow();
+      if (locked.password_hash !== user.password_hash) throw new ConflictException('Your password just changed. Sign in again.');
+      await tx.updateTable('auth.users').set({ password_hash: passwordHash, updated_at: new Date() }).where('id', '=', user.id).execute();
+      await tx.updateTable('auth.sessions').set({ revoked_at: new Date() })
+        .where('user_id', '=', user.id).where('id', '!=', claims.sid).where('revoked_at', 'is', null).execute();
+      await tx.updateTable('auth.action_tokens').set({ used_at: new Date() })
+        .where('user_id', '=', user.id).where('purpose', '=', 'reset').where('used_at', 'is', null).execute();
+    });
+    return { message: 'Password changed.' };
+  }
+
+  async signOutOthers(authorization?: string) {
+    const { claims, user } = await this.current(authorization);
+    await this.database.db.updateTable('auth.sessions').set({ revoked_at: new Date() })
+      .where('user_id', '=', user.id).where('id', '!=', claims.sid).where('revoked_at', 'is', null).execute();
+    return { message: 'Signed out of other devices.' };
+  }
+
+  // The response is the same whether or not the address is taken, so it cannot be used to discover accounts.
+  async changeEmail(authorization: string | undefined, newEmailInput: string, currentPassword: string) {
+    const { user } = await this.current(authorization);
+    await this.checkPassword(user, currentPassword);
+    const email = normalizeEmail(newEmailInput);
+    if (email === user.email) throw new BadRequestException('This is already your email');
+    const taken = await this.database.db.selectFrom('auth.users').select('id').where('email', '=', email).executeTakeFirst();
+    if (!taken) {
+      const raw = token();
+      await this.database.db.transaction().execute(async (tx) => {
+        await tx.updateTable('auth.action_tokens').set({ used_at: new Date() })
+          .where('user_id', '=', user.id).where('purpose', '=', 'email_change').where('used_at', 'is', null).execute();
+        await tx.insertInto('auth.action_tokens').values({ token_hash: hash(raw), user_id: user.id, purpose: 'email_change', new_email: email, expires_at: new Date(Date.now() + DAY) }).execute();
+      });
+      this.deliver(email, 'email_change', raw);
+    }
+    return { message: 'Check your new email for a confirmation link.' };
+  }
+
+  async confirmEmailChange(raw: string) {
+    const result = await this.database.db.transaction().execute(async (tx) => {
+      const candidate = await tx.selectFrom('auth.action_tokens').select('user_id')
+        .where('token_hash', '=', hash(raw)).where('purpose', '=', 'email_change').executeTakeFirst();
+      if (!candidate) return null;
+      const user = await tx.selectFrom('auth.users').select(['id', 'email']).where('id', '=', candidate.user_id).forUpdate().executeTakeFirst();
+      const action = await tx.selectFrom('auth.action_tokens').selectAll()
+        .where('token_hash', '=', hash(raw)).where('purpose', '=', 'email_change').forUpdate().executeTakeFirst();
+      if (!user || !action || action.used_at || action.expires_at <= new Date() || !action.new_email) return null;
+      const taken = await tx.selectFrom('auth.users').select('id').where('email', '=', action.new_email).where('id', '!=', user.id).executeTakeFirst();
+      if (taken) throw new ConflictException('That email is already in use');
+      await tx.updateTable('auth.action_tokens').set({ used_at: new Date() })
+        .where('user_id', '=', user.id).where('purpose', '=', 'email_change').where('used_at', 'is', null).execute();
+      await tx.updateTable('auth.users').set({ email: action.new_email, email_verified: true, updated_at: new Date() }).where('id', '=', user.id).execute();
+      return { oldEmail: user.email, newEmail: action.new_email };
+    });
+    if (!result) throw new BadRequestException('Invalid or expired token');
+    this.notify(result.oldEmail, 'Your Shotclock email was changed', `Your Shotclock sign-in email was changed to ${result.newEmail}. If you did not make this change, reset your password right away.`);
+    return { message: 'Email changed.' };
+  }
+
+  async deleteAccount(authorization: string | undefined, password: string) {
+    const { user } = await this.current(authorization);
+    await this.checkPassword(user, password);
+    await this.database.db.transaction().execute(async (tx) => {
+      await tx.selectFrom('auth.users').select('id').where('id', '=', user.id).forUpdate().executeTakeFirstOrThrow();
+      const organization = await tx.selectFrom('league.organizations').select('id').where('owner_user_id', '=', user.id).executeTakeFirst();
+      if (organization) throw new ConflictException('Delete your organizations first');
+      await tx.updateTable('league.players').set({ user_id: null }).where('user_id', '=', user.id).execute();
+      await tx.deleteFrom('league.league_members').where('user_id', '=', user.id).execute();
+      await tx.deleteFrom('auth.users').where('id', '=', user.id).execute();
+    });
+    return { message: 'Account deleted.' };
   }
 
   async logout(authorization?: string, refreshToken?: string) {

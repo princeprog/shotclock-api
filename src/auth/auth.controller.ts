@@ -1,7 +1,7 @@
-import { Body, Controller, Get, Headers, HttpCode, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Headers, HttpCode, Patch, Post, UseGuards } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { AuthRateLimitGuard } from './auth-rate-limit.guard';
-import { EmailDto, LoginDto, LogoutDto, RefreshDto, RegisterDto, ResetDto, TokenDto } from './auth.dto';
+import { ChangeEmailDto, ChangePasswordDto, EmailDto, LoginDto, LogoutDto, PasswordDto, RefreshDto, RegisterDto, ResetDto, TokenDto, UpdateProfileDto } from './auth.dto';
 
 @Controller('auth')
 export class AuthController {
@@ -35,4 +35,22 @@ export class AuthController {
 
   @Get('me')
   me(@Headers('authorization') authorization?: string) { return this.auth.me(authorization); }
+
+  @Patch('me')
+  updateProfile(@Headers('authorization') authorization: string | undefined, @Body() body: UpdateProfileDto) { return this.auth.updateProfile(authorization, body.name); }
+
+  @Delete('me') @HttpCode(200) @UseGuards(AuthRateLimitGuard)
+  deleteAccount(@Headers('authorization') authorization: string | undefined, @Body() body: PasswordDto) { return this.auth.deleteAccount(authorization, body.password); }
+
+  @Post('change-password') @HttpCode(200) @UseGuards(AuthRateLimitGuard)
+  changePassword(@Headers('authorization') authorization: string | undefined, @Body() body: ChangePasswordDto) { return this.auth.changePassword(authorization, body.currentPassword, body.newPassword); }
+
+  @Post('sign-out-others') @HttpCode(200)
+  signOutOthers(@Headers('authorization') authorization?: string) { return this.auth.signOutOthers(authorization); }
+
+  @Post('change-email') @HttpCode(200) @UseGuards(AuthRateLimitGuard)
+  changeEmail(@Headers('authorization') authorization: string | undefined, @Body() body: ChangeEmailDto) { return this.auth.changeEmail(authorization, body.newEmail, body.currentPassword); }
+
+  @Post('confirm-email-change') @HttpCode(200) @UseGuards(AuthRateLimitGuard)
+  confirmEmailChange(@Body() body: TokenDto) { return this.auth.confirmEmailChange(body.token); }
 }
