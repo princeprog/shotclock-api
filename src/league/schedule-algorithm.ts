@@ -787,8 +787,10 @@ export function suggestSlots(
     for (const [venueIndex, venueId] of config.venueIds.entries()) {
       const to = Math.min(interval.end, latest);
       let next = Math.max(interval.start, from);
-      for (let start = firstFit(blockedByVenue[venueIndex], next, to, config.length); start !== undefined; start = firstFit(blockedByVenue[venueIndex], next, to, config.length)) {
+      let venueSlots = 0;
+      for (let start = firstFit(blockedByVenue[venueIndex], next, to, config.length); start !== undefined && venueSlots < limit; start = firstFit(blockedByVenue[venueIndex], next, to, config.length)) {
         if (!found.has(start)) found.set(start, venueId);
+        venueSlots++;
         next = start + config.length + config.changeover;
       }
     }
