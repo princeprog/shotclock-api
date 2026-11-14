@@ -14,6 +14,7 @@ export type Timestamp = ColumnType<Date, Date | string, Date | string>;
 export interface AuthActionTokens {
   created_at: Generated<Timestamp>;
   expires_at: Timestamp;
+  new_email: string | null;
   purpose: string;
   token_hash: string;
   used_at: Timestamp | null;
@@ -115,11 +116,13 @@ export interface LeagueLeagueMembers {
 }
 
 export interface LeagueLeagues {
+  archived_at: Timestamp | null;
   created_at: Generated<Timestamp>;
   id: Generated<string>;
   location: string | null;
   name: string;
   organization_id: string;
+  time_zone: string | null;
   updated_at: Generated<Timestamp>;
 }
 
@@ -129,6 +132,7 @@ export interface LeagueOrganizationPlayers {
 }
 
 export interface LeagueOrganizations {
+  archived_at: Timestamp | null;
   created_at: Generated<Timestamp>;
   id: Generated<string>;
   name: string;
@@ -174,6 +178,7 @@ export interface LeagueRosters {
 }
 
 export interface LeagueSeasons {
+  archived_at: Timestamp | null;
   created_at: Generated<Timestamp>;
   end_date: Timestamp | null;
   id: Generated<string>;

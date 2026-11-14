@@ -2,8 +2,15 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createTransport, type Transporter } from 'nodemailer';
 
-export function authLink(frontend: URL, purpose: 'verify' | 'reset', token: string): string {
-  const url = new URL(purpose === 'verify' ? '/verify-email' : '/reset-password', frontend);
+export type AuthEmailPurpose = 'verify' | 'reset' | 'email_change';
+const emailCopy: Record<AuthEmailPurpose, { path: string; subject: string; action: string }> = {
+  verify: { path: '/verify-email', subject: 'Verify your email', action: 'verify your email' },
+  reset: { path: '/reset-password', subject: 'Reset your password', action: 'reset your password' },
+  email_change: { path: '/confirm-email', subject: 'Confirm your new email', action: 'confirm your new email address' },
+};
+
+export function authLink(frontend: URL, purpose: AuthEmailPurpose, token: string): string {
+  const url = new URL(emailCopy[purpose].path, frontend);
   url.hash = new URLSearchParams({ token }).toString();
   return url.toString();
 }
@@ -50,14 +57,18 @@ export class AuthMailer {
     });
   }
 
-  async send(email: string, purpose: 'verify' | 'reset', token: string): Promise<void> {
+  async send(email: string, purpose: AuthEmailPurpose, token: string): Promise<void> {
     const url = authLink(this.frontend, purpose, token);
+    await this.deliver(email, emailCopy[purpose].subject, `Open this link to ${emailCopy[purpose].action}: ${url}`);
+  }
+
+  async notice(email: string, subject: string, text: string): Promise<void> {
+    await this.deliver(email, subject, text);
+  }
+
+  private async deliver(email: string, subject: string, text: string): Promise<void> {
     try {
-      await this.transport.sendMail({
-        from: this.from, to: email,
-        subject: purpose === 'verify' ? 'Verify your email' : 'Reset your password',
-        text: `Open this link to ${purpose === 'verify' ? 'verify your email' : 'reset your password'}: ${url}`,
-      });
+      await this.transport.sendMail({ from: this.from, to: email, subject, text });
     } catch {
       // Do not leak the address, token, or SMTP credentials into logs or HTTP responses.
       this.logger.error('Failed to deliver an authentication email');

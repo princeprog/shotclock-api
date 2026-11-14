@@ -19,6 +19,20 @@ export class RefreshDto {
 export class LogoutDto {
   @IsOptional() @IsString() @MinLength(1) @MaxLength(512) refreshToken?: string;
 }
+export class UpdateProfileDto {
+  @IsOptional() @IsString() @MaxLength(120) name?: string | null;
+}
+export class PasswordDto {
+  @IsString() @MinLength(1) @MaxLength(128) password: string;
+}
+export class ChangePasswordDto {
+  @IsString() @MinLength(1) @MaxLength(128) currentPassword: string;
+  @IsString() @MinLength(12) @MaxLength(128) newPassword: string;
+}
+export class ChangeEmailDto {
+  @IsEmail() @MaxLength(254) newEmail: string;
+  @IsString() @MinLength(1) @MaxLength(128) currentPassword: string;
+}
 export class ResetDto extends TokenDto {
   @IsString() @MinLength(12) @MaxLength(128) password: string;
 }

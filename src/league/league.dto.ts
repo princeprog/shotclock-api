@@ -8,6 +8,13 @@ export class NameDto {
 }
 export class LeagueDto extends NameDto {
   @IsOptional() @IsString() @MaxLength(160) location?: string | null;
+  @IsOptional() @IsString() @MaxLength(100) timeZone?: string | null;
+}
+export class ArchivedFilterDto {
+  @IsOptional() @IsIn(['true', 'false']) archived?: 'true' | 'false';
+}
+export class ConfirmDeleteDto {
+  @IsString() @MinLength(1) @MaxLength(200) confirmName!: string;
 }
 export class TeamDto extends NameDto {
   @IsOptional() @IsString() @MaxLength(12) abbreviation?: string | null;
@@ -48,6 +55,7 @@ export class SeasonDto extends NameDto {
 export class SeasonFilterDto {
   @IsOptional() @IsString() @MaxLength(120) search?: string;
   @IsOptional() @IsIn(['draft', 'active', 'completed']) status?: 'draft' | 'active' | 'completed';
+  @IsOptional() @IsIn(['true', 'false']) archived?: 'true' | 'false';
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(1000000) page?: number;
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(100) pageSize?: number;
 }
@@ -67,7 +75,7 @@ export class OrganizationVenueFilterDto {
   @IsOptional() @IsUUID() leagueId?: string;
 }
 export class StatusDto {
-  @IsIn(['active', 'completed']) status!: 'active' | 'completed';
+  @IsIn(['draft', 'active', 'completed']) status!: 'draft' | 'active' | 'completed';
 }
 export class TeamRegistrationDto {
   @IsUUID() teamId!: string;

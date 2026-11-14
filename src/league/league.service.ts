@@ -5,7 +5,8 @@ import type { DB } from '../database/db';
 import { calculateStandings } from './standings';
 import { ForfeitDto } from './forfeit.dto';
 import { paginationMeta } from '../common/pagination';
-import { CreateTeamDto, DivisionDto, PlayerDto, UpdateDivisionDto, UpdatePlayerDto, GameDto, GameFilterDto, JerseyDto, LeagueDto, NameDto, OrganizationSeasonFilterDto, OrganizationTeamFilterDto, OrganizationVenueFilterDto, RosterDto, RosterFilterDto, ScoreDto, SeasonDto, SeasonFilterDto, TeamDto, VenueDto } from './league.dto';
+import { allowArchived, ensureNotArchived } from '../common/request-scope';
+import { ConfirmDeleteDto, CreateTeamDto, DivisionDto, PlayerDto, UpdateDivisionDto, UpdatePlayerDto, GameDto, GameFilterDto, JerseyDto, LeagueDto, NameDto, OrganizationSeasonFilterDto, OrganizationTeamFilterDto, OrganizationVenueFilterDto, RosterDto, RosterFilterDto, ScoreDto, SeasonDto, SeasonFilterDto, TeamDto, VenueDto } from './league.dto';
 
 type Database = Kysely<DB> | Transaction<DB>;
 const seasonDates = [sql<string | null>`start_date::text`.as('start_date'), sql<string | null>`end_date::text`.as('end_date')] as const;
@@ -17,20 +18,26 @@ export class LeagueService {
   private name(value: string) { const result = value.trim(); if (!result) throw new BadRequestException('Name is required'); return result; }
   private async org(user: string, id: string, db: Database = this.db) {
     const row = await db.selectFrom('league.organizations').selectAll().where('id', '=', id).where('owner_user_id', '=', user).executeTakeFirst();
-    if (!row) throw new NotFoundException(); return row;
+    if (!row) throw new NotFoundException(); ensureNotArchived(row.archived_at); return row;
   }
   private async league(user: string, id: string, db: Database = this.db) {
-    const row = await db.selectFrom('league.leagues as l').innerJoin('league.organizations as o', 'o.id', 'l.organization_id').selectAll('l').where('l.id', '=', id).where('o.owner_user_id', '=', user).executeTakeFirst();
-    if (!row) throw new NotFoundException(); return row;
+    const found = await db.selectFrom('league.leagues as l').innerJoin('league.organizations as o', 'o.id', 'l.organization_id').selectAll('l').select('o.archived_at as organization_archived_at').where('l.id', '=', id).where('o.owner_user_id', '=', user).executeTakeFirst();
+    if (!found) throw new NotFoundException();
+    const { organization_archived_at, ...row } = found;
+    ensureNotArchived(row.archived_at, organization_archived_at); return row;
   }
   private async season(user: string, id: string, db: Database = this.db, lock = false) {
-    let q = db.selectFrom('league.seasons as s').innerJoin('league.leagues as l', 'l.id', 's.league_id').innerJoin('league.organizations as o', 'o.id', 'l.organization_id').selectAll('s').where('s.id', '=', id).where('o.owner_user_id', '=', user);
+    let q = db.selectFrom('league.seasons as s').innerJoin('league.leagues as l', 'l.id', 's.league_id').innerJoin('league.organizations as o', 'o.id', 'l.organization_id').selectAll('s').select(['l.archived_at as league_archived_at', 'o.archived_at as organization_archived_at']).where('s.id', '=', id).where('o.owner_user_id', '=', user);
     if (lock) q = q.forUpdate('s');
-    const row = await q.executeTakeFirst(); if (!row) throw new NotFoundException(); return row;
+    const found = await q.executeTakeFirst(); if (!found) throw new NotFoundException();
+    const { league_archived_at, organization_archived_at, ...row } = found;
+    ensureNotArchived(row.archived_at, league_archived_at, organization_archived_at); return row;
   }
   private async team(user: string, id: string, db: Database = this.db) {
-    const row = await db.selectFrom('league.teams as t').innerJoin('league.leagues as l', 'l.id', 't.league_id').innerJoin('league.organizations as o', 'o.id', 'l.organization_id').selectAll('t').where('t.id', '=', id).where('o.owner_user_id', '=', user).executeTakeFirst();
-    if (!row) throw new NotFoundException(); return row;
+    const found = await db.selectFrom('league.teams as t').innerJoin('league.leagues as l', 'l.id', 't.league_id').innerJoin('league.organizations as o', 'o.id', 'l.organization_id').selectAll('t').select(['l.archived_at as league_archived_at', 'o.archived_at as organization_archived_at']).where('t.id', '=', id).where('o.owner_user_id', '=', user).executeTakeFirst();
+    if (!found) throw new NotFoundException();
+    const { league_archived_at, organization_archived_at, ...row } = found;
+    ensureNotArchived(league_archived_at, organization_archived_at); return row;
   }
   private editable(status: string) { if (status === 'completed') throw new BadRequestException('Completed seasons cannot be changed'); }
   private calendarDate(value: string, now = Date.now()) {
@@ -95,14 +102,161 @@ export class LeagueService {
     }
   }
 
-  organizations(user: string) { return this.db.selectFrom('league.organizations').select(['id', 'name']).where('owner_user_id', '=', user).orderBy('name').execute(); }
+  private async venue(user: string, id: string, db: Database = this.db) {
+    const found = await db.selectFrom('league.venues as v').innerJoin('league.leagues as l', 'l.id', 'v.league_id').innerJoin('league.organizations as o', 'o.id', 'l.organization_id').selectAll('v').select(['l.archived_at as league_archived_at', 'o.archived_at as organization_archived_at']).where('v.id', '=', id).where('o.owner_user_id', '=', user).executeTakeFirst();
+    if (!found) throw new NotFoundException();
+    const { league_archived_at, organization_archived_at, ...venue } = found;
+    ensureNotArchived(league_archived_at, organization_archived_at);
+    return venue;
+  }
+  // History means a recorded result or player statistics; anything else can be deleted outright.
+  private async hasHistory(db: Database, seasonIds: string[]) {
+    if (!seasonIds.length) return false;
+    const result = await db.selectFrom('league.games').select('id').where('season_id', 'in', seasonIds).where('status', '=', 'completed').executeTakeFirst();
+    if (result) return true;
+    const stat = await db.selectFrom('league.player_game_stats as pgs').innerJoin('league.games as g', 'g.id', 'pgs.game_id').select('pgs.id').where('g.season_id', 'in', seasonIds).executeTakeFirst();
+    return !!stat;
+  }
+  private confirmName(name: string, dto: ConfirmDeleteDto) {
+    if (dto.confirmName.trim() !== name.trim()) throw new BadRequestException('Type the name exactly to confirm');
+  }
+  // Foreign keys restrict deletes, so children are removed explicitly in dependency order.
+  private async purgeSeasons(db: Database, seasonIds: string[]) {
+    if (!seasonIds.length) return;
+    const games = db.selectFrom('league.games').select('id').where('season_id', 'in', seasonIds);
+    const rosters = db.selectFrom('league.rosters').select('id').where('season_id', 'in', seasonIds);
+    await db.deleteFrom('league.player_game_stats').where((eb) => eb.or([eb('game_id', 'in', games), eb('roster_id', 'in', rosters)])).execute();
+    await db.deleteFrom('league.games').where('season_id', 'in', seasonIds).execute();
+    await db.deleteFrom('league.division_schedules').where('division_id', 'in', db.selectFrom('league.divisions').select('id').where('season_id', 'in', seasonIds)).execute();
+    await db.deleteFrom('league.rosters').where('season_id', 'in', seasonIds).execute();
+    await db.deleteFrom('league.season_teams').where('season_id', 'in', seasonIds).execute();
+    await db.deleteFrom('league.divisions').where('season_id', 'in', seasonIds).execute();
+    await db.deleteFrom('league.seasons').where('id', 'in', seasonIds).execute();
+  }
+  private async purgeLeagues(db: Database, leagueIds: string[]) {
+    if (!leagueIds.length) return;
+    for (const id of [...leagueIds].sort()) await this.scheduleLock(id, db);
+    const seasons = await db.selectFrom('league.seasons').select('id').where('league_id', 'in', leagueIds).execute();
+    await this.purgeSeasons(db, seasons.map((season) => season.id));
+    await db.deleteFrom('league.teams').where('league_id', 'in', leagueIds).execute();
+    await db.deleteFrom('league.venues').where('league_id', 'in', leagueIds).execute();
+    await db.deleteFrom('league.league_members').where('league_id', 'in', leagueIds).execute();
+    await db.deleteFrom('league.leagues').where('id', 'in', leagueIds).execute();
+  }
+  private async seasonIdsForLeagues(db: Database, leagueIds: string[]) {
+    if (!leagueIds.length) return [];
+    return (await db.selectFrom('league.seasons').select('id').where('league_id', 'in', leagueIds).execute()).map((season) => season.id);
+  }
+
+  async archiveOrganization(user: string, id: string, archived: boolean) { return allowArchived(async () => {
+    await this.org(user, id);
+    return this.db.updateTable('league.organizations').set({ archived_at: archived ? new Date() : null, updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow();
+  }); }
+  async deleteOrganization(user: string, id: string, dto: ConfirmDeleteDto) { return allowArchived(() => this.db.transaction().execute(async (tx) => {
+    const org = await this.org(user, id, tx);
+    this.confirmName(org.name, dto);
+    const leagueIds = (await tx.selectFrom('league.leagues').select('id').where('organization_id', '=', id).execute()).map((league) => league.id);
+    if (!org.archived_at && await this.hasHistory(tx, await this.seasonIdsForLeagues(tx, leagueIds))) throw new ConflictException('This organization has recorded results. Archive it instead.');
+    await this.purgeLeagues(tx, leagueIds);
+    const players = (await tx.selectFrom('league.organization_players').select('player_id').where('organization_id', '=', id).execute()).map((row) => row.player_id);
+    await tx.deleteFrom('league.organization_players').where('organization_id', '=', id).execute();
+    if (players.length) await tx.deleteFrom('league.players').where('id', 'in', players)
+      .where(({ not, exists, selectFrom }) => not(exists(selectFrom('league.organization_players as op').select('op.player_id').whereRef('op.player_id', '=', 'league.players.id'))))
+      .where(({ not, exists, selectFrom }) => not(exists(selectFrom('league.rosters as r').select('r.id').whereRef('r.player_id', '=', 'league.players.id')))).execute();
+    await tx.deleteFrom('league.organizations').where('id', '=', id).execute();
+    return { deleted: true };
+  })); }
+  async archiveLeague(user: string, id: string, archived: boolean) { return allowArchived(async () => {
+    const league = await this.league(user, id);
+    if (!archived) {
+      const org = await this.db.selectFrom('league.organizations').select('archived_at').where('id', '=', league.organization_id).executeTakeFirstOrThrow();
+      if (org.archived_at) throw new ConflictException('Restore the organization first');
+    }
+    return this.db.updateTable('league.leagues').set({ archived_at: archived ? new Date() : null, updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow();
+  }); }
+  async deleteLeague(user: string, id: string, dto: ConfirmDeleteDto) { return allowArchived(() => this.db.transaction().execute(async (tx) => {
+    const league = await this.league(user, id, tx);
+    this.confirmName(league.name, dto);
+    if (!league.archived_at && await this.hasHistory(tx, await this.seasonIdsForLeagues(tx, [id]))) throw new ConflictException('This league has recorded results. Archive it instead.');
+    await this.purgeLeagues(tx, [id]);
+    return { deleted: true, organization_id: league.organization_id };
+  })); }
+  async archiveSeason(user: string, id: string, archived: boolean) { return allowArchived(async () => {
+    const season = await this.season(user, id);
+    if (!archived) {
+      const parent = await this.db.selectFrom('league.leagues as l').innerJoin('league.organizations as o', 'o.id', 'l.organization_id').select(['l.archived_at as league_archived_at', 'o.archived_at as organization_archived_at']).where('l.id', '=', season.league_id).executeTakeFirstOrThrow();
+      if (parent.organization_archived_at) throw new ConflictException('Restore the organization first');
+      if (parent.league_archived_at) throw new ConflictException('Restore the league first');
+    }
+    return this.db.updateTable('league.seasons').set({ archived_at: archived ? new Date() : null, updated_at: new Date() }).where('id', '=', id).returningAll().returning(seasonDates).executeTakeFirstOrThrow();
+  }); }
+  async deleteSeason(user: string, id: string, dto: ConfirmDeleteDto) { return allowArchived(() => this.db.transaction().execute(async (tx) => {
+    const season = await this.season(user, id, tx, true);
+    this.confirmName(season.name, dto);
+    if (!season.archived_at && await this.hasHistory(tx, [id])) throw new ConflictException('This season has recorded results. Archive it instead.');
+    await this.scheduleLock(season.league_id, tx);
+    await this.purgeSeasons(tx, [id]);
+    return { deleted: true, league_id: season.league_id };
+  })); }
+  async deleteTeam(user: string, id: string) { return this.db.transaction().execute(async (tx) => {
+    const team = await this.team(user, id, tx);
+    await this.scheduleLock(team.league_id, tx);
+    const registrations = await tx.selectFrom('league.season_teams').select(['id', 'division_id']).where('team_id', '=', id).execute();
+    const ids = registrations.map((registration) => registration.id);
+    if (ids.length) {
+      const game = await tx.selectFrom('league.games').select('id').where((eb) => eb.or([eb('home_season_team_id', 'in', ids), eb('away_season_team_id', 'in', ids)])).executeTakeFirst();
+      if (game) throw new ConflictException('This team has games, so it stays for the record.');
+      for (const registration of registrations) await this.ensureDivisionRegistrationsEditable(tx, registration.division_id);
+      await tx.deleteFrom('league.rosters').where('season_team_id', 'in', ids).execute();
+      await tx.deleteFrom('league.season_teams').where('id', 'in', ids).execute();
+    }
+    await tx.deleteFrom('league.teams').where('id', '=', id).execute();
+    return { deleted: true, league_id: team.league_id };
+  }); }
+  async deletePlayer(user: string, organization: string, playerId: string) { return this.db.transaction().execute(async (tx) => {
+    await this.org(user, organization, tx);
+    await this.playerLock(playerId, tx);
+    const link = await tx.selectFrom('league.organization_players').select('player_id').where('organization_id', '=', organization).where('player_id', '=', playerId).executeTakeFirst();
+    if (!link) throw new NotFoundException();
+    const rosters = await tx.selectFrom('league.rosters as r').innerJoin('league.seasons as s', 's.id', 'r.season_id').innerJoin('league.leagues as l', 'l.id', 's.league_id')
+      .select(['r.id', 's.status']).where('r.player_id', '=', playerId).where('l.organization_id', '=', organization).execute();
+    if (rosters.some((roster) => roster.status !== 'draft')) throw new ConflictException('This player is on a roster in a started season, so they stay for the record.');
+    const rosterIds = rosters.map((roster) => roster.id);
+    if (rosterIds.length) {
+      const stat = await tx.selectFrom('league.player_game_stats').select('id').where('roster_id', 'in', rosterIds).executeTakeFirst();
+      if (stat) throw new ConflictException('This player has game statistics, so they stay for the record.');
+      await tx.deleteFrom('league.rosters').where('id', 'in', rosterIds).execute();
+    }
+    await tx.deleteFrom('league.organization_players').where('organization_id', '=', organization).where('player_id', '=', playerId).execute();
+    const otherLink = await tx.selectFrom('league.organization_players').select('player_id').where('player_id', '=', playerId).executeTakeFirst();
+    const otherRoster = await tx.selectFrom('league.rosters').select('id').where('player_id', '=', playerId).executeTakeFirst();
+    if (!otherLink && !otherRoster) await tx.deleteFrom('league.players').where('id', '=', playerId).execute();
+    return { deleted: true };
+  }); }
+  async deleteVenue(user: string, id: string) { return this.db.transaction().execute(async (tx) => {
+    const venue = await this.venue(user, id, tx);
+    const game = await tx.selectFrom('league.games').select('id').where('venue_id', '=', id).executeTakeFirst();
+    const change = await tx.selectFrom('league.game_schedule_changes').select('id').where((eb) => eb.or([eb('old_venue_id', '=', id), eb('new_venue_id', '=', id)])).executeTakeFirst();
+    if (game || change) throw new ConflictException('This venue has games, so it stays for the record.');
+    await tx.deleteFrom('league.venues').where('id', '=', id).execute();
+    return { deleted: true, league_id: venue.league_id };
+  }); }
+
+
+  organizations(user: string, archived = false) { return this.db.selectFrom('league.organizations').select(['id', 'name', 'archived_at']).where('owner_user_id', '=', user).where('archived_at', archived ? 'is not' : 'is', null).orderBy('name').execute(); }
   async createOrganization(user: string, dto: NameDto) { return this.db.insertInto('league.organizations').values({ owner_user_id: user, name: this.name(dto.name) }).returningAll().executeTakeFirstOrThrow(); }
   async getOrganization(user: string, id: string) { return this.org(user, id); }
   async editOrganization(user: string, id: string, dto: NameDto) { await this.org(user, id); return this.db.updateTable('league.organizations').set({ name: this.name(dto.name), updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow(); }
-  async leagues(user: string, org: string) { await this.org(user, org); return this.db.selectFrom('league.leagues').selectAll().where('organization_id', '=', org).orderBy('name').execute(); }
-  async createLeague(user: string, org: string, dto: LeagueDto) { await this.org(user, org); return this.db.insertInto('league.leagues').values({ organization_id: org, name: this.name(dto.name), location: dto.location?.trim() || null }).returningAll().executeTakeFirstOrThrow(); }
+  async leagues(user: string, org: string, archived = false) { await this.org(user, org); return this.db.selectFrom('league.leagues').selectAll().where('organization_id', '=', org).where('archived_at', archived ? 'is not' : 'is', null).orderBy('name').execute(); }
+  private timeZone(value: string | null | undefined) {
+    const zone = value?.trim();
+    if (!zone) return null;
+    try { new Intl.DateTimeFormat('en-US', { timeZone: zone }).format(); } catch { throw new BadRequestException('Choose a valid time zone'); }
+    return zone;
+  }
+  async createLeague(user: string, org: string, dto: LeagueDto) { await this.org(user, org); return this.db.insertInto('league.leagues').values({ organization_id: org, name: this.name(dto.name), location: dto.location?.trim() || null, time_zone: this.timeZone(dto.timeZone) }).returningAll().executeTakeFirstOrThrow(); }
   async getLeague(user: string, id: string) { return this.league(user, id); }
-  async editLeague(user: string, id: string, dto: LeagueDto) { await this.league(user, id); return this.db.updateTable('league.leagues').set({ name: this.name(dto.name), location: dto.location?.trim() || null, updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow(); }
+  async editLeague(user: string, id: string, dto: LeagueDto) { const league = await this.league(user, id); return this.db.updateTable('league.leagues').set({ name: this.name(dto.name), location: dto.location?.trim() || null, time_zone: dto.timeZone === undefined ? league.time_zone : this.timeZone(dto.timeZone), updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow(); }
   async organizationSeasons(user: string, organization: string, filters: OrganizationSeasonFilterDto = {}) {
     await this.org(user, organization);
     if (filters.leagueId) {
@@ -114,6 +268,10 @@ export class LeagueService {
       .where('l.organization_id', '=', organization);
     if (filters.leagueId) query = query.where('s.league_id', '=', filters.leagueId);
     if (filters.status) query = query.where('s.status', '=', filters.status);
+    // A season counts as archived when it or its league is archived.
+    query = filters.archived === 'true'
+      ? query.where((eb) => eb.or([eb('s.archived_at', 'is not', null), eb('l.archived_at', 'is not', null)]))
+      : query.where('s.archived_at', 'is', null).where('l.archived_at', 'is', null);
     const search = filters.search?.trim();
     if (search) query = query.where('s.name', 'ilike', `%${search.replace(/[\\%_]/g, '\\$&')}%`);
     const count = await query.clearSelect().select(({ fn }) => fn.countAll<string>().as('total')).executeTakeFirstOrThrow();
@@ -123,7 +281,7 @@ export class LeagueService {
   }
   async seasons(user: string, league: string, filters: SeasonFilterDto = {}) {
     await this.league(user, league);
-    let query = this.db.selectFrom('league.seasons').selectAll().select(seasonDates).where('league_id', '=', league);
+    let query = this.db.selectFrom('league.seasons').selectAll().select(seasonDates).where('league_id', '=', league).where('archived_at', filters.archived === 'true' ? 'is not' : 'is', null);
     if (filters.status) query = query.where('status', '=', filters.status);
     const search = filters.search?.trim();
     if (search) query = query.where('name', 'ilike', `%${search.replace(/[\\%_]/g, '\\$&')}%`);
@@ -145,9 +303,10 @@ export class LeagueService {
   async createDivision(user: string, seasonId: string, dto: DivisionDto) { return this.mutation(() => this.db.transaction().execute(async (tx) => { const season = await this.season(user, seasonId, tx, true); this.editable(season.status); const minAge = dto.minAge ?? null; const maxAge = dto.maxAge ?? null; this.ageRange(minAge, maxAge); return tx.insertInto('league.divisions').values({ season_id: seasonId, name: this.name(dto.name), min_age: minAge, max_age: maxAge }).returningAll().executeTakeFirstOrThrow(); })); }
   async editDivision(user: string, id: string, dto: UpdateDivisionDto) { return this.mutation(() => this.db.transaction().execute(async (tx) => { const initial = await this.division(user, id, tx); const season = await this.season(user, initial.season_id, tx, true); this.editable(season.status); const division = await this.division(user, id, tx); const minAge = dto.minAge === undefined ? division.min_age : dto.minAge; const maxAge = dto.maxAge === undefined ? division.max_age : dto.maxAge; this.ageRange(minAge, maxAge); await this.checkRegistrations(tx, { divisionId: id }, { minAge, maxAge }); return tx.updateTable('league.divisions').set({ name: dto.name === undefined ? division.name : this.name(dto.name), min_age: minAge, max_age: maxAge, updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow(); })); }
   async deleteDivision(user: string, id: string) { return this.db.transaction().execute(async (tx) => { const division = await this.division(user, id, tx); const season = await this.season(user, division.season_id, tx, true); if (season.status !== 'draft') throw new BadRequestException('Divisions can only be deleted in draft seasons'); const team = await tx.selectFrom('league.season_teams').select('id').where('division_id', '=', id).executeTakeFirst(); const game = await tx.selectFrom('league.games').select('id').where('division_id', '=', id).executeTakeFirst(); if (team || game) throw new BadRequestException('Only empty divisions can be deleted'); await tx.deleteFrom('league.divisions').where('id', '=', id).execute(); return { deleted: true }; }); }
-  async transition(user: string, id: string, status: 'active' | 'completed') { return this.db.transaction().execute(async (tx) => {
+  async transition(user: string, id: string, status: 'draft' | 'active' | 'completed') { return this.db.transaction().execute(async (tx) => {
     const season = await this.season(user, id, tx, true);
-    if ((status === 'active' && season.status !== 'draft') || (status === 'completed' && season.status !== 'active')) throw new BadRequestException('Invalid season transition');
+    if ((status === 'draft' && season.status !== 'active') || (status === 'active' && season.status !== 'draft') || (status === 'completed' && season.status !== 'active')) throw new BadRequestException('Invalid season transition');
+    if (status === 'draft' && await this.hasHistory(tx, [id])) throw new BadRequestException('Seasons with recorded results can’t return to draft');
     if (status === 'completed') {
       const games = await tx.selectFrom('league.games').select(['status', 'stage', 'schedule_id', 'division_id']).where('season_id', '=', id).execute();
       if (!games.length || games.some((game) => game.status !== 'completed')) throw new BadRequestException('Complete all games before completing the season');
@@ -165,7 +324,7 @@ export class LeagueService {
     await this.org(user, organization);
     return this.db.selectFrom('league.seasons as s').innerJoin('league.leagues as l', 'l.id', 's.league_id')
       .select(['s.id', 's.name', 's.league_id', 's.status', 'l.name as league_name'])
-      .where('l.organization_id', '=', organization).orderBy('l.name').orderBy('s.name').orderBy('s.id').execute();
+      .where('l.organization_id', '=', organization).where('l.archived_at', 'is', null).where('s.archived_at', 'is', null).orderBy('l.name').orderBy('s.name').orderBy('s.id').execute();
   }
   async organizationTeams(user: string, organization: string, filters: OrganizationTeamFilterDto = {}) {
     await this.org(user, organization);
@@ -184,7 +343,7 @@ export class LeagueService {
       .leftJoin('league.seasons as s', 's.id', 'st.season_id')
       .leftJoin('league.divisions as d', 'd.id', 'st.division_id')
       .select(['t.id', 't.name', 't.abbreviation', 't.league_id', 'l.name as league_name', 'st.id as season_team_id', 's.id as season_id', 's.name as season_name', 's.status as season_status', 'st.division_id', 'd.name as division_name'])
-      .where('l.organization_id', '=', organization);
+      .where('l.organization_id', '=', organization).where('l.archived_at', 'is', null);
     if (filters.leagueId) query = query.where('t.league_id', '=', filters.leagueId);
     const paginated = filters.page !== undefined || filters.pageSize !== undefined;
     if (filters.seasonId) {
@@ -322,8 +481,9 @@ export class LeagueService {
   }); }
   async editPlayer(user: string, id: string, dto: UpdatePlayerDto) { return this.db.transaction().execute(async (tx) => {
     await this.playerLock(id, tx);
-    const owned = await tx.selectFrom('league.organization_players as op').innerJoin('league.organizations as o', 'o.id', 'op.organization_id').select('op.player_id').where('op.player_id', '=', id).where('o.owner_user_id', '=', user).executeTakeFirst();
+    const owned = await tx.selectFrom('league.organization_players as op').innerJoin('league.organizations as o', 'o.id', 'op.organization_id').select(['op.player_id', 'o.archived_at']).where('op.player_id', '=', id).where('o.owner_user_id', '=', user).executeTakeFirst();
     if (!owned) throw new NotFoundException();
+    ensureNotArchived(owned.archived_at);
     const other = await tx.selectFrom('league.organization_players as op').innerJoin('league.organizations as o', 'o.id', 'op.organization_id').select('op.player_id').where('op.player_id', '=', id).where('o.owner_user_id', '!=', user).executeTakeFirst();
     if (other) throw new NotFoundException();
     const registrations = await tx.selectFrom('league.rosters').select('season_id').where('player_id', '=', id).orderBy('season_id').execute();
@@ -365,15 +525,14 @@ export class LeagueService {
   async organizationVenues(user: string, organization: string, filters: OrganizationVenueFilterDto = {}) {
     await this.org(user, organization);
     if (filters.leagueId) { const league = await this.league(user, filters.leagueId); if (league.organization_id !== organization) throw new NotFoundException(); }
-    let query = this.db.selectFrom('league.venues as v').innerJoin('league.leagues as l', 'l.id', 'v.league_id').selectAll('v').select('l.name as league_name').where('l.organization_id', '=', organization);
+    let query = this.db.selectFrom('league.venues as v').innerJoin('league.leagues as l', 'l.id', 'v.league_id').selectAll('v').select('l.name as league_name').where('l.organization_id', '=', organization).where('l.archived_at', 'is', null);
     if (filters.leagueId) query = query.where('v.league_id', '=', filters.leagueId);
     const search = filters.search?.trim();
     if (search) query = query.where('v.name', 'ilike', `%${search.replace(/[\\%_]/g, '\\$&')}%`);
     return query.orderBy('v.name').orderBy('v.id').execute();
   }
   async editVenue(user: string, id: string, dto: VenueDto) {
-    const venue = await this.db.selectFrom('league.venues as v').innerJoin('league.leagues as l', 'l.id', 'v.league_id').innerJoin('league.organizations as o', 'o.id', 'l.organization_id').select('v.id').where('v.id', '=', id).where('o.owner_user_id', '=', user).executeTakeFirst();
-    if (!venue) throw new NotFoundException();
+    await this.venue(user, id);
     return this.db.updateTable('league.venues').set({ name: this.name(dto.name), address: dto.address?.trim() || null, updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow();
   }
   async games(user: string, season: string, divisionId?: string) { await this.season(user, season); const division = await this.divisionForSeason(season, divisionId); return this.db.selectFrom('league.games as g').innerJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').innerJoin('league.teams as ht', 'ht.id', 'h.team_id').innerJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').innerJoin('league.teams as at', 'at.id', 'a.team_id').leftJoin('league.venues as v', 'v.id', 'g.venue_id').selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name']).where('g.season_id', '=', season).where('g.division_id', '=', division.id).orderBy('g.scheduled_at', 'asc').execute(); }

@@ -1,6 +1,6 @@
 import { Body, Controller, Delete, Get, Headers, Param, ParseUUIDPipe, Patch, Post, Query } from '@nestjs/common';
 import { AuthService } from '../auth/auth.service';
-import { CreateTeamDto, MoveTeamRegistrationDto, DivisionDto, DivisionFilterDto, PlayerDto, UpdateDivisionDto, UpdatePlayerDto, GameDto, GameFilterDto, JerseyDto, LeagueDto, NameDto, OrganizationSeasonFilterDto, OrganizationTeamFilterDto, OrganizationVenueFilterDto, RosterDto, RosterFilterDto, ScoreDto, SeasonDto, SeasonFilterDto, StatusDto, TeamDto, TeamRegistrationDto, VenueDto } from './league.dto';
+import { ArchivedFilterDto, ConfirmDeleteDto, CreateTeamDto, MoveTeamRegistrationDto, DivisionDto, DivisionFilterDto, PlayerDto, UpdateDivisionDto, UpdatePlayerDto, GameDto, GameFilterDto, JerseyDto, LeagueDto, NameDto, OrganizationSeasonFilterDto, OrganizationTeamFilterDto, OrganizationVenueFilterDto, RosterDto, RosterFilterDto, ScoreDto, SeasonDto, SeasonFilterDto, StatusDto, TeamDto, TeamRegistrationDto, VenueDto } from './league.dto';
 import { LeagueService } from './league.service';
 import { ScheduleService } from './schedule.service';
 import { ForfeitDto } from './forfeit.dto';
@@ -10,11 +10,23 @@ import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, Sch
 export class LeagueController {
   constructor(private readonly auth: AuthService, private readonly league: LeagueService, private readonly schedule: ScheduleService) {}
   private async user(header?: string) { return (await this.auth.me(header)).user.id; }
-  @Get('organizations') async organizations(@Headers('authorization') h?: string) { return this.league.organizations(await this.user(h)); }
+  @Get('organizations') async organizations(@Headers('authorization') h: string | undefined, @Query() filters: ArchivedFilterDto) { return this.league.organizations(await this.user(h), filters.archived === 'true'); }
   @Post('organizations') async createOrganization(@Headers('authorization') h: string, @Body() dto: NameDto) { return this.league.createOrganization(await this.user(h), dto); }
   @Get('organizations/:id') async organization(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.league.getOrganization(await this.user(h), id); }
   @Patch('organizations/:id') async editOrganization(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: NameDto) { return this.league.editOrganization(await this.user(h), id, dto); }
-  @Get('organizations/:id/leagues') async leagues(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.league.leagues(await this.user(h), id); }
+  @Get('organizations/:id/leagues') async leagues(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Query() filters: ArchivedFilterDto) { return this.league.leagues(await this.user(h), id, filters.archived === 'true'); }
+  @Post('organizations/:id/archive') async archiveOrganization(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.league.archiveOrganization(await this.user(h), id, true); }
+  @Post('organizations/:id/restore') async restoreOrganization(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.league.archiveOrganization(await this.user(h), id, false); }
+  @Delete('organizations/:id') async deleteOrganization(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: ConfirmDeleteDto) { return this.league.deleteOrganization(await this.user(h), id, dto); }
+  @Delete('organizations/:id/players/:playerId') async deletePlayer(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Param('playerId', ParseUUIDPipe) playerId: string) { return this.league.deletePlayer(await this.user(h), id, playerId); }
+  @Post('leagues/:id/archive') async archiveLeague(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.league.archiveLeague(await this.user(h), id, true); }
+  @Post('leagues/:id/restore') async restoreLeague(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.league.archiveLeague(await this.user(h), id, false); }
+  @Delete('leagues/:id') async deleteLeague(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: ConfirmDeleteDto) { return this.league.deleteLeague(await this.user(h), id, dto); }
+  @Post('seasons/:id/archive') async archiveSeason(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.league.archiveSeason(await this.user(h), id, true); }
+  @Post('seasons/:id/restore') async restoreSeason(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.league.archiveSeason(await this.user(h), id, false); }
+  @Delete('seasons/:id') async deleteSeason(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: ConfirmDeleteDto) { return this.league.deleteSeason(await this.user(h), id, dto); }
+  @Delete('teams/:id') async deleteTeam(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.league.deleteTeam(await this.user(h), id); }
+  @Delete('venues/:id') async deleteVenue(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.league.deleteVenue(await this.user(h), id); }
   @Get('organizations/:id/seasons') async organizationSeasons(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Query() filters: OrganizationSeasonFilterDto) { return this.league.organizationSeasons(await this.user(h), id, filters); }
   @Get('organizations/:id/teams') async organizationTeams(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Query() filters: OrganizationTeamFilterDto) { return this.league.organizationTeams(await this.user(h), id, filters); }
   @Get('organizations/:id/players') async players(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Query() filters: RosterFilterDto) { return this.league.players(await this.user(h), id, filters); }
