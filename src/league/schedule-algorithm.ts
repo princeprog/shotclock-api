@@ -625,7 +625,7 @@ function placementReason(
   if ((Number.isFinite(options.earliest) || Number.isFinite(options.latest)) && fits({ earliest: -Infinity, latest: Infinity })) {
     return { code: 'round_order', message: 'A suitable slot exists earlier, but each team must finish its previous round first. Add more playing time or extend the date range. A different arrangement may also work.' };
   }
-  if (options.minDay > 0 && fits({ minDay: 0 })) {
+  if (config.pace === 'spread' && options.minDay > 0 && fits({ minDay: 0 })) {
     return { code: 'spread', message: 'Spread pacing reserves later dates for this round, and those dates are full. Add playing time or choose weekly pacing. A different arrangement may also work.' };
   }
   if (fits({ checkTeams: false })) {
@@ -697,11 +697,18 @@ function attempt(
   const playingDays = intervals.length ? intervals[intervals.length - 1].day + 1 : 0;
   const groupRounds = new Map<string, number>();
   for (const match of matches) groupRounds.set(match.groupId ?? '', Math.max(groupRounds.get(match.groupId ?? '') ?? 0, match.round));
+  // Stagger divisions across the first week's playing days, preserving weekly spacing.
+  const firstWeekDays = intervals.filter((interval) => interval.dayNumber < (intervals[0]?.dayNumber ?? 0) + 7);
+  const firstWeekCount = firstWeekDays.length ? Math.min(4, firstWeekDays[firstWeekDays.length - 1].day + 1) : 0;
+  const staggerCount = Math.min(groupRounds.size, firstWeekCount);
+  const groupDays = new Map([...groupRounds.keys()].map((group, index) => [group,
+    staggerCount > 1 ? Math.floor((index % staggerCount) * (firstWeekCount - 1) / (staggerCount - 1)) : 0]));
   const games: (ScheduleGame | undefined)[] = new Array(matches.length);
   const unplaced: Unplaced[] = [];
   let placed = 0;
   for (const { match, index } of ordered) {
-    const minDay = config.pace === 'spread' ? Math.floor((match.round - 1) * playingDays / groupRounds.get(match.groupId ?? '')!) : 0;
+    const minDay = config.pace === 'spread' ? Math.floor((match.round - 1) * playingDays / groupRounds.get(match.groupId ?? '')!)
+      : config.pace === 'weekly' && fair ? groupDays.get(match.groupId ?? '')! : 0;
     const options: PlacementOptions = { checkTeams: true, checkVenues: true, checkDays: true, rest, minDay, fair, ...state.bounds(match) };
     const selected = findPlacement(match, config, intervals, state, options);
     if (!selected) {

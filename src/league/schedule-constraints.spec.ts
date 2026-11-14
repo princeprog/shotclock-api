@@ -89,6 +89,34 @@ const draft = (homeTeamId: string, awayTeamId: string, scheduledAt: string, roun
   ({ ...fixture(homeTeamId, awayTeamId, round), scheduledAt, venueId, durationMinutes: 60 });
 const twoSundays: ScheduleAvailability = { ...base, venueIds: ['court-a', 'court-b'] };
 
+it.each([2, 4])('uses weekday and weekend windows for %i weekly divisions when both fit', (divisionCount) => {
+  const options: ScheduleAvailability = { ...base, startDate: '2028-11-15', endDate: '2028-12-31',
+    windows: [{ weekdays: [1, 2, 3, 4, 5], startTime: '05:00', endTime: '22:00' },
+      { weekdays: [0, 6], startTime: '08:00', endTime: '18:00' }], pace: 'weekly', maxGamesPerTeamPerDay: 1 };
+  const fixtures = Array.from({ length: divisionCount }, (_, division) =>
+    roundRobin(Array.from({ length: 8 }, (_, team) => `${division}-${team}`), 'single')
+      .map((item) => ({ ...item, groupId: String(division) }))).flat();
+  const result = planSchedule(fixtures, options, []);
+  expect(result.unplaced).toHaveLength(0);
+  const games = result.games.map(({ game }) => game);
+  const weekday = (value: string) => new Date(Date.parse(value) + 8 * 60 * MINUTE).getUTCDay();
+  expect(games.some((game) => [0, 6].includes(weekday(game.scheduledAt)))).toBe(true);
+  expect(games.some((game) => ![0, 6].includes(weekday(game.scheduledAt)))).toBe(true);
+  expect(scheduleIssues(games, options, [])).toEqual([]);
+});
+
+it('falls back to earliest days when staggering would leave games unscheduled', () => {
+  const options: ScheduleAvailability = { ...base, startDate: '2028-11-15', endDate: '2028-11-29',
+    windows: [{ weekdays: [0, 1, 2, 3, 4, 5, 6], startTime: '08:00', endTime: '18:00' }],
+    pace: 'weekly', maxGamesPerTeamPerDay: 1 };
+  const fixtures = Array.from({ length: 2 }, (_, division) =>
+    roundRobin(Array.from({ length: 4 }, (_, team) => `${division}-${team}`), 'single')
+      .map((item) => ({ ...item, groupId: String(division) }))).flat();
+  const result = planSchedule(fixtures, options, []);
+  expect(result.unplaced).toHaveLength(0);
+  expect(scheduleIssues(result.games.map(({ game }) => game), options, [])).toEqual([]);
+});
+
 describe('court changeover', () => {
   it('leaves the changeover gap between games on the same court', () => {
     const options = { ...base, venueIds: ['court-a'], endDate: '2026-11-01', windows: [{ weekdays: [0], startTime: '09:00', endTime: '12:00' }], changeoverMinutes: 15 };
