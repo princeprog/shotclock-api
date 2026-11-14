@@ -40,6 +40,14 @@ const game = (overrides: Partial<ScheduleGame> = {}): ScheduleGame => ({
 });
 
 describe('schedule preview diagnostics', () => {
+  it('accounts for changeover from bookings just outside either window boundary', () => {
+    const config = { ...availability, venueIds: ['court-a'], changeoverMinutes: 15,
+      windows: [{ weekdays: [0], startTime: '09:00', endTime: '10:00' }] };
+    const booking: ExistingGame = { homeTeamId: 'x', awayTeamId: 'y', venueId: 'court-a', durationMinutes: 60, scheduledAt: '2026-11-01T00:00:00Z' };
+    expect(estimateCourtCapacity(config, [booking])).toBe(0);
+    expect(estimateCourtCapacity(config, [{ ...booking, scheduledAt: '2026-11-01T02:00:00Z' }])).toBe(0);
+    expect(estimateCourtCapacity(config, [])).toBe(1);
+  });
   it('counts free court capacity after overlapping bookings and legacy durations', () => {
     const existing: ExistingGame[] = [
       { homeTeamId: 'x', awayTeamId: 'y', scheduledAt: '2026-11-01T01:30:00.000Z', venueId: 'court-a', durationMinutes: null },

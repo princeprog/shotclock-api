@@ -383,7 +383,9 @@ function busyGames(
 export function estimateCourtCapacity(availability: ScheduleAvailability, existing: ExistingGame[]): number {
   const config = settings(availability);
   const intervals = windows(config);
-  const busy = busyGames(existing, availability).filter((game) => {
+  const busy = busyGames(existing, availability).map((game) => ({
+    ...game, start: game.start - config.changeover, end: game.end + config.changeover,
+  })).filter((game) => {
     if (game.venueId === null || !availability.venueIds.includes(game.venueId)) return false;
     let low = 0, high = intervals.length;
     while (low < high) {
