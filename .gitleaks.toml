@@ -1,0 +1,9 @@
+title = "Shotclock API secret scanning"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test-only fixtures and documented placeholders, never real credentials"
+paths = ['''\.env\.example$''', '''\.spec\.ts$''', '''\.github/workflows/ci\.yml$''']
+

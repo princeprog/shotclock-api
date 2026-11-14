@@ -1,4 +1,5 @@
-import { Body, Controller, Delete, Get, Headers, Param, ParseUUIDPipe, Patch, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Headers, Param, ParseUUIDPipe, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import { LeagueRateLimitGuard } from './league-rate-limit.guard';
 import { AuthService } from '../auth/auth.service';
 import { ArchivedFilterDto, ConfirmDeleteDto, CreateTeamDto, MoveTeamRegistrationDto, DivisionDto, DivisionFilterDto, PlayerDto, UpdateDivisionDto, UpdatePlayerDto, GameDto, GameFilterDto, JerseyDto, LeagueDto, NameDto, OrganizationSeasonFilterDto, OrganizationTeamFilterDto, OrganizationVenueFilterDto, RosterDto, RosterFilterDto, ScoreDto, SeasonDto, SeasonFilterDto, StatusDto, TeamDto, TeamRegistrationDto, VenueDto } from './league.dto';
 import { LeagueService } from './league.service';
@@ -7,6 +8,7 @@ import { ForfeitDto } from './forfeit.dto';
 import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffPreviewDto, SeasonPlayoffSaveDto, SeasonPlayoffSuggestDto, SeasonSchedulePreviewDto, SeasonScheduleSaveDto, SeasonScheduleSuggestDto } from './league.dto';
 
 @Controller('league')
+@UseGuards(LeagueRateLimitGuard)
 export class LeagueController {
   constructor(private readonly auth: AuthService, private readonly league: LeagueService, private readonly schedule: ScheduleService) {}
   private async user(header?: string) { return (await this.auth.me(header)).user.id; }

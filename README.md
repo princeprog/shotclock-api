@@ -42,3 +42,25 @@ By default, the API uses the socket peer and ignores `X-Forwarded-For` and all c
 For per-client limits, optionally configure **both** `AUTH_TRUSTED_GATEWAY_IPS` (comma-separated exact API-visible IPv4/IPv6 socket peer addresses; no CIDRs) and a separate random `AUTH_GATEWAY_SECRET` of at least 32 bytes. The gateway sends `X-Auth-Client-IP` as one IPv4 or IPv6 address and `X-Auth-Gateway-Secret` with that secret. The API honors the address only if the socket peer is allowlisted and the secret matches. Incorrect or missing attestation falls back to the socket peer.
 
 The gateway must obtain the client IP from a trusted platform connection address or an ingress that strips and overwrites client-provided forwarding headers. Never copy an arbitrary browser-supplied forwarding header. Strip incoming `X-Auth-Client-IP` and `X-Auth-Gateway-Secret` before creating backend requests; do not expose the secret to browser code, redact it from logs, and use TLS on the gateway-to-API connection. Restrict API network access to the gateway and rotate the secret if exposed. If the API sees a proxy rather than the gateway as its peer, allowlisting that proxy is safe only if it prevents untrusted traffic from reaching the API and does not disclose or inject the secret. If the gateway cannot identify client IPs reliably, omit attestation instead of guessing.
+
+## Security
+
+- **Rate limits:** auth routes keep their 15-minute limits per client and per account. League routes are limited per user per minute: 300 reads, 60 writes and 20 schedule planning or saving requests (60 for requests without a valid token); tune them with the LEAGUE_RATE_LIMIT_* settings. Current-password checks allow 10 attempts per account per 15 minutes.
+- **Security events:** `auth.security_events` records sign-ins (failed attempts store a SHA-256 hash of the email), password, email and session changes, account deletion, and archive, restore and delete actions, with the client IP. Events are kept for 365 days. Password changes and resets also email the account.
+- **Database TLS:** set `DB_SSL=verify-full` (with `DB_SSL_CA` when the provider uses a private CA). The API refuses to start in production with TLS disabled.
+- **Least privilege:** run migrations as an owner role through `DB_MIGRATION_USER`/`DB_MIGRATION_PASSWORD` and give the API's `DB_USER` only what it needs:
+
+```sql
+CREATE ROLE shotclock_app LOGIN PASSWORD '<generated>';
+GRANT CONNECT ON DATABASE shotclock TO shotclock_app;
+GRANT USAGE ON SCHEMA auth, league TO shotclock_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA auth, league TO shotclock_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE shotclock_owner IN SCHEMA auth, league GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO shotclock_app;
+```
+
+### Production checklist
+
+- Set `AUTH_GATEWAY_SECRET` and `AUTH_TRUSTED_GATEWAY_IPS` here and the matching web gateway settings, so rate limits apply per client instead of to everyone behind the gateway.
+- Keep the API on a private network that only the web app can reach.
+- Use HTTPS origins for `FRONTEND_URL` and `CORS_ORIGINS`, and `DB_SSL=verify-full`.
+- CI fails on high or critical `pnpm audit` findings; CodeQL, gitleaks and Dependabot run on GitHub.

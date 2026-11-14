@@ -7,6 +7,8 @@ import { sql, type Kysely, type Transaction } from 'kysely';
 import { DatabaseService } from '../database/database.service';
 import type { DB } from '../database/db';
 import { AuthMailer, type AuthEmailPurpose } from './auth-mailer.service';
+import { RateLimitService } from '../common/rate-limit.service';
+import { SecurityEventsService } from '../common/security-events.service';
 
 const DAY = 86_400_000;
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -22,7 +24,8 @@ export class AuthService {
   private readonly secret: string;
   private readonly dummyHash = argon2.hash(randomBytes(32).toString('hex'), { type: argon2.argon2id });
   constructor(private readonly database: DatabaseService, private readonly jwt: JwtService,
-    private readonly mailer: AuthMailer, config: ConfigService) {
+    private readonly mailer: AuthMailer, private readonly limits: RateLimitService,
+    private readonly events: SecurityEventsService, config: ConfigService) {
     this.secret = config.getOrThrow<string>('AUTH_JWT_SECRET');
     if (Buffer.byteLength(this.secret) < 32) throw new Error('AUTH_JWT_SECRET must be at least 32 bytes');
   }
@@ -35,6 +38,10 @@ export class AuthService {
     void this.mailer.send(email, purpose, raw).catch(() => {
       this.logger.error('Failed to deliver an authentication email');
     });
+  }
+
+  private notifyPasswordChanged(email: string) {
+    this.notify(email, 'Your Shotclock password was changed', 'Your Shotclock password was just changed. If you did not make this change, reset your password right away.');
   }
 
   private notify(email: string, subject: string, text: string) {
@@ -80,13 +87,19 @@ export class AuthService {
     const user = await this.database.db.selectFrom('auth.users').selectAll()
       .where('email', '=', normalizeEmail(emailInput)).executeTakeFirst();
     const valid = await argon2.verify(user?.password_hash ?? await this.dummyHash, password);
-    if (!user || !valid || !user.email_verified) throw new UnauthorizedException('Invalid email or password');
-    return this.database.db.transaction().execute(async (tx) => {
+    if (!user || !valid || !user.email_verified) {
+      // The email is hashed so the log never holds addresses typed by strangers.
+      await this.events.record('login_failed', { userId: user?.id ?? null, metadata: { emailHash: hash(normalizeEmail(emailInput)) } });
+      throw new UnauthorizedException('Invalid email or password');
+    }
+    const session = await this.database.db.transaction().execute(async (tx) => {
       const current = await tx.selectFrom('auth.users').selectAll().where('id', '=', user.id).forUpdate().executeTakeFirst();
       // A concurrent password reset must not create a session from old credentials.
       if (!current || !current.email_verified || current.password_hash !== user.password_hash) throw new UnauthorizedException('Invalid email or password');
       return this.issue(tx, current);
     });
+    await this.events.record('login_succeeded', { userId: user.id });
+    return session;
   }
 
   async refresh(refreshToken: string) {
@@ -144,12 +157,19 @@ export class AuthService {
     return { claims, user };
   }
 
+  // Verifies only the access token signature and expiry, for cheap per-user keys such as rate limits.
+  async accessTokenUser(authorization?: string): Promise<string | null> {
+    try { return (await this.claims(authorization)).sub; } catch { return null; }
+  }
+
   async me(authorization?: string) {
     const { user } = await this.current(authorization);
     return { user: this.publicUser(user) };
   }
 
+  // Limited per account so a stolen session cannot be used to guess the current password.
   private async checkPassword(user: User, password: string) {
+    await this.limits.enforce('password-check:' + user.id, 10, 15 * 60);
     if (!await argon2.verify(user.password_hash, password)) throw new BadRequestException('Current password is incorrect');
   }
 
@@ -174,6 +194,8 @@ export class AuthService {
       await tx.updateTable('auth.action_tokens').set({ used_at: new Date() })
         .where('user_id', '=', user.id).where('purpose', '=', 'reset').where('used_at', 'is', null).execute();
     });
+    await this.events.record('password_changed', { userId: user.id });
+    this.notifyPasswordChanged(user.email);
     return { message: 'Password changed.' };
   }
 
@@ -181,6 +203,7 @@ export class AuthService {
     const { claims, user } = await this.current(authorization);
     await this.database.db.updateTable('auth.sessions').set({ revoked_at: new Date() })
       .where('user_id', '=', user.id).where('id', '!=', claims.sid).where('revoked_at', 'is', null).execute();
+    await this.events.record('other_sessions_revoked', { userId: user.id });
     return { message: 'Signed out of other devices.' };
   }
 
@@ -200,6 +223,7 @@ export class AuthService {
       });
       this.deliver(email, 'email_change', raw);
     }
+    await this.events.record('email_change_requested', { userId: user.id });
     return { message: 'Check your new email for a confirmation link.' };
   }
 
@@ -217,9 +241,10 @@ export class AuthService {
       await tx.updateTable('auth.action_tokens').set({ used_at: new Date() })
         .where('user_id', '=', user.id).where('purpose', '=', 'email_change').where('used_at', 'is', null).execute();
       await tx.updateTable('auth.users').set({ email: action.new_email, email_verified: true, updated_at: new Date() }).where('id', '=', user.id).execute();
-      return { oldEmail: user.email, newEmail: action.new_email };
+      return { userId: user.id, oldEmail: user.email, newEmail: action.new_email };
     });
     if (!result) throw new BadRequestException('Invalid or expired token');
+    await this.events.record('email_changed', { userId: result.userId });
     this.notify(result.oldEmail, 'Your Shotclock email was changed', `Your Shotclock sign-in email was changed to ${result.newEmail}. If you did not make this change, reset your password right away.`);
     return { message: 'Email changed.' };
   }
@@ -235,6 +260,8 @@ export class AuthService {
       await tx.deleteFrom('league.league_members').where('user_id', '=', user.id).execute();
       await tx.deleteFrom('auth.users').where('id', '=', user.id).execute();
     });
+    // The user row is gone, so the account ID is kept in metadata for the audit trail.
+    await this.events.record('account_deleted', { metadata: { accountId: user.id } });
     return { message: 'Account deleted.' };
   }
 
@@ -270,12 +297,12 @@ export class AuthService {
     const success = await this.database.db.transaction().execute(async (tx) => {
       const candidate = await tx.selectFrom('auth.action_tokens').select('user_id')
         .where('token_hash', '=', hash(raw)).where('purpose', '=', purpose).executeTakeFirst();
-      if (!candidate) return false;
+      if (!candidate) return null;
       // Keep the same user-then-token lock order as sendAction.
-      await tx.selectFrom('auth.users').select('id').where('id', '=', candidate.user_id).forUpdate().executeTakeFirst();
+      const owner = await tx.selectFrom('auth.users').select(['id', 'email']).where('id', '=', candidate.user_id).forUpdate().executeTakeFirst();
       const action = await tx.selectFrom('auth.action_tokens').selectAll()
         .where('token_hash', '=', hash(raw)).where('purpose', '=', purpose).forUpdate().executeTakeFirst();
-      if (!action || action.used_at || action.expires_at <= new Date()) return false;
+      if (!action || action.used_at || action.expires_at <= new Date()) return null;
       await tx.updateTable('auth.action_tokens').set({ used_at: new Date() })
         .where('user_id', '=', action.user_id).where('purpose', '=', purpose).where('used_at', 'is', null).execute();
       if (purpose === 'verify') {
@@ -286,9 +313,13 @@ export class AuthService {
           .where('id', '=', action.user_id).execute();
         await tx.updateTable('auth.sessions').set({ revoked_at: new Date() }).where('user_id', '=', action.user_id).execute();
       }
-      return true;
+      return owner ?? null;
     });
     if (!success) throw new BadRequestException('Invalid or expired token');
+    if (purpose === 'reset') {
+      await this.events.record('password_reset', { userId: success.id });
+      this.notifyPasswordChanged(success.email);
+    }
     return { message: purpose === 'verify' ? 'Email verified.' : 'Password reset.' };
   }
 }

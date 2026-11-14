@@ -21,6 +21,8 @@ export class AuthCleanup implements OnModuleInit, OnModuleDestroy {
     await this.database.db.deleteFrom('auth.sessions')
       .where((eb) => eb.or([eb('idle_expires_at', '<=', now), eb('absolute_expires_at', '<=', now)])).execute();
     await this.database.db.deleteFrom('auth.action_tokens').where('expires_at', '<=', now).execute();
+    await this.database.db.deleteFrom('auth.security_events')
+      .where('created_at', '<=', new Date(now.getTime() - 365 * 24 * 60 * 60_000)).execute();
     await this.database.db.deleteFrom('auth.rate_limits')
       .where('window_start', '<=', new Date(now.getTime() - 24 * 60 * 60_000)).execute();
   }
