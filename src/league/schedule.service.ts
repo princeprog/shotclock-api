@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { sql, type Kysely, type Transaction } from 'kysely';
 import { DatabaseService } from '../database/database.service';
+import { ensureNotArchived } from '../common/request-scope';
 import type { DB } from '../database/db';
 import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffPreviewDto, SeasonPlayoffSaveDto, SeasonPlayoffSuggestDto, SeasonSchedulePreviewDto, SeasonScheduleSaveDto, SeasonScheduleSuggestDto } from './league.dto';
 import { estimateCourtCapacity, planSchedule, teamGameCapacity, roundRobin, scheduleIssues, scheduleMatches, SchedulePlacementError, suggestSlots, validateSchedule, type ExistingGame, type ScheduleAvailability, type ScheduleGame, type ScheduleMatch } from './schedule-algorithm';
@@ -23,8 +24,10 @@ export class ScheduleService {
         sql<string | null>`s.start_date::text`.as('startDate'), sql<string | null>`s.end_date::text`.as('endDate')])
       .where('d.id', '=', divisionId).where('o.owner_user_id', '=', user);
     if (lock) query = query.forUpdate('s');
-    const context = await query.executeTakeFirst();
-    if (!context) throw new NotFoundException();
+    const found = await query.select(['s.archived_at as seasonArchivedAt', 'l.archived_at as leagueArchivedAt', 'o.archived_at as organizationArchivedAt']).executeTakeFirst();
+    if (!found) throw new NotFoundException();
+    const { seasonArchivedAt, leagueArchivedAt, organizationArchivedAt, ...context } = found;
+    ensureNotArchived(seasonArchivedAt, leagueArchivedAt, organizationArchivedAt);
     return context;
   }
 
@@ -153,8 +156,10 @@ export class ScheduleService {
       .select(['s.id as seasonId', 's.league_id as leagueId', 's.status', sql<string | null>`s.start_date::text`.as('startDate'), sql<string | null>`s.end_date::text`.as('endDate')])
       .where('s.id', '=', seasonId).where('o.owner_user_id', '=', user);
     if (lock) query = query.forUpdate('s');
-    const season = await query.executeTakeFirst();
-    if (!season) throw new NotFoundException();
+    const found = await query.select(['s.archived_at as seasonArchivedAt', 'l.archived_at as leagueArchivedAt', 'o.archived_at as organizationArchivedAt']).executeTakeFirst();
+    if (!found) throw new NotFoundException();
+    const { seasonArchivedAt, leagueArchivedAt, organizationArchivedAt, ...season } = found;
+    ensureNotArchived(seasonArchivedAt, leagueArchivedAt, organizationArchivedAt);
     return season;
   }
 
