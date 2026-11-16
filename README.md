@@ -18,6 +18,10 @@ Seasons transition from draft to active to completed; an active season without r
 
 Team creation accepts `divisionIds` to register a new team in one or more divisions in a single transaction. Each registration has a separate roster. The existing single `divisionId` remains supported; a player record can still join only one roster per season.
 
+## Public website
+
+`PATCH /league/leagues/:id/publication` lets an owner publish a league and set its web address. The unauthenticated `/public` endpoints (`src/public/`) serve published leagues' active and completed seasons, games, standings, team stats and teams, without player or account data. Set `PUBLIC_SITE_KEY` to give the website its own rate-limit budget, and `WEBSITE_REVALIDATE_URL` with `WEBSITE_REVALIDATE_SECRET` so league changes refresh the website's cache; see `.env.example`. `src/public/public.integration.spec.ts` runs with the disposable database settings above.
+
 ## Authentication contract
 
 All bodies are JSON. Emails are case-normalized. New passwords must be 12–128 characters. Unknown properties and malformed input are rejected. `name` is optional and at most 120 characters.

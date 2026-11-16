@@ -3,11 +3,12 @@ import { sql, type Kysely, type Selectable, type Transaction } from 'kysely';
 import { DatabaseService } from '../database/database.service';
 import type { DB } from '../database/db';
 import { calculateStandings } from './standings';
+import { slugify, uniqueSlug } from './slug';
 import { ForfeitDto } from './forfeit.dto';
 import { paginationMeta } from '../common/pagination';
 import { allowArchived, ensureNotArchived } from '../common/request-scope';
 import { SecurityEventsService } from '../common/security-events.service';
-import { ConfirmDeleteDto, CreateTeamDto, DivisionDto, PlayerDto, UpdateDivisionDto, UpdatePlayerDto, GameDto, GameFilterDto, JerseyDto, LeagueDto, NameDto, OrganizationSeasonFilterDto, OrganizationTeamFilterDto, OrganizationVenueFilterDto, RosterDto, RosterFilterDto, ScoreDto, SeasonDto, SeasonFilterDto, TeamDto, VenueDto } from './league.dto';
+import { ConfirmDeleteDto, CreateTeamDto, DivisionDto, PlayerDto, UpdateDivisionDto, UpdatePlayerDto, GameDto, GameFilterDto, JerseyDto, LeagueDto, NameDto, OrganizationSeasonFilterDto, OrganizationTeamFilterDto, OrganizationVenueFilterDto, PublicationDto, RosterDto, RosterFilterDto, ScoreDto, SeasonDto, SeasonFilterDto, TeamDto, VenueDto } from './league.dto';
 
 type Database = Kysely<DB> | Transaction<DB>;
 const seasonDates = [sql<string | null>`start_date::text`.as('start_date'), sql<string | null>`end_date::text`.as('end_date')] as const;
@@ -264,6 +265,21 @@ export class LeagueService {
   async createLeague(user: string, org: string, dto: LeagueDto) { await this.org(user, org); return this.db.insertInto('league.leagues').values({ organization_id: org, name: this.name(dto.name), location: dto.location?.trim() || null, time_zone: this.timeZone(dto.timeZone) }).returningAll().executeTakeFirstOrThrow(); }
   async getLeague(user: string, id: string) { return this.league(user, id); }
   async editLeague(user: string, id: string, dto: LeagueDto) { const league = await this.league(user, id); return this.db.updateTable('league.leagues').set({ name: this.name(dto.name), location: dto.location?.trim() || null, time_zone: dto.timeZone === undefined ? league.time_zone : this.timeZone(dto.timeZone), updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow(); }
+  // Publishing shows the league on the public website. The first publish derives a web address from the league name.
+  async publication(user: string, id: string, dto: PublicationDto) { return this.db.transaction().execute(async (tx) => {
+    const league = await this.league(user, id, tx);
+    await sql`select pg_advisory_xact_lock(hashtextextended('shotclock:league-slug', 0))`.execute(tx);
+    let slug = dto.slug ?? league.slug;
+    if (!slug && dto.published) {
+      const base = slugify(league.name, 'league');
+      const taken = await tx.selectFrom('league.leagues').select('slug').where('slug', 'like', `${base}%`).execute();
+      slug = uniqueSlug(base, new Set(taken.map((row) => row.slug!)));
+    } else if (slug && slug !== league.slug) {
+      const other = await tx.selectFrom('league.leagues').select('id').where('slug', '=', slug).where('id', '<>', id).executeTakeFirst();
+      if (other) throw new ConflictException('That web address is already used by another league');
+    }
+    return tx.updateTable('league.leagues').set({ slug, published_at: dto.published ? (league.published_at ?? new Date()) : null, updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow();
+  }); }
   async organizationSeasons(user: string, organization: string, filters: OrganizationSeasonFilterDto = {}) {
     await this.org(user, organization);
     if (filters.leagueId) {
@@ -303,7 +319,17 @@ export class LeagueService {
     if ((dto.startDate && !/^\d{4}-\d{2}-\d{2}$/.test(dto.startDate)) || (dto.endDate && !/^\d{4}-\d{2}-\d{2}$/.test(dto.endDate)) || (dto.startDate && dto.endDate && dto.startDate > dto.endDate)) throw new BadRequestException('Invalid season date range');
     return { name: this.name(dto.name), start_date: dto.startDate ?? null, end_date: dto.endDate ?? null };
   }
-  async createSeason(user: string, league: string, dto: SeasonDto) { return this.db.transaction().execute(async (tx) => { await this.league(user, league, tx); const season = await tx.insertInto('league.seasons').values({ league_id: league, ...this.dates(dto) }).returningAll().returning(seasonDates).executeTakeFirstOrThrow(); await tx.insertInto('league.divisions').values({ season_id: season.id, name: 'Open', max_age: null }).execute(); return season; }); }
+  async createSeason(user: string, league: string, dto: SeasonDto) { return this.db.transaction().execute(async (tx) => {
+    await this.league(user, league, tx);
+    const values = this.dates(dto);
+    // The web address is fixed at creation so renaming a season keeps existing links working.
+    await sql`select pg_advisory_xact_lock(hashtextextended('shotclock:season-slug:' || ${league}, 0))`.execute(tx);
+    const taken = await tx.selectFrom('league.seasons').select('slug').where('league_id', '=', league).execute();
+    const slug = uniqueSlug(slugify(values.name, 'season'), new Set(taken.map((row) => row.slug)));
+    const season = await tx.insertInto('league.seasons').values({ league_id: league, ...values, slug }).returningAll().returning(seasonDates).executeTakeFirstOrThrow();
+    await tx.insertInto('league.divisions').values({ season_id: season.id, name: 'Open', max_age: null }).execute();
+    return season;
+  }); }
   async getSeason(user: string, id: string) { await this.season(user, id); return this.db.selectFrom('league.seasons').selectAll().select(seasonDates).where('id', '=', id).executeTakeFirstOrThrow(); }
   async editSeason(user: string, id: string, dto: SeasonDto) { return this.db.transaction().execute(async (tx) => { const season = await this.season(user, id, tx, true); this.editable(season.status); const dates = this.dates(dto); await this.checkRegistrations(tx, { seasonId: id }, { start: dates.start_date }); return tx.updateTable('league.seasons').set({ ...dates, updated_at: new Date() }).where('id', '=', id).returningAll().returning(seasonDates).executeTakeFirstOrThrow(); }); }
   async divisions(user: string, seasonId: string) { await this.season(user, seasonId); return this.db.selectFrom('league.divisions').selectAll().where('season_id', '=', seasonId).orderBy('name').orderBy('id').execute(); }

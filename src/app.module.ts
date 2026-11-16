@@ -6,6 +6,8 @@ import { AuthModule } from './auth/auth.module';
 import { LeagueModule } from './league/league.module';
 import { AuthController } from './auth/auth.controller';
 import { LeagueController } from './league/league.controller';
+import { PublicModule } from './public/public.module';
+import { PublicController } from './public/public.controller';
 import { RequestScopeMiddleware } from './common/request-scope';
 
 @Module({
@@ -13,10 +15,11 @@ import { RequestScopeMiddleware } from './common/request-scope';
     ConfigModule.forRoot({ isGlobal: true, envFilePath: ['.env.local', '.env'] }),
     AuthModule,
     LeagueModule,
+    PublicModule,
   ],
   controllers: [AppController],
   providers: [AppService],
 })
 export class AppModule implements NestModule {
-  configure(consumer: MiddlewareConsumer) { consumer.apply(RequestScopeMiddleware).forRoutes(AppController, AuthController, LeagueController); }
+  configure(consumer: MiddlewareConsumer) { consumer.apply(RequestScopeMiddleware).forRoutes(AppController, AuthController, LeagueController, PublicController); }
 }

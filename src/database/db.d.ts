@@ -143,6 +143,8 @@ export interface LeagueLeagues {
   location: string | null;
   name: string;
   organization_id: string;
+  published_at: Timestamp | null;
+  slug: string | null;
   time_zone: string | null;
   updated_at: Generated<Timestamp>;
 }
@@ -205,6 +207,7 @@ export interface LeagueSeasons {
   id: Generated<string>;
   league_id: string;
   name: string;
+  slug: string;
   start_date: Timestamp | null;
   status: Generated<string>;
   updated_at: Generated<Timestamp>;

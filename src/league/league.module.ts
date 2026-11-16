@@ -4,6 +4,7 @@ import { LeagueController } from './league.controller';
 import { LeagueService } from './league.service';
 import { ScheduleService } from './schedule.service';
 import { LeagueRateLimitGuard } from './league-rate-limit.guard';
+import { PublicModule } from '../public/public.module';
 
-@Module({ imports: [AuthModule], controllers: [LeagueController], providers: [LeagueService, ScheduleService, LeagueRateLimitGuard] })
+@Module({ imports: [AuthModule, PublicModule], controllers: [LeagueController], providers: [LeagueService, ScheduleService, LeagueRateLimitGuard] })
 export class LeagueModule {}
