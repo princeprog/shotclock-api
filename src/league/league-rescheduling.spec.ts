@@ -1,3 +1,4 @@
+import type { SecurityEventsService } from '../common/security-events.service';
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { ValidationPipe, type INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
@@ -45,7 +46,7 @@ function setup() {
   };
   const pool = { connect: async () => client, end: async () => {} } as unknown as Pool;
   const db = new Kysely<DB>({ dialect: new PostgresDialect({ pool }) });
-  return { state, db, service: new LeagueService({ db } as DatabaseService) };
+  return { state, db, service: new LeagueService({ db } as DatabaseService, { record: async () => undefined } as unknown as SecurityEventsService) };
 }
 
 describe('game rescheduling', () => {

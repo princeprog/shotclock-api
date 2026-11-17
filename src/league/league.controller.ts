@@ -1,12 +1,16 @@
-import { Body, Controller, Delete, Get, Headers, Param, ParseUUIDPipe, Patch, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Headers, Param, ParseUUIDPipe, Patch, Post, Query, UseGuards, UseInterceptors } from '@nestjs/common';
+import { LeagueRateLimitGuard } from './league-rate-limit.guard';
+import { PublicRevalidationInterceptor } from '../public/public-revalidation.interceptor';
 import { AuthService } from '../auth/auth.service';
-import { ArchivedFilterDto, ConfirmDeleteDto, CreateTeamDto, MoveTeamRegistrationDto, DivisionDto, DivisionFilterDto, PlayerDto, UpdateDivisionDto, UpdatePlayerDto, GameDto, GameFilterDto, JerseyDto, LeagueDto, NameDto, OrganizationSeasonFilterDto, OrganizationTeamFilterDto, OrganizationVenueFilterDto, RosterDto, RosterFilterDto, ScoreDto, SeasonDto, SeasonFilterDto, StatusDto, TeamDto, TeamRegistrationDto, VenueDto } from './league.dto';
+import { ArchivedFilterDto, ConfirmDeleteDto, CreateTeamDto, MoveTeamRegistrationDto, DivisionDto, DivisionFilterDto, PlayerDto, UpdateDivisionDto, UpdatePlayerDto, GameDto, GameFilterDto, JerseyDto, LeagueDto, NameDto, OrganizationSeasonFilterDto, OrganizationTeamFilterDto, OrganizationVenueFilterDto, PublicationDto, RosterDto, RosterFilterDto, ScoreDto, SeasonDto, SeasonFilterDto, StatusDto, TeamDto, TeamRegistrationDto, VenueDto } from './league.dto';
 import { LeagueService } from './league.service';
 import { ScheduleService } from './schedule.service';
 import { ForfeitDto } from './forfeit.dto';
 import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffPreviewDto, SeasonPlayoffSaveDto, SeasonPlayoffSuggestDto, SeasonSchedulePreviewDto, SeasonScheduleSaveDto, SeasonScheduleSuggestDto } from './league.dto';
 
 @Controller('league')
+@UseGuards(LeagueRateLimitGuard)
+@UseInterceptors(PublicRevalidationInterceptor)
 export class LeagueController {
   constructor(private readonly auth: AuthService, private readonly league: LeagueService, private readonly schedule: ScheduleService) {}
   private async user(header?: string) { return (await this.auth.me(header)).user.id; }
@@ -38,6 +42,7 @@ export class LeagueController {
   @Post('organizations/:id/leagues') async createLeague(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: LeagueDto) { return this.league.createLeague(await this.user(h), id, dto); }
   @Get('leagues/:id') async getLeague(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.league.getLeague(await this.user(h), id); }
   @Patch('leagues/:id') async editLeague(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: LeagueDto) { return this.league.editLeague(await this.user(h), id, dto); }
+  @Patch('leagues/:id/publication') async publication(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: PublicationDto) { return this.league.publication(await this.user(h), id, dto); }
   @Get('leagues/:id/seasons') async seasons(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Query() filters: SeasonFilterDto) { return this.league.seasons(await this.user(h), id, filters); }
   @Post('leagues/:id/seasons') async createSeason(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: SeasonDto) { return this.league.createSeason(await this.user(h), id, dto); }
   @Get('seasons/:id') async season(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.league.getSeason(await this.user(h), id); }

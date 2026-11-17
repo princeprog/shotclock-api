@@ -1,5 +1,6 @@
 import { ArrayMaxSize, ArrayNotEmpty, ArrayUnique, IsArray, IsBoolean, IsDateString, IsDefined, IsIn, IsInt, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min, MinLength, ValidateIf, ValidateNested } from 'class-validator';
 import { Type } from 'class-transformer';
+import { SLUG_MAX, SLUG_MIN, SLUG_PATTERN } from './slug';
 
 const positions = ['point_guard', 'shooting_guard', 'small_forward', 'power_forward', 'center'];
 
@@ -12,6 +13,10 @@ export class LeagueDto extends NameDto {
 }
 export class ArchivedFilterDto {
   @IsOptional() @IsIn(['true', 'false']) archived?: 'true' | 'false';
+}
+export class PublicationDto {
+  @IsBoolean() published!: boolean;
+  @IsOptional() @IsString() @MinLength(SLUG_MIN) @MaxLength(SLUG_MAX) @Matches(SLUG_PATTERN, { message: 'Use lowercase letters, numbers and single hyphens' }) slug?: string;
 }
 export class ConfirmDeleteDto {
   @IsString() @MinLength(1) @MaxLength(200) confirmName!: string;
@@ -61,6 +66,8 @@ export class SeasonFilterDto {
 }
 export class OrganizationSeasonFilterDto extends SeasonFilterDto {
   @IsOptional() @IsUUID() leagueId?: string;
+  @IsOptional() @IsIn(['name', 'league', 'status', 'startDate', 'endDate']) sortBy?: 'name' | 'league' | 'status' | 'startDate' | 'endDate';
+  @IsOptional() @IsIn(['asc', 'desc']) sortDir?: 'asc' | 'desc';
 }
 export class OrganizationTeamFilterDto {
   @IsOptional() @IsString() @MaxLength(120) search?: string;
@@ -69,6 +76,8 @@ export class OrganizationTeamFilterDto {
   @IsOptional() @IsUUID() divisionId?: string;
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(1000000) page?: number;
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(100) pageSize?: number;
+  @IsOptional() @IsIn(['name', 'league', 'season', 'division', 'status']) sortBy?: 'name' | 'league' | 'season' | 'division' | 'status';
+  @IsOptional() @IsIn(['asc', 'desc']) sortDir?: 'asc' | 'desc';
 }
 export class OrganizationVenueFilterDto {
   @IsOptional() @IsString() @MaxLength(120) search?: string;

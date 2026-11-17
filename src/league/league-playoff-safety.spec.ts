@@ -2,6 +2,7 @@ import { BadRequestException } from '@nestjs/common';
 import { Kysely, PostgresDialect } from 'kysely';
 import type { Pool } from 'pg';
 import type { DatabaseService } from '../database/database.service';
+import type { SecurityEventsService } from '../common/security-events.service';
 import type { DB } from '../database/db';
 import { LeagueService } from './league.service';
 
@@ -138,7 +139,7 @@ function setup() {
   };
   const pool = { connect: async () => client, end: async () => {} } as unknown as Pool;
   const db = new Kysely<DB>({ dialect: new PostgresDialect({ pool }) });
-  const service = new LeagueService({ db } as DatabaseService);
+  const service = new LeagueService({ db } as DatabaseService, { record: async () => undefined } as unknown as SecurityEventsService);
   return { state, service, db };
 }
 

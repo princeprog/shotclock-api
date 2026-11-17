@@ -8,6 +8,7 @@ import { ConfigService } from '@nestjs/config'
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import { Pool } from 'pg'
 import { DB } from './db';
+import { databaseSsl } from './database-ssl';
 
 @Injectable()
 export class DatabaseService implements OnModuleInit, OnModuleDestroy{
@@ -22,7 +23,8 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy{
             port,
             user: config.getOrThrow<string>('DB_USER'),
             password: config.getOrThrow<string>('DB_PASSWORD'),
-            database: config.getOrThrow<string>('DB_NAME')
+            database: config.getOrThrow<string>('DB_NAME'),
+            ssl: databaseSsl({ get: (key) => config.get<string>(key) }),
         });
         pool.on('error', (error: Error) => {
             this.logger.error('Unexpected database connection error', error.stack);

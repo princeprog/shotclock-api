@@ -1,9 +1,10 @@
 import { BadRequestException } from '@nestjs/common';
 import { LeagueService } from './league.service';
 import type { DatabaseService } from '../database/database.service';
+import type { SecurityEventsService } from '../common/security-events.service';
 
 describe('division age eligibility', () => {
-  const service = new LeagueService({} as DatabaseService);
+  const service = new LeagueService({} as DatabaseService, {} as SecurityEventsService);
 
   it('uses age at the season start and treats the limit as exclusive', () => {
     expect(() => service['eligible']('2009-09-02', '2026-09-01', null, 17)).not.toThrow();

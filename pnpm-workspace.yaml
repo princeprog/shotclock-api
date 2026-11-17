@@ -1,3 +1,6 @@
+# Wait a day before installing newly published versions, to limit exposure to compromised releases.
+minimumReleaseAge: 1440
+
 allowBuilds:
   '@parcel/watcher': true
   argon2: true
