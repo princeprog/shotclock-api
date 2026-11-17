@@ -10,6 +10,12 @@ import { allowArchived, ensureNotArchived } from '../common/request-scope';
 import { SecurityEventsService } from '../common/security-events.service';
 import { ConfirmDeleteDto, CreateTeamDto, DivisionDto, PlayerDto, UpdateDivisionDto, UpdatePlayerDto, GameDto, GameFilterDto, JerseyDto, LeagueDto, NameDto, OrganizationSeasonFilterDto, OrganizationTeamFilterDto, OrganizationVenueFilterDto, PublicationDto, RosterDto, RosterFilterDto, ScoreDto, SeasonDto, SeasonFilterDto, TeamDto, VenueDto } from './league.dto';
 
+// Whitelisted sort columns for paginated lists. Names sort case-insensitively; season statuses follow the lifecycle and team status sorts by its registration label.
+const lifecycle = (column: string) => sql`case ${sql.ref(column)} when 'draft' then 1 when 'active' then 2 when 'completed' then 3 end`;
+const seasonSortColumns = { name: sql`lower(s.name)`, league: sql`lower(l.name)`, status: lifecycle('s.status'), startDate: sql`s.start_date`, endDate: sql`s.end_date` };
+const teamSortColumns = { name: sql`lower(t.name)`, league: sql`lower(l.name)`, season: sql`lower(s.name)`, division: sql`lower(d.name)`, status: sql`case when st.id is null then 'Not registered' else 'Registered' end` };
+const sortDirection = (dir?: 'asc' | 'desc') => sql.raw(dir === 'desc' ? 'desc' : 'asc');
+
 type Database = Kysely<DB> | Transaction<DB>;
 const seasonDates = [sql<string | null>`start_date::text`.as('start_date'), sql<string | null>`end_date::text`.as('end_date')] as const;
 
@@ -299,7 +305,8 @@ export class LeagueService {
     if (search) query = query.where('s.name', 'ilike', `%${search.replace(/[\\%_]/g, '\\$&')}%`);
     const count = await query.clearSelect().select(({ fn }) => fn.countAll<string>().as('total')).executeTakeFirstOrThrow();
     const meta = paginationMeta(Number(count.total), filters.page ?? 1, filters.pageSize ?? 10);
-    const items = await query.orderBy('s.created_at', 'desc').orderBy('s.id', 'desc').limit(meta.pageSize).offset((meta.page - 1) * meta.pageSize).execute();
+    const sorted = filters.sortBy ? query.orderBy(sql`${seasonSortColumns[filters.sortBy]} ${sortDirection(filters.sortDir)} nulls last`) : query;
+    const items = await sorted.orderBy('s.created_at', 'desc').orderBy('s.id', 'desc').limit(meta.pageSize).offset((meta.page - 1) * meta.pageSize).execute();
     return { items, ...meta };
   }
   async seasons(user: string, league: string, filters: SeasonFilterDto = {}) {
@@ -393,7 +400,8 @@ export class LeagueService {
     if (filters.divisionId) { if (!filters.seasonId) throw new BadRequestException('A season is required when filtering by division'); await this.divisionForSeason(filters.seasonId, filters.divisionId); query = query.where('st.division_id', '=', filters.divisionId); }
     const search = filters.search?.trim();
     if (search) query = query.where('t.name', 'ilike', `%${search.replace(/[\\%_]/g, '\\$&')}%`);
-    const ordered = query.orderBy('t.name').orderBy('t.id').orderBy('s.name').orderBy('s.id');
+    const sorted = filters.sortBy ? query.orderBy(sql`${teamSortColumns[filters.sortBy]} ${sortDirection(filters.sortDir)} nulls last`) : query;
+    const ordered = sorted.orderBy('t.name').orderBy('t.id').orderBy('s.name').orderBy('s.id');
     if (!paginated) return ordered.execute();
     const count = await query.clearSelect().select(({ fn }) => fn.countAll<string>().as('total')).executeTakeFirstOrThrow();
     const meta = paginationMeta(Number(count.total), filters.page ?? 1, filters.pageSize ?? 10);
