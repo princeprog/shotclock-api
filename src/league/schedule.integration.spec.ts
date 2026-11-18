@@ -146,7 +146,7 @@ databaseTests('automatic scheduling against disposable PostgreSQL', () => {
     expect((await f.get(`${f.schedule}/status`).expect(200)).body.hasSchedule).toBe(false);
   });
 
-  it.each([false, true])('runs playoffs and requires the final and configured third-place game (third place: %s)', async (thirdPlace) => {
+  it.each([false, true])('schedules the whole playoff bracket and fills it from semifinal results (third place: %s)', async (thirdPlace) => {
     const f = await fixture();
     const input = { format: 'single', playoffs: true, thirdPlace, availability: f.availability };
     const preview = (await f.post(`${f.schedule}/preview`, input).expect(201)).body;
@@ -161,12 +161,29 @@ databaseTests('automatic scheduling against disposable PostgreSQL', () => {
     }
     await f.post(`/seasons/${f.season.id}/status`, { status: 'completed' }).expect(400);
     expect((await f.get(`${f.schedule}/status`).expect(200)).body.playoffStage).toBe('semifinal');
-    const semis: { games: PreviewGame[] } = (await f.post(`${f.playoffs}/preview`, { availability: f.availability }).expect(201)).body;
-    expect(semis.games.map((game) => game.scheduledAt).sort()).toEqual(['2025-02-02T10:00:00.000Z', '2025-02-02T11:00:00.000Z']);
-    const names = semis.games.map((game) => [rank.get(game.homeTeamId), rank.get(game.awayTeamId)].sort().join(':')).sort();
+    const bracket: { games: (PreviewGame & { homeName: string; awayName: string })[] } = (await f.post(`${f.playoffs}/preview`, { availability: f.availability }).expect(201)).body;
+    expect(bracket.games.map((game) => game.stage).sort()).toEqual(thirdPlace ? ['final', 'semifinal', 'semifinal', 'third_place'] : ['final', 'semifinal', 'semifinal']);
+    const semis = bracket.games.filter((game) => game.stage === 'semifinal');
+    expect(semis.map((game) => game.scheduledAt).sort()).toEqual(['2025-02-02T10:00:00.000Z', '2025-02-02T11:00:00.000Z']);
+    const names = semis.map((game) => [rank.get(game.homeTeamId), rank.get(game.awayTeamId)].sort().join(':')).sort();
     expect(names).toEqual(['Alpha:Delta', 'Bravo:Charlie']);
-    await f.post(f.playoffs, { availability: f.availability, games: semis.games }).expect(201);
+    // Later rounds wait for both semifinals and name the results they take.
+    for (const game of bracket.games.filter((item) => item.stage !== 'semifinal')) {
+      expect(Date.parse(game.scheduledAt)).toBeGreaterThanOrEqual(Date.parse('2025-02-02T12:00:00.000Z'));
+      expect(game.homeName).toMatch(game.stage === 'final' ? / winner$/ : / loser$/);
+    }
+    await f.post(f.playoffs, { availability: f.availability, games: semis }).expect(400);
+    await f.post(f.playoffs, { availability: f.availability, games: bracket.games }).expect(201);
     await f.post(`${f.playoffs}/preview`, { availability: f.availability }).expect(400);
+    expect((await f.get(`${f.schedule}/status`).expect(200)).body.playoffStage).toBeNull();
+    const waiting = (await f.games()).filter((game) => game.stage === 'final' || game.stage === 'third_place');
+    expect(waiting).toHaveLength(thirdPlace ? 2 : 1);
+    expect(waiting.every((game) => game.home_season_team_id === null && game.away_season_team_id === null)).toBe(true);
+    await f.score(waiting[0].id, 30, 20).expect(400);
+    const venueId = f.availability.venueIds[0];
+    const early = await f.patch(`/games/${waiting[0].id}`, { scheduledAt: '2025-02-02T09:00:00Z', venueId, durationMinutes: 60 }).expect(400);
+    expect(early.body.message).toMatch(/after the semifinal/);
+    await f.patch(`/games/${waiting[0].id}`, { scheduledAt: '2025-02-02T15:00:00Z', venueId, durationMinutes: 60 }).expect(200);
     const alphaBravo = preliminaries.find((game) => [rank.get(game.home_season_team_id), rank.get(game.away_season_team_id)].sort().join(':') === 'Alpha:Bravo')!;
     const alphaHome = rank.get(alphaBravo.home_season_team_id) === 'Alpha';
     await f.score(alphaBravo.id, alphaHome ? 0 : 9999, alphaHome ? 9999 : 0).expect(400);
@@ -175,28 +192,56 @@ databaseTests('automatic scheduling against disposable PostgreSQL', () => {
     expect(semifinalGames).toHaveLength(2);
     for (const game of semifinalGames) await f.score(game.id, 20, 10).expect(201);
     await f.post(`/seasons/${f.season.id}/status`, { status: 'completed' }).expect(400);
-    expect((await f.get(`${f.schedule}/status`).expect(200)).body.playoffStage).toBe('final');
-    const finals: { games: PreviewGame[] } = (await f.post(`${f.playoffs}/preview`, { availability: f.availability }).expect(201)).body;
-    expect(finals.games.map((game) => game.stage).sort()).toEqual(thirdPlace ? ['final', 'third_place'] : ['final']);
-    const final = finals.games.find((game) => game.stage === 'final')!;
-    expect(new Set([final.homeTeamId, final.awayTeamId])).toEqual(new Set(semifinalGames.map((game) => game.home_season_team_id)));
+    const filled = await f.games();
+    const final = filled.find((game) => game.stage === 'final')!;
+    expect(new Set([final.home_season_team_id, final.away_season_team_id])).toEqual(new Set(semifinalGames.map((game) => game.home_season_team_id)));
     if (thirdPlace) {
-      const third = finals.games.find((game) => game.stage === 'third_place')!;
-      expect(new Set([third.homeTeamId, third.awayTeamId])).toEqual(new Set(semifinalGames.map((game) => game.away_season_team_id)));
+      const third = filled.find((game) => game.stage === 'third_place')!;
+      expect(new Set([third.home_season_team_id, third.away_season_team_id])).toEqual(new Set(semifinalGames.map((game) => game.away_season_team_id)));
     }
-    await f.post(f.playoffs, { availability: f.availability, games: finals.games }).expect(201);
-    await f.score(semifinalGames[0].id, 10, 20).expect(400);
+    // A corrected semifinal moves the new winner into the waiting games until they are played.
+    await f.score(semifinalGames[0].id, 10, 20).expect(201);
+    const corrected = (await f.games()).find((game) => game.stage === 'final')!;
+    expect([corrected.home_season_team_id, corrected.away_season_team_id]).toContain(semifinalGames[0].away_season_team_id);
     await f.score(semifinalGames[0].id, 21, 10).expect(201);
     await f.del(`/games/${semifinalGames[0].id}`).expect(400);
     const finalGames = (await f.games()).filter((game) => game.stage === 'final' || game.stage === 'third_place');
     const finalGame = finalGames.find((game) => game.stage === 'final')!;
+    expect([finalGame.home_season_team_id, finalGame.away_season_team_id]).toContain(semifinalGames[0].home_season_team_id);
     await f.score(finalGame.id, 30, 20).expect(201);
+    await f.score(semifinalGames[0].id, 10, 21).expect(400);
     if (thirdPlace) {
       await f.post(`/seasons/${f.season.id}/status`, { status: 'completed' }).expect(400);
       await f.score(finalGames.find((game) => game.stage === 'third_place')!.id, 30, 20).expect(201);
     }
     await f.post(`/seasons/${f.season.id}/status`, { status: 'completed' }).expect(201);
     await f.del(`/games/${finalGame.id}`).expect(400);
+  });
+
+  it('schedules the championship for semifinals that were saved on their own', async () => {
+    const f = await fixture();
+    const input = { format: 'single', playoffs: true, thirdPlace: true, availability: f.availability };
+    const preview = (await f.post(`${f.schedule}/preview`, input).expect(201)).body;
+    await f.post(f.schedule, { ...input, games: preview.games }).expect(201);
+    await f.post(`/seasons/${f.season.id}/status`, { status: 'active' }).expect(201);
+    for (const game of await f.games()) await f.score(game.id, 10, 0).expect(201);
+    const bracket = (await f.post(`${f.playoffs}/preview`, { availability: f.availability }).expect(201)).body;
+    await f.post(f.playoffs, { availability: f.availability, games: bracket.games }).expect(201);
+    // Leave only the semifinals, as the earlier one-round flow did.
+    for (const game of (await f.games()).filter((item) => item.stage === 'final' || item.stage === 'third_place')) await f.del(`/games/${game.id}`).expect(200);
+    expect((await f.get(`${f.schedule}/status`).expect(200)).body.playoffStage).toBe('final');
+    const semifinals = (await f.games()).filter((game) => game.stage === 'semifinal');
+    const next: { games: (PreviewGame & { homeName: string })[] } = (await f.post(`${f.playoffs}/preview`, { availability: f.availability }).expect(201)).body;
+    expect(next.games.map((game) => game.stage).sort()).toEqual(['final', 'third_place']);
+    const semifinalEnd = Math.max(...semifinals.map((game) => Date.parse((game as StoredGame & { scheduled_at: string }).scheduled_at))) + 60 * 60000;
+    for (const game of next.games) {
+      expect(Date.parse(game.scheduledAt)).toBeGreaterThanOrEqual(semifinalEnd);
+      expect(semifinals.map((semifinal) => semifinal.id + ':' + (game.stage === 'final' ? 'winner' : 'loser'))).toContain(game.homeTeamId);
+    }
+    await f.post(f.playoffs, { availability: f.availability, games: next.games }).expect(201);
+    for (const game of semifinals) await f.score(game.id, 7, 9).expect(201);
+    const final = (await f.games()).find((game) => game.stage === 'final')!;
+    expect(new Set([final.home_season_team_id, final.away_season_team_id])).toEqual(new Set(semifinals.map((game) => game.away_season_team_id)));
   });
 
   it('protects generated participants and clears the schedule only after its last unplayed game is removed', async () => {

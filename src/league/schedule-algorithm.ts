@@ -21,6 +21,8 @@ export type ScheduleMatch = {
   round: number;
   stage: 'preliminary' | 'semifinal' | 'final' | 'third_place';
   groupId?: string;
+  // Stand-in teams this game also counts for, such as a semifinal's future winner and loser in a bracket.
+  aliases?: string[];
 };
 
 export type ScheduleGame = ScheduleMatch & {
@@ -33,6 +35,9 @@ export type ExistingGame = {
   id?: string;
   homeTeamId: string;
   awayTeamId: string;
+  aliases?: string[];
+  // Saved games that later rounds must follow, such as semifinals, carry a round below every draft round.
+  round?: number;
   scheduledAt: string;
   venueId: string | null;
   durationMinutes: number | null;
@@ -48,6 +53,8 @@ export type Interval = { start: number; end: number };
 type BusyGame = Interval & {
   homeTeamId: string;
   awayTeamId: string;
+  aliases?: string[];
+  round?: number;
   venueId: string | null;
   id?: string;
 };
@@ -375,6 +382,8 @@ function busyGames(
       homeTeamId: game.homeTeamId,
       awayTeamId: game.awayTeamId,
       venueId: game.venueId,
+      ...(game.aliases?.length ? { aliases: game.aliases } : {}),
+      ...(game.round !== undefined ? { round: game.round } : {}),
     };
   });
 }
@@ -427,8 +436,13 @@ function playIntervals(config: Config): PlayInterval[] {
   return intervals.map((interval) => ({ ...interval, dayNumber: config.dayOf(interval.date), day: days.get(interval.date)! }));
 }
 
-function involves(game: { homeTeamId: string; awayTeamId: string }, team: string): boolean {
-  return game.homeTeamId === team || game.awayTeamId === team;
+// The teams a game occupies for rest, round-order and daily-limit rules, including stand-ins.
+function teamsOf(game: { homeTeamId: string; awayTeamId: string; aliases?: string[] }): string[] {
+  return game.aliases?.length ? [game.homeTeamId, game.awayTeamId, ...game.aliases] : [game.homeTeamId, game.awayTeamId];
+}
+
+function involves(game: { homeTeamId: string; awayTeamId: string; aliases?: string[] }, team: string): boolean {
+  return teamsOf(game).includes(team);
 }
 
 // Tracks booked games and the per-team counts that the day, week and round rules read.
@@ -446,7 +460,7 @@ class PlacementState {
     this.busy.push(game);
     const { date, minutes } = localParts(this.config.formatter, game.start);
     const dayNumber = this.config.dayOf(date);
-    for (const team of [game.homeTeamId, game.awayTeamId]) {
+    for (const team of teamsOf(game)) {
       this.days.set(`${team}\u0000${date}`, (this.days.get(`${team}\u0000${date}`) ?? 0) + 1);
       this.playDays.set(team, [...(this.playDays.get(team) ?? []), dayNumber]);
       if (round === undefined) continue;
@@ -473,7 +487,7 @@ class PlacementState {
   bounds(match: ScheduleMatch): { earliest: number; latest: number } {
     let earliest = -Infinity;
     let latest = Infinity;
-    for (const team of [match.homeTeamId, match.awayTeamId]) {
+    for (const team of teamsOf(match)) {
       for (const game of this.rounds.get(team) ?? []) {
         if (game.round < match.round) earliest = Math.max(earliest, game.end);
         if (game.round > match.round) latest = Math.min(latest, game.start);
@@ -515,7 +529,7 @@ function conflictReasons(
   changeover: number,
 ): Conflict[] {
   const reasons: Conflict[] = [];
-  const sharedTeam = [candidate.homeTeamId, candidate.awayTeamId].find((team) => involves(previous, team));
+  const sharedTeam = teamsOf(candidate).find((team) => involves(previous, team));
   if (
     sharedTeam &&
     candidate.start < previous.end + rest &&
@@ -540,7 +554,7 @@ function findPlacement(
   state: PlacementState,
   options: PlacementOptions,
 ): BusyGame | undefined {
-  const teams = [match.homeTeamId, match.awayTeamId];
+  const teams = teamsOf(match);
   const teamBlocked = options.checkTeams
     ? state.busy.filter((item) => teams.some((team) => involves(item, team))).map((item) => ({ start: item.start - options.rest, end: item.end + options.rest }))
     : [];
@@ -658,7 +672,7 @@ function place(
     validateMatch(game);
     duration(game.durationMinutes, 'pinned durationMinutes', 1, 1440);
     const start = instant(game.scheduledAt);
-    return { game: { homeTeamId: game.homeTeamId, awayTeamId: game.awayTeamId, venueId: game.venueId, start, end: start + game.durationMinutes * MINUTE }, round: game.round };
+    return { game: { homeTeamId: game.homeTeamId, awayTeamId: game.awayTeamId, aliases: game.aliases, venueId: game.venueId, start, end: start + game.durationMinutes * MINUTE }, round: game.round };
   });
   if (!matches.length) return { games: [], unplaced: [] };
   if (
@@ -687,7 +701,7 @@ function attempt(
   fair: boolean,
 ): Placement {
   const state = new PlacementState(config);
-  for (const game of busy) state.add(game);
+  for (const game of busy) state.add(game, game.round);
   for (const { game, round } of fixed) state.add(game, round);
   const rest = availability.restMinutes * MINUTE;
   const ordered = matches
@@ -773,13 +787,13 @@ export function suggestSlots(
   const busy = busyGames(existing, availability);
   if ((busy.length + drafts.length) * availability.venueIds.length > MAX_COMPARISONS) throw new Error('Scheduling input exceeds work limit');
   const state = new PlacementState(config);
-  for (const game of busy) state.add(game);
+  for (const game of busy) state.add(game, game.round);
   for (const game of drafts) {
     validateMatch(game);
     const start = instant(game.scheduledAt);
-    state.add({ homeTeamId: game.homeTeamId, awayTeamId: game.awayTeamId, venueId: game.venueId, start, end: start + game.durationMinutes * MINUTE }, game.round);
+    state.add({ homeTeamId: game.homeTeamId, awayTeamId: game.awayTeamId, aliases: game.aliases, venueId: game.venueId, start, end: start + game.durationMinutes * MINUTE }, game.round);
   }
-  const teams = [match.homeTeamId, match.awayTeamId];
+  const teams = teamsOf(match);
   const rest = availability.restMinutes * MINUTE;
   const { earliest, latest } = state.bounds(match);
   const teamBlocked = state.busy.filter((item) => teams.some((team) => involves(item, team))).map((item) => ({ start: item.start - rest, end: item.end + rest }));
@@ -879,7 +893,7 @@ export function scheduleIssues(
       )
     )
       addIssue({ index, type: 'window', message: 'Game outside availability window' });
-    for (const team of [game.homeTeamId, game.awayTeamId]) {
+    for (const team of teamsOf(game)) {
       if (config.unavailable.get(team)?.has(candidate.date))
         addIssue({ index, type: 'unavailable', teamId: team, message: 'Team availability: a team is unavailable on this date. Choose another date.' });
     }
@@ -900,8 +914,8 @@ export function scheduleIssues(
     // A team's games, including existing ones, must be at least 7 local days apart.
     const byTeamDay = new Map<string, { day: number; index?: number }[]>();
     const note = (team: string, day: number, index?: number) => byTeamDay.set(team, [...(byTeamDay.get(team) ?? []), { day, index }]);
-    for (const { item, date } of existingDates) for (const team of [item.homeTeamId, item.awayTeamId]) note(team, config.dayOf(date));
-    for (const [index, item] of drafts.entries()) for (const team of [item.homeTeamId, item.awayTeamId]) note(team, config.dayOf(item.date), index);
+    for (const { item, date } of existingDates) for (const team of teamsOf(item)) note(team, config.dayOf(date));
+    for (const [index, item] of drafts.entries()) for (const team of teamsOf(item)) note(team, config.dayOf(item.date), index);
     for (const [team, entries] of byTeamDay) {
       entries.sort((a, b) => a.day - b.day);
       for (let first = 0; first < entries.length; first++) {
@@ -921,15 +935,15 @@ export function scheduleIssues(
         if (index !== undefined) entry.indexes.push(index);
         counts.set(key, entry);
       };
-      for (const { item, date } of existingDates) for (const team of [item.homeTeamId, item.awayTeamId]) count(team, date);
-      for (const [index, item] of drafts.entries()) for (const team of [item.homeTeamId, item.awayTeamId]) count(team, item.date, index);
+      for (const { item, date } of existingDates) for (const team of teamsOf(item)) count(team, date);
+      for (const [index, item] of drafts.entries()) for (const team of teamsOf(item)) count(team, item.date, index);
       for (const entry of counts.values()) {
         if (entry.total > rule.limit) for (const index of entry.indexes) addIssue({ index, type: rule.type, teamId: entry.team, message: rule.message });
       }
     }
   }
   const byTeam = new Map<string, number[]>();
-  for (const [index, item] of drafts.entries()) for (const team of [item.homeTeamId, item.awayTeamId]) byTeam.set(team, [...(byTeam.get(team) ?? []), index]);
+  for (const [index, item] of drafts.entries()) for (const team of teamsOf(item)) byTeam.set(team, [...(byTeam.get(team) ?? []), index]);
   for (const [team, indexes] of byTeam) {
     for (const first of indexes) {
       for (const second of indexes) {
@@ -943,6 +957,13 @@ export function scheduleIssues(
       }
     }
   }
+  // A draft game must also follow saved games of an earlier round, such as the semifinal it waits for.
+  for (const item of busy) {
+    if (item.round === undefined) continue;
+    for (const team of teamsOf(item)) for (const index of byTeam.get(team) ?? []) {
+      if (item.round < drafts[index].round && drafts[index].start < item.end)
+        addIssue({ index, type: 'round', teamId: team, message: 'Round sequence conflict: a later round starts before an earlier round ends', ...(item.id ? { with: { kind: 'existing' as const, id: item.id } } : {}) });
+    }
+  }
   return issues;
 }
-

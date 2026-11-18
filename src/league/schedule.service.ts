@@ -6,9 +6,11 @@ import type { DB } from '../database/db';
 import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffPreviewDto, SeasonPlayoffSaveDto, SeasonPlayoffSuggestDto, SeasonSchedulePreviewDto, SeasonScheduleSaveDto, SeasonScheduleSuggestDto } from './league.dto';
 import { estimateCourtCapacity, planSchedule, teamGameCapacity, roundRobin, scheduleIssues, scheduleMatches, SchedulePlacementError, suggestSlots, validateSchedule, type ExistingGame, type ScheduleAvailability, type ScheduleGame, type ScheduleMatch } from './schedule-algorithm';
 import { calculateStandings } from './standings';
+import { bracketSlot, labelPending, parseBracketSlot, parseSavedSlot, pendingLabel } from './bracket';
 
 type Database = Kysely<DB> | Transaction<DB>;
 type DivisionContext = Awaited<ReturnType<ScheduleService['context']>>;
+type Named = { id: string; name: string };
 
 @Injectable()
 export class ScheduleService {
@@ -53,13 +55,18 @@ export class ScheduleService {
   // Only games near the selected dates can conflict. The margin covers time-zone offsets, game length and the 7-day pacing rule.
   private async existing(db: Database, leagueId: string, availability?: ScheduleAvailability): Promise<ExistingGame[]> {
     let query = db.selectFrom('league.games as g').innerJoin('league.seasons as s', 's.id', 'g.season_id')
-      .select(['g.id', 'g.home_season_team_id', 'g.away_season_team_id', 'g.scheduled_at', 'g.venue_id', 'g.duration_minutes'])
+      .select(['g.id', 'g.stage', 'g.home_season_team_id', 'g.away_season_team_id', 'g.home_source_game_id', 'g.home_source_outcome',
+        'g.away_source_game_id', 'g.away_source_outcome', 'g.scheduled_at', 'g.venue_id', 'g.duration_minutes'])
       .where('s.league_id', '=', leagueId).where('g.scheduled_at', 'is not', null);
     const from = Date.parse(`${availability?.startDate}T00:00:00Z`) - 8 * 86400000;
     const to = Date.parse(`${availability?.endDate}T00:00:00Z`) + 9 * 86400000;
     if (Number.isFinite(from) && Number.isFinite(to)) query = query.where('g.scheduled_at', '>=', new Date(from)).where('g.scheduled_at', '<', new Date(to));
     const games = await query.execute();
-    return games.map((game) => ({ id: game.id, homeTeamId: game.home_season_team_id, awayTeamId: game.away_season_team_id,
+    // A side still waiting for a semifinal stands in as that semifinal's winner or loser, which the semifinal also counts for.
+    return games.map((game) => ({ id: game.id,
+      homeTeamId: game.home_season_team_id ?? game.home_source_game_id + ':' + game.home_source_outcome,
+      awayTeamId: game.away_season_team_id ?? game.away_source_game_id + ':' + game.away_source_outcome,
+      ...(game.stage === 'semifinal' ? { aliases: [game.id + ':winner', game.id + ':loser'], round: 0 } : {}),
       scheduledAt: new Date(game.scheduled_at!).toISOString(), venueId: game.venue_id, durationMinutes: game.duration_minutes }));
   }
 
@@ -79,9 +86,16 @@ export class ScheduleService {
     return outside ? ['Some games are outside the season dates.'] : [];
   }
 
-  private withNames(games: ScheduleGame[], teams: { id: string; name: string }[]) {
+  private withNames(games: ScheduleGame[], teams: Named[]) {
     const names = new Map(teams.map((team) => [team.id, team.name]));
     return games.map((game) => ({ ...game, homeName: names.get(game.homeTeamId) ?? '', awayName: names.get(game.awayTeamId) ?? '' }));
+  }
+
+  // Drafts come back from the browser without stand-ins, so semifinals get theirs again from the expected fixtures.
+  private withAliases<T extends ScheduleMatch>(games: T[], matches: ScheduleMatch[]): T[] {
+    const key = (match: ScheduleMatch) => [match.stage, match.round, match.homeTeamId, match.awayTeamId].join(':');
+    const aliases = new Map(matches.filter((match) => match.aliases?.length).map((match) => [key(match), match.aliases!]));
+    return games.map((game) => aliases.has(key(game)) ? { ...game, aliases: aliases.get(key(game)) } : game);
   }
 
   private sameMatches(expected: ScheduleMatch[], actual: ScheduleGame[]) {
@@ -103,7 +117,7 @@ export class ScheduleService {
     }
   }
 
-  private trySchedule<T>(fn: () => T, teams: { id: string; name: string }[] = []): T {
+  private trySchedule<T>(fn: () => T, teams: Named[] = []): T {
     try { return fn(); } catch (error) {
       if (error instanceof SchedulePlacementError) {
         const home = teams.find((team) => team.id === error.match.homeTeamId)?.name;
@@ -144,7 +158,7 @@ export class ScheduleService {
     let playoffStage: 'semifinal' | 'final' | null = null;
     if (schedule?.playoffs && prelim.length && prelim.every((game) => game.status === 'completed')) {
       if (!semifinals.length) playoffStage = 'semifinal';
-      else if (semifinals.length === 2 && semifinals.every((game) => game.status === 'completed') && !games.some((game) => game.stage === 'final' || game.stage === 'third_place')) playoffStage = 'final';
+      else if (semifinals.length === 2 && !games.some((game) => game.stage === 'final' || game.stage === 'third_place')) playoffStage = 'final';
     }
     return { hasSchedule: !!schedule, canGeneratePreliminary: context.status !== 'completed' && !schedule && !prelim.length,
       playoffStage: context.status === 'completed' ? null : playoffStage, playoffs: !!schedule?.playoffs, thirdPlace: !!schedule?.third_place };
@@ -189,14 +203,14 @@ export class ScheduleService {
       return { id: division.id, name: division.name, teamCount: teams.length, hasSchedule: !!schedule,
         canGeneratePreliminary: season.status !== 'completed' && !preliminaryReason,
         playoffs: !!schedule?.playoffs, thirdPlace: !!schedule?.third_place, playoffStage,
-        preliminaryReason, playoffReason: playoff ? undefined : playoffReason, context, teams, playoff };
+        preliminaryReason, playoffReason: playoff ? undefined : playoffReason, context, teams, labels: playoff?.labels ?? teams, playoff };
     }));
   }
 
   async seasonStatus(user: string, seasonId: string) {
     const season = await this.seasonContext(user, seasonId, this.db);
     const divisions = await this.seasonDivisions(this.db, season);
-    return { divisions: divisions.map(({ context: _context, playoff: _playoff, ...division }) => division) };
+    return { divisions: divisions.map(({ context: _context, playoff: _playoff, labels: _labels, ...division }) => division) };
   }
 
   private async seasonPlan(db: Database, season: Awaited<ReturnType<ScheduleService['seasonContext']>>, input: ScheduleAvailabilityRequestDto | SchedulePreviewDto, mode: 'preliminary' | 'playoffs', allowEmpty = false) {
@@ -223,7 +237,7 @@ export class ScheduleService {
     return { included, details, matches };
   }
 
-  private seasonPlacement(matches: (ScheduleMatch & { divisionId: string })[], availability: ScheduleAvailability, existing: ExistingGame[], divisions: { id: string; name: string; teams: { id: string; name: string }[] }[], mode: 'preliminary' | 'playoffs', pinned: (ScheduleGame & { divisionId: string })[] = []) {
+  private seasonPlacement(matches: (ScheduleMatch & { divisionId: string })[], availability: ScheduleAvailability, existing: ExistingGame[], divisions: { id: string; name: string; labels: Named[] }[], mode: 'preliminary' | 'playoffs', pinned: (ScheduleGame & { divisionId: string })[] = []) {
     // Pinned games keep their time and venue; they must be expected fixtures, each used once.
     const key = (match: ScheduleMatch & { divisionId: string }) => [match.divisionId, match.stage, match.round, match.homeTeamId, match.awayTeamId].join(':');
     const pool = new Map<string, (ScheduleGame & { divisionId: string })[]>();
@@ -238,17 +252,19 @@ export class ScheduleService {
       if (game) kept.set(index, game); else open.push(index);
     });
     if ([...pool.values()].some((games) => games.length)) throw new BadRequestException('The schedule has changed; generate a new preview');
-    // Playoff divisions can be at different stages, so they do not share round order.
-    const round = (item: { round: number }) => mode === 'playoffs' ? 1 : item.round;
+    // Playoff divisions can be at different stages, so each one's rounds count from its own first round.
+    const firstRound = new Map<string, number>();
+    for (const match of matches) firstRound.set(match.divisionId, Math.min(firstRound.get(match.divisionId) ?? match.round, match.round));
+    const round = (item: { round: number; divisionId: string }) => mode === 'playoffs' ? item.round - (firstRound.get(item.divisionId) ?? 1) + 1 : item.round;
     const toPlace = open.map((index) => matches[index]);
-    const fixed = [...kept.values()].map((game) => ({ homeTeamId: game.homeTeamId, awayTeamId: game.awayTeamId, stage: game.stage,
-      scheduledAt: game.scheduledAt, venueId: game.venueId, durationMinutes: game.durationMinutes, round: round(game) }));
+    const fixed = [...kept.entries()].map(([index, game]) => ({ homeTeamId: game.homeTeamId, awayTeamId: game.awayTeamId, stage: game.stage, aliases: matches[index].aliases,
+      scheduledAt: game.scheduledAt, venueId: game.venueId, durationMinutes: game.durationMinutes, round: round(matches[index]) }));
     const plan = this.trySchedule(() => planSchedule(toPlace.map((match) => ({ ...match, round: round(match) })), availability, existing, fixed));
     const unplaced = plan.unplaced.map(({ index, reason, code }) => {
       const match = toPlace[index];
       const division = divisions.find((item) => item.id === match.divisionId);
-      const home = division?.teams.find((team) => team.id === match.homeTeamId)?.name;
-      const away = division?.teams.find((team) => team.id === match.awayTeamId)?.name;
+      const home = division?.labels.find((team) => team.id === match.homeTeamId)?.name;
+      const away = division?.labels.find((team) => team.id === match.awayTeamId)?.name;
       return { divisionId: match.divisionId, divisionName: division?.name ?? '', homeTeamId: match.homeTeamId, awayTeamId: match.awayTeamId,
         homeName: home ?? '', awayName: away ?? '', round: match.round, stage: match.stage, reason, reasonCode: code, message: new SchedulePlacementError(match, plan.games.length, matches.length, reason).withTeamNames(home, away) };
     });
@@ -268,7 +284,7 @@ export class ScheduleService {
     const plan = await this.seasonPlan(this.db, season, input, mode);
     const existing = await this.existing(this.db, season.leagueId, input.availability);
     const { games, unplaced } = this.seasonPlacement(plan.matches, input.availability, existing, plan.included, mode, input.pinned ?? []);
-    const names = new Map(plan.included.flatMap((division) => division.teams.map((team) => [team.id, team.name] as const)));
+    const names = new Map(plan.included.flatMap((division) => division.labels.map((team) => [team.id, team.name] as const)));
     const divisionNames = new Map(plan.included.map((division) => [division.id, division.name]));
     return { games: games.map((game) => ({ ...game, homeName: names.get(game.homeTeamId), awayName: names.get(game.awayTeamId), divisionName: divisionNames.get(game.divisionId) })),
       unplaced, warnings: this.warnings(games, plan.included[0].context, input.availability.timeZone), divisions: plan.details };
@@ -283,7 +299,7 @@ export class ScheduleService {
     // The most games any one team plays in the division, compared with what pacing and daily limits allow.
     const gamesPerTeam = (divisionId: string) => {
       const counts = new Map<string, number>();
-      for (const match of plan.matches) if (match.divisionId === divisionId) for (const team of [match.homeTeamId, match.awayTeamId]) counts.set(team, (counts.get(team) ?? 0) + 1);
+      for (const match of plan.matches) if (match.divisionId === divisionId) for (const team of [match.homeTeamId, match.awayTeamId, ...(match.aliases ?? [])]) counts.set(team, (counts.get(team) ?? 0) + 1);
       return Math.max(0, ...counts.values());
     };
     return { capacity, required: plan.matches.length, ...teamCapacity, divisions: plan.details.map((division) => ({ ...division, gameCount: plan.matches.filter((match) => match.divisionId === division.id).length, gamesPerTeam: gamesPerTeam(division.id) })) };
@@ -298,7 +314,7 @@ export class ScheduleService {
     for (const division of plan.included) this.partOfMatches(plan.matches.filter((match) => match.divisionId === division.id), input.games.filter((game) => game.divisionId === division.id));
     if (input.games.some((game) => !expectedIds.includes(game.divisionId))) throw new BadRequestException('The schedule has changed; generate a new preview');
     const existing = await this.existing(this.db, season.leagueId, input.availability);
-    const issues = this.trySchedule(() => scheduleIssues(mode === 'playoffs' ? input.games.map((game) => ({ ...game, round: 1 })) : input.games, input.availability, existing));
+    const issues = this.trySchedule(() => scheduleIssues(this.withAliases(input.games, plan.matches), input.availability, existing));
     const ids = [...new Set(issues.flatMap((issue) => issue.with?.kind === 'existing' ? [issue.with.id] : []))];
     return { issues, existingGames: await this.existingDetails(season.leagueId, ids) };
   }
@@ -308,13 +324,14 @@ export class ScheduleService {
     if (!ids.length) return [];
     const games = await this.db.selectFrom('league.games as g').innerJoin('league.seasons as s', 's.id', 'g.season_id')
       .innerJoin('league.divisions as d', 'd.id', 'g.division_id')
-      .innerJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').innerJoin('league.teams as ht', 'ht.id', 'h.team_id')
-      .innerJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').innerJoin('league.teams as at', 'at.id', 'a.team_id')
+      .leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id')
+      .leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id')
       .leftJoin('league.venues as v', 'v.id', 'g.venue_id')
-      .select(['g.id', 'g.scheduled_at', 'g.duration_minutes', 'g.venue_id', 'v.name as venueName', 'ht.name as homeName', 'at.name as awayName', 'd.name as divisionName'])
-      .where('s.league_id', '=', leagueId).where('g.id', 'in', ids).execute();
+      .select(['g.id', 'g.scheduled_at', 'g.duration_minutes', 'g.venue_id', 'v.name as venueName', 'ht.name as home_name', 'at.name as away_name', 'd.name as divisionName',
+        'g.home_source_game_id', 'g.home_source_outcome', 'g.away_source_game_id', 'g.away_source_outcome'])
+      .where('s.league_id', '=', leagueId).where('g.id', 'in', ids).execute().then((rows) => labelPending(this.db, rows));
     return games.map((game) => ({ id: game.id, scheduledAt: new Date(game.scheduled_at!).toISOString(), durationMinutes: game.duration_minutes,
-      venueId: game.venue_id, venueName: game.venueName, homeName: game.homeName, awayName: game.awayName, divisionName: game.divisionName }));
+      venueId: game.venue_id, venueName: game.venueName, homeName: game.home_name, awayName: game.away_name, divisionName: game.divisionName }));
   }
 
   async suggestSeason(user: string, seasonId: string, input: SeasonScheduleSuggestDto | SeasonPlayoffSuggestDto, mode: 'preliminary' | 'playoffs') {
@@ -332,11 +349,9 @@ export class ScheduleService {
     if (all.some((item) => !expectedIds.includes(item.divisionId))) throw new BadRequestException('The schedule has changed; generate a new preview');
     for (const division of plan.included) this.partOfMatches(plan.matches.filter((match) => match.divisionId === division.id), all.filter((item) => item.divisionId === division.id));
     const existing = await this.existing(this.db, season.leagueId, input.availability);
-    // Playoff divisions can be at different stages, so they do not share round order.
-    const round = (item: { round: number }) => mode === 'playoffs' ? 1 : item.round;
-    const match: ScheduleMatch = { homeTeamId: target.homeTeamId, awayTeamId: target.awayTeamId, round: round(target), stage: target.stage };
+    const [match] = this.withAliases<ScheduleMatch>([{ homeTeamId: target.homeTeamId, awayTeamId: target.awayTeamId, round: target.round, stage: target.stage }], plan.matches);
     const current = index !== undefined ? { at: Date.parse(input.games[index].scheduledAt), venueId: input.games[index].venueId } : undefined;
-    const slots = this.trySchedule(() => suggestSlots(match, others.map((item) => ({ ...item, round: round(item) })), input.availability, existing, 4));
+    const slots = this.trySchedule(() => suggestSlots(match, this.withAliases(others, plan.matches), input.availability, existing, 4));
     // The game's own slot is not a suggestion.
     return { suggestions: slots.filter((slot) => !current || Date.parse(slot.scheduledAt) !== current.at || slot.venueId !== current.venueId).slice(0, 3) };
   }
@@ -350,13 +365,14 @@ export class ScheduleService {
     if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || end.getTime() - start.getTime() > 371 * 86400000 || end <= start) throw new BadRequestException('Invalid date range');
     const games = await this.db.selectFrom('league.games as g').innerJoin('league.seasons as s', 's.id', 'g.season_id')
       .innerJoin('league.divisions as d', 'd.id', 'g.division_id')
-      .innerJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').innerJoin('league.teams as ht', 'ht.id', 'h.team_id')
-      .innerJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').innerJoin('league.teams as at', 'at.id', 'a.team_id')
-      .select(['g.id', 'g.scheduled_at', 'g.duration_minutes', 'g.venue_id', 'ht.name as homeName', 'at.name as awayName', 'd.name as divisionName'])
+      .leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id')
+      .leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id')
+      .select(['g.id', 'g.scheduled_at', 'g.duration_minutes', 'g.venue_id', 'ht.name as home_name', 'at.name as away_name', 'd.name as divisionName',
+        'g.home_source_game_id', 'g.home_source_outcome', 'g.away_source_game_id', 'g.away_source_outcome'])
       .where('s.league_id', '=', season.leagueId).where('g.venue_id', 'in', input.availability.venueIds)
-      .where('g.scheduled_at', '>=', start).where('g.scheduled_at', '<', end).limit(10001).execute();
+      .where('g.scheduled_at', '>=', start).where('g.scheduled_at', '<', end).limit(10001).execute().then((rows) => labelPending(this.db, rows));
     if (games.length > 10000) throw new BadRequestException('Too many existing games to display. Shorten the date range.');
-    return { games: games.map((game) => ({ id: game.id, scheduledAt: new Date(game.scheduled_at!).toISOString(), durationMinutes: game.duration_minutes ?? input.availability.durationMinutes, venueId: game.venue_id, homeName: game.homeName, awayName: game.awayName, divisionName: game.divisionName })) };
+    return { games: games.map((game) => ({ id: game.id, scheduledAt: new Date(game.scheduled_at!).toISOString(), durationMinutes: game.duration_minutes ?? input.availability.durationMinutes, venueId: game.venue_id, homeName: game.home_name, awayName: game.away_name, divisionName: game.divisionName })) };
   }
 
   async saveSeason(user: string, seasonId: string, input: SeasonScheduleSaveDto | SeasonPlayoffSaveDto, mode: 'preliminary' | 'playoffs') {
@@ -370,7 +386,7 @@ export class ScheduleService {
       for (const division of plan.included) this.sameMatches(plan.matches.filter((match) => match.divisionId === division.id), input.games.filter((game) => game.divisionId === division.id));
       if (input.games.some((game) => !expectedIds.includes(game.divisionId))) throw new BadRequestException('The schedule has changed; generate a new preview');
       const existing = await this.existing(tx, season.leagueId, input.availability);
-      this.trySchedule(() => validateSchedule(mode === 'playoffs' ? input.games.map((game) => ({ ...game, round: 1 })) : input.games, input.availability, existing));
+      this.trySchedule(() => validateSchedule(this.withAliases(input.games, plan.matches), input.availability, existing));
       for (const division of plan.included) {
         let scheduleId = division.playoff?.schedule.id;
         if (mode === 'preliminary') {
@@ -381,7 +397,7 @@ export class ScheduleService {
           scheduleId = schedule.id;
         }
         if (!scheduleId) throw new BadRequestException('The playoff schedule changed; generate a new preview');
-        await this.insert(tx, division.context, scheduleId, input.games.filter((game) => game.divisionId === division.id));
+        await this.insert(tx, division.context, scheduleId, input.games.filter((game) => game.divisionId === division.id), division.playoff?.matches ?? []);
       }
       return { saved: input.games.length };
     });
@@ -405,7 +421,7 @@ export class ScheduleService {
       this.trySchedule(() => validateSchedule(input.games, input.availability, existing));
       const schedule = await tx.insertInto('league.division_schedules').values({ division_id: divisionId, format: input.format,
         playoffs: input.playoffs, third_place: input.thirdPlace, team_ids: teams.map((team) => team.id) }).returning('id').executeTakeFirstOrThrow();
-      await this.insert(tx, context, schedule.id, input.games);
+      await this.insert(tx, context, schedule.id, input.games, []);
       return { saved: input.games.length };
     });
   }
@@ -422,35 +438,51 @@ export class ScheduleService {
     const preliminary = games.filter((game) => game.stage === 'preliminary');
     const expected = roundRobin(schedule.team_ids, schedule.format as 'single' | 'double');
     const generated = preliminary.filter((game) => game.schedule_id === schedule.id);
-    this.sameMatches(expected, generated.map((game) => ({ homeTeamId: game.home_season_team_id, awayTeamId: game.away_season_team_id,
+    this.sameMatches(expected, generated.map((game) => ({ homeTeamId: game.home_season_team_id!, awayTeamId: game.away_season_team_id!,
       round: game.round ?? 0, stage: 'preliminary', scheduledAt: '', venueId: '', durationMinutes: 1 })));
     if (preliminary.some((game) => game.status !== 'completed')) throw new BadRequestException('Complete all preliminary games before generating playoffs');
     const semifinals = games.filter((game) => game.stage === 'semifinal');
+    if (games.some((game) => game.stage === 'final' || game.stage === 'third_place')) throw new BadRequestException('Playoff games are already scheduled.');
     let matches: ScheduleMatch[];
+    let labels: Named[] = teams;
     if (!semifinals.length) {
-      const standings = calculateStandings(teams, preliminary.map((game) => ({ homeId: game.home_season_team_id, awayId: game.away_season_team_id, homeScore: game.home_score!, awayScore: game.away_score! })));
-      matches = [ { homeTeamId: standings[0].id, awayTeamId: standings[3].id, round: 1, stage: 'semifinal' },
-        { homeTeamId: standings[1].id, awayTeamId: standings[2].id, round: 1, stage: 'semifinal' } ];
+      // The whole bracket at once: semifinals in round 1, then the championship and third-place game for their winners and losers.
+      const standings = calculateStandings(teams, preliminary.map((game) => ({ homeId: game.home_season_team_id!, awayId: game.away_season_team_id!, homeScore: game.home_score!, awayScore: game.away_score! })));
+      const pairs = [[standings[0], standings[3]], [standings[1], standings[2]]] as const;
+      const slot = (semifinal: 1 | 2, outcome: 'winner' | 'loser') => bracketSlot(context.divisionId, semifinal, outcome);
+      matches = pairs.map(([home, away], index) => ({ homeTeamId: home.id, awayTeamId: away.id, round: 1, stage: 'semifinal' as const,
+        aliases: [slot(index ? 2 : 1, 'winner'), slot(index ? 2 : 1, 'loser')] }));
+      matches.push({ homeTeamId: slot(1, 'winner'), awayTeamId: slot(2, 'winner'), round: 2, stage: 'final' });
+      if (schedule.third_place) matches.push({ homeTeamId: slot(1, 'loser'), awayTeamId: slot(2, 'loser'), round: 2, stage: 'third_place' });
+      const name = (id: string) => teams.find((team) => team.id === id)?.name ?? '';
+      labels = [...teams, ...pairs.flatMap(([home, away], index) => (['winner', 'loser'] as const).map((outcome) => ({
+        id: slot(index ? 2 : 1, outcome), name: pendingLabel(outcome, name(home.id), name(away.id)) })))];
     } else {
-      if (semifinals.length !== 2 || semifinals.some((game) => game.status !== 'completed')) throw new BadRequestException('Complete both semifinals before generating the final');
-      if (games.some((game) => game.stage === 'final' || game.stage === 'third_place')) throw new BadRequestException('Remove existing final-round games before generating them again');
+      // Semifinals saved on their own: the later games take each result now if it is in, or when it is recorded.
+      if (semifinals.length !== 2) throw new BadRequestException('Playoffs need exactly two semifinals');
       semifinals.sort((a, b) => a.id.localeCompare(b.id));
-      const winner = (game: typeof semifinals[number]) => game.home_score! > game.away_score! ? game.home_season_team_id : game.away_season_team_id;
-      const loser = (game: typeof semifinals[number]) => game.home_score! > game.away_score! ? game.away_season_team_id : game.home_season_team_id;
-      matches = [{ homeTeamId: winner(semifinals[0]), awayTeamId: winner(semifinals[1]), round: 2, stage: 'final' }];
-      if (schedule.third_place) matches.push({ homeTeamId: loser(semifinals[0]), awayTeamId: loser(semifinals[1]), round: 2, stage: 'third_place' });
+      const side = (game: typeof semifinals[number], outcome: 'winner' | 'loser') => {
+        if (game.status !== 'completed') return game.id + ':' + outcome;
+        const homeWon = game.home_score! > game.away_score!;
+        return (homeWon === (outcome === 'winner') ? game.home_season_team_id : game.away_season_team_id)!;
+      };
+      matches = [{ homeTeamId: side(semifinals[0], 'winner'), awayTeamId: side(semifinals[1], 'winner'), round: 2, stage: 'final' }];
+      if (schedule.third_place) matches.push({ homeTeamId: side(semifinals[0], 'loser'), awayTeamId: side(semifinals[1], 'loser'), round: 2, stage: 'third_place' });
+      const name = (id: string | null) => teams.find((team) => team.id === id)?.name ?? '';
+      labels = [...teams, ...semifinals.filter((game) => game.status !== 'completed').flatMap((game) => (['winner', 'loser'] as const).map((outcome) => ({
+        id: game.id + ':' + outcome, name: pendingLabel(outcome, name(game.home_season_team_id), name(game.away_season_team_id)) })))];
     }
-    return { teams, matches, schedule };
+    return { teams, labels, matches, schedule };
   }
 
   async previewPlayoffs(user: string, divisionId: string, input: ScheduleAvailabilityRequestDto) {
     const context = await this.context(user, divisionId, this.db);
-    const { teams, matches } = await this.playoffMatches(this.db, context);
+    const { teams, labels, matches } = await this.playoffMatches(this.db, context);
     await this.validateVenues(this.db, context.leagueId, input.availability);
     this.checkTeamAvailability(input.availability, teams.map((team) => team.id));
     const existing = await this.existing(this.db, context.leagueId, input.availability);
-    const games = this.trySchedule(() => scheduleMatches(matches, input.availability, existing), teams);
-    return { games: this.withNames(games, teams), warnings: this.warnings(games, context, input.availability.timeZone) };
+    const games = this.trySchedule(() => scheduleMatches(matches, input.availability, existing), labels).map(({ aliases: _aliases, ...game }) => game);
+    return { games: this.withNames(games, labels), warnings: this.warnings(games, context, input.availability.timeZone) };
   }
 
   async savePlayoffs(user: string, divisionId: string, input: PlayoffSaveDto) {
@@ -462,16 +494,47 @@ export class ScheduleService {
       this.checkTeamAvailability(input.availability, teams.map((team) => team.id));
       this.sameMatches(matches, input.games);
       const existing = await this.existing(tx, context.leagueId, input.availability);
-      this.trySchedule(() => validateSchedule(input.games, input.availability, existing));
-      await this.insert(tx, context, schedule.id, input.games);
+      this.trySchedule(() => validateSchedule(this.withAliases(input.games, matches), input.availability, existing));
+      await this.insert(tx, context, schedule.id, input.games, matches);
       return { saved: input.games.length };
     });
   }
 
-  private async insert(tx: Transaction<DB>, context: DivisionContext, scheduleId: string, games: ScheduleGame[]) {
-    await tx.insertInto('league.games').values(games.map((game) => ({ season_id: context.seasonId, division_id: context.divisionId,
-      home_season_team_id: game.homeTeamId, away_season_team_id: game.awayTeamId, scheduled_at: new Date(game.scheduledAt),
-      venue_id: game.venueId, duration_minutes: game.durationMinutes, stage: game.stage, round: game.round, schedule_id: scheduleId }))).execute();
+  // Games whose sides wait for a semifinal are saved after it, pointing at it until its result fills in the team.
+  private async insert(tx: Transaction<DB>, context: DivisionContext, scheduleId: string, games: ScheduleGame[], matches: ScheduleMatch[]) {
+    const isSlot = (id: string) => !!parseBracketSlot(id) || !!parseSavedSlot(id);
+    const pending = (game: ScheduleGame) => isSlot(game.homeTeamId) || isSlot(game.awayTeamId);
+    const row = (game: ScheduleGame) => ({ season_id: context.seasonId, division_id: context.divisionId, scheduled_at: new Date(game.scheduledAt),
+      venue_id: game.venueId, duration_minutes: game.durationMinutes, stage: game.stage, round: game.round, schedule_id: scheduleId });
+    const known = games.filter((game) => !pending(game));
+    const saved = known.length ? await tx.insertInto('league.games').values(known.map((game) => ({ ...row(game),
+      home_season_team_id: game.homeTeamId, away_season_team_id: game.awayTeamId }))).returning(['id', 'stage', 'home_season_team_id', 'away_season_team_id']).execute() : [];
+    const later = games.filter(pending);
+    if (!later.length) return;
+    const savedSemifinals = new Set((await tx.selectFrom('league.games').select('id').where('division_id', '=', context.divisionId).where('stage', '=', 'semifinal').execute()).map((game) => game.id));
+    const semifinalId = (number: 1 | 2) => {
+      const match = matches.find((item) => item.stage === 'semifinal' && item.aliases?.some((alias) => parseBracketSlot(alias)?.semifinal === number));
+      const game = match && saved.find((item) => item.stage === 'semifinal' && item.home_season_team_id === match.homeTeamId && item.away_season_team_id === match.awayTeamId);
+      if (!game) throw new BadRequestException('Schedule both semifinals with the rest of the bracket');
+      return game.id;
+    };
+    const side = (id: string) => {
+      const existing = parseSavedSlot(id);
+      if (existing) {
+        if (!savedSemifinals.has(existing.gameId)) throw new BadRequestException('The schedule has changed; generate a new preview');
+        return { team: null, source: existing.gameId, outcome: existing.outcome };
+      }
+      const slot = parseBracketSlot(id);
+      if (!slot) return { team: id, source: null, outcome: null };
+      if (slot.divisionId !== context.divisionId) throw new BadRequestException('The schedule has changed; generate a new preview');
+      return { team: null, source: semifinalId(slot.semifinal), outcome: slot.outcome };
+    };
+    await tx.insertInto('league.games').values(later.map((game) => {
+      const home = side(game.homeTeamId);
+      const away = side(game.awayTeamId);
+      return { ...row(game), home_season_team_id: home.team, away_season_team_id: away.team, home_source_game_id: home.source,
+        home_source_outcome: home.outcome, away_source_game_id: away.source, away_source_outcome: away.outcome };
+    })).execute();
   }
 
   async remove(user: string, gameId: string) {

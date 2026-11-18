@@ -115,7 +115,7 @@ databaseTests('season-wide scheduling against disposable PostgreSQL', () => {
     expect((await f.get(`/seasons/${f.season.id}/games?scope=season`).expect(200)).body.total).toBe(1);
   });
 
-  it('schedules all ready playoff divisions even when their stages differ', async () => {
+  it('schedules a whole playoff bracket in every ready division and fills it from results', async () => {
     const f = await fixture(); const base = `/seasons/${f.season.id}/schedule`;
     const openTeams = (await f.get(`/seasons/${f.season.id}/teams?divisionId=${f.open.id}`).expect(200)).body;
     await f.post(`/seasons/${f.season.id}/teams`, { teamId: openTeams[0].team_id, divisionId: f.small.id }).expect(201);
@@ -124,23 +124,25 @@ databaseTests('season-wide scheduling against disposable PostgreSQL', () => {
     await f.post(`/seasons/${f.season.id}/status`, { status: 'active' }).expect(201);
     const games = (await f.get(`/seasons/${f.season.id}/games?scope=season&pageSize=100`).expect(200)).body.items;
     for (const game of games.filter((item: { division_id: string }) => item.division_id !== f.occupied.id)) await f.post(`/games/${game.id}/score`, { homeScore: 20, awayScore: 10 }).expect(201);
-    const previousPlayoffs = `/divisions/${f.open.id}/playoffs`;
-    const semifinal = (await f.post(`${previousPlayoffs}/preview`, { availability: f.input.availability }).expect(201)).body;
-    await f.post(previousPlayoffs, { availability: f.input.availability, games: semifinal.games }).expect(201);
-    const openGames = (await f.get(`/seasons/${f.season.id}/games?divisionId=${f.open.id}&pageSize=100`).expect(200)).body.items;
-    for (const game of openGames.filter((item: { stage: string }) => item.stage === 'semifinal')) await f.post(`/games/${game.id}/score`, { homeScore: 20, awayScore: 10 }).expect(201);
     const playoffs = `/seasons/${f.season.id}/playoffs`;
     const playoffEstimate = (await f.post(`${playoffs}/estimate`, { availability: f.input.availability }).expect(201)).body;
-    expect(playoffEstimate.required).toBe(4);
+    expect(playoffEstimate.required).toBe(8);
     const next = (await f.post(`${playoffs}/preview`, { availability: f.input.availability }).expect(201)).body;
-    expect(next.games).toHaveLength(4);
-    expect(next.games.filter((game: PreviewGame) => game.divisionId === f.small.id).map((game: PreviewGame) => game.stage)).toEqual(['semifinal', 'semifinal']);
-    expect(next.games.filter((game: PreviewGame) => game.divisionId === f.open.id).map((game: PreviewGame) => game.stage).sort()).toEqual(['final', 'third_place']);
+    expect(next.games).toHaveLength(8);
+    for (const division of [f.open, f.small]) expect(next.games.filter((game: PreviewGame) => game.divisionId === division.id).map((game: PreviewGame) => game.stage).sort()).toEqual(['final', 'semifinal', 'semifinal', 'third_place']);
     const payload = { availability: f.input.availability, divisionIds: [f.open.id, f.small.id], games: next.games };
     expect((await f.post(`${playoffs}/validate`, payload).expect(201)).body.issues).toEqual([]);
     await f.post(playoffs, payload).expect(201);
     const after = (await f.get(`/seasons/${f.season.id}/games?scope=season&pageSize=100`).expect(200)).body.items;
-    expect(after.filter((game: { stage: string }) => game.stage === 'final')).toHaveLength(1);
-    expect(after.filter((game: { stage: string }) => game.stage === 'third_place')).toHaveLength(1);
+    const waiting = after.filter((game: { stage: string }) => game.stage === 'final' || game.stage === 'third_place');
+    expect(waiting).toHaveLength(4);
+    expect(waiting.every((game: { home_season_team_id: string | null; home_name: string }) => game.home_season_team_id === null && / (winner|loser)$/.test(game.home_name))).toBe(true);
+    const status = (await f.get(`/seasons/${f.season.id}/schedule/status`).expect(200)).body;
+    expect(status.divisions.find((division: { id: string }) => division.id === f.open.id)).toMatchObject({ playoffStage: null, playoffReason: 'Playoff games are already scheduled.' });
+    const semifinals = after.filter((game: { stage: string; division_id: string }) => game.stage === 'semifinal' && game.division_id === f.small.id);
+    for (const game of semifinals) await f.post(`/games/${game.id}/score`, { homeScore: 20, awayScore: 10 }).expect(201);
+    const filled = (await f.get(`/seasons/${f.season.id}/games?divisionId=${f.small.id}&pageSize=100`).expect(200)).body.items;
+    const final = filled.find((game: { stage: string }) => game.stage === 'final');
+    expect(new Set([final.home_season_team_id, final.away_season_team_id])).toEqual(new Set(semifinals.map((game: { home_season_team_id: string }) => game.home_season_team_id)));
   });
 });

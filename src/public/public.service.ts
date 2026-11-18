@@ -2,6 +2,7 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { sql } from 'kysely';
 import { DatabaseService } from '../database/database.service';
 import { calculateStandings } from '../league/standings';
+import { labelPending } from '../league/bracket';
 import { statLeaders, teamForm, teamStats, winPct, type ResultGame, type StatTeam } from './team-stats';
 
 // Read-only data for the public website. Only published leagues in unarchived organizations, and their
@@ -15,8 +16,9 @@ type DivisionRow = { id: string; name: string; min_age: number | null; max_age: 
 type GameRow = {
   id: string; scheduled_at: Date | null; status: string; stage: string; round: number | null; duration_minutes: number | null;
   home_score: number | null; away_score: number | null; forfeited_by_season_team_id: string | null;
-  home_id: string; home_team_id: string; home_name: string; home_abbreviation: string | null;
-  away_id: string; away_team_id: string; away_name: string; away_abbreviation: string | null;
+  // A playoff side waiting for a semifinal has no team yet; its name says which result it takes.
+  home_id: string | null; home_team_id: string | null; home_name: string; home_abbreviation: string | null;
+  away_id: string | null; away_team_id: string | null; away_name: string; away_abbreviation: string | null;
   venue_name: string | null; venue_address: string | null;
 };
 
@@ -48,7 +50,7 @@ function gameView(row: GameRow) {
 }
 
 function resultGame(row: GameRow): ResultGame {
-  return { id: row.id, homeId: row.home_id, awayId: row.away_id, homeScore: row.home_score!, awayScore: row.away_score!, forfeit: row.forfeited_by_season_team_id !== null, playedAt: row.scheduled_at ? new Date(row.scheduled_at).getTime() : 0 };
+  return { id: row.id, homeId: row.home_id!, awayId: row.away_id!, homeScore: row.home_score!, awayScore: row.away_score!, forfeit: row.forfeited_by_season_team_id !== null, playedAt: row.scheduled_at ? new Date(row.scheduled_at).getTime() : 0 };
 }
 
 @Injectable()
@@ -106,14 +108,14 @@ export class PublicService {
 
   // Scheduled games in the next seven days across all published leagues.
   async upcoming(limit = 8) {
-    const rows = await this.gameQuery()
+    const rows = await labelPending(this.db, await this.gameQuery()
       .innerJoin('league.seasons as s', 's.id', 'g.season_id').innerJoin('league.leagues as l', 'l.id', 's.league_id')
       .innerJoin('league.organizations as o', 'o.id', 'l.organization_id').innerJoin('league.divisions as d', 'd.id', 'g.division_id')
       .select(['l.slug as league_slug', 'l.name as league_name', 'l.time_zone', 's.slug as season_slug', 'd.id as division_id', 'd.name as division_name'])
       .where('l.published_at', 'is not', null).where('l.slug', 'is not', null).where('l.archived_at', 'is', null).where('o.archived_at', 'is', null)
       .where('s.status', 'in', PUBLIC_SEASON_STATUSES).where('s.archived_at', 'is', null)
       .where('g.status', '=', 'scheduled').where('g.scheduled_at', '>=', sql<Date>`now()`).where('g.scheduled_at', '<', sql<Date>`now() + interval '7 days'`)
-      .orderBy('g.scheduled_at').orderBy('g.id').limit(limit).execute();
+      .orderBy('g.scheduled_at').orderBy('g.id').limit(limit).execute());
     return rows.map((row) => ({ ...gameView(row), league: { slug: row.league_slug!, name: row.league_name, timeZone: row.time_zone }, season: { slug: row.season_slug }, division: { id: row.division_id, name: row.division_name } }));
   }
 
@@ -152,10 +154,11 @@ export class PublicService {
 
   private gameQuery() {
     return this.db.selectFrom('league.games as g')
-      .innerJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').innerJoin('league.teams as ht', 'ht.id', 'h.team_id')
-      .innerJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').innerJoin('league.teams as at', 'at.id', 'a.team_id')
+      .leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id')
+      .leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id')
       .leftJoin('league.venues as v', 'v.id', 'g.venue_id')
       .select(['g.id', 'g.scheduled_at', 'g.status', 'g.stage', 'g.round', 'g.duration_minutes', 'g.home_score', 'g.away_score', 'g.forfeited_by_season_team_id',
+        'g.home_source_game_id', 'g.home_source_outcome', 'g.away_source_game_id', 'g.away_source_outcome',
         'h.id as home_id', 'ht.id as home_team_id', 'ht.name as home_name', 'ht.abbreviation as home_abbreviation',
         'a.id as away_id', 'at.id as away_team_id', 'at.name as away_name', 'at.abbreviation as away_abbreviation',
         'v.name as venue_name', 'v.address as venue_address']);
@@ -163,7 +166,7 @@ export class PublicService {
 
   private divisionGames(seasonId: string, divisionId: string): Promise<GameRow[]> {
     return this.gameQuery().where('g.season_id', '=', seasonId).where('g.division_id', '=', divisionId)
-      .orderBy(sql`g.scheduled_at asc nulls last`).orderBy('g.id').execute();
+      .orderBy(sql`g.scheduled_at asc nulls last`).orderBy('g.id').execute().then((rows) => labelPending(this.db, rows));
   }
 
   private divisionTeams(seasonId: string, divisionId: string): Promise<StatTeam[]> {

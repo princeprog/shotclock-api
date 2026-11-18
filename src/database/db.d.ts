@@ -96,13 +96,17 @@ export interface LeagueDivisionSchedules {
 
 export interface LeagueGames {
   away_score: number | null;
-  away_season_team_id: string;
+  away_season_team_id: string | null;
+  away_source_game_id: string | null;
+  away_source_outcome: string | null;
   created_at: Generated<Timestamp>;
   division_id: string;
   duration_minutes: number | null;
   forfeited_by_season_team_id: string | null;
   home_score: number | null;
-  home_season_team_id: string;
+  home_season_team_id: string | null;
+  home_source_game_id: string | null;
+  home_source_outcome: string | null;
   id: Generated<string>;
   round: number | null;
   schedule_id: string | null;
