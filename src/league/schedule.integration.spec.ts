@@ -218,6 +218,38 @@ databaseTests('automatic scheduling against disposable PostgreSQL', () => {
     await f.del(`/games/${finalGame.id}`).expect(400);
   });
 
+  it('decides playoffs and the third-place game when they are scheduled, not with the round robin', async () => {
+    const f = await fixture();
+    const input = { format: 'single', availability: f.availability };
+    const preview = (await f.post(`${f.schedule}/preview`, input).expect(201)).body;
+    await f.post(f.schedule, { ...input, games: preview.games }).expect(201);
+    await f.post(`/seasons/${f.season.id}/status`, { status: 'active' }).expect(201);
+    for (const game of await f.games()) await f.score(game.id, 10, 0).expect(201);
+    expect((await f.get(`${f.schedule}/status`).expect(200)).body).toMatchObject({ playoffStage: 'semifinal', playoffs: false });
+    const withThird = (await f.post(`${f.playoffs}/preview`, { availability: f.availability, thirdPlace: true }).expect(201)).body;
+    expect(withThird.games).toHaveLength(4);
+    const bracket = (await f.post(`${f.playoffs}/preview`, { availability: f.availability, thirdPlace: false }).expect(201)).body;
+    expect(bracket.games.map((game: PreviewGame) => game.stage).sort()).toEqual(['final', 'semifinal', 'semifinal']);
+    await f.post(f.playoffs, { availability: f.availability, thirdPlace: false, games: withThird.games }).expect(400);
+    await f.post(f.playoffs, { availability: f.availability, thirdPlace: false, games: bracket.games }).expect(201);
+    expect((await f.get(`${f.schedule}/status`).expect(200)).body).toMatchObject({ playoffStage: null, playoffs: true, thirdPlace: false });
+    // A saved bracket must be finished before the season can complete.
+    await f.post(`/seasons/${f.season.id}/status`, { status: 'completed' }).expect(400);
+    for (const game of (await f.games()).filter((item) => item.stage === 'semifinal')) await f.score(game.id, 20, 10).expect(201);
+    await f.score((await f.games()).find((item) => item.stage === 'final')!.id, 30, 20).expect(201);
+    await f.post(`/seasons/${f.season.id}/status`, { status: 'completed' }).expect(201);
+  });
+
+  it('lets a season without playoffs finish after its round robin', async () => {
+    const f = await fixture();
+    const input = { format: 'single', availability: f.availability };
+    const preview = (await f.post(`${f.schedule}/preview`, input).expect(201)).body;
+    await f.post(f.schedule, { ...input, games: preview.games }).expect(201);
+    await f.post(`/seasons/${f.season.id}/status`, { status: 'active' }).expect(201);
+    for (const game of await f.games()) await f.score(game.id, 10, 0).expect(201);
+    await f.post(`/seasons/${f.season.id}/status`, { status: 'completed' }).expect(201);
+  });
+
   it('schedules the championship for semifinals that were saved on their own', async () => {
     const f = await fixture();
     const input = { format: 'single', playoffs: true, thirdPlace: true, availability: f.availability };

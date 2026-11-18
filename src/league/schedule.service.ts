@@ -3,7 +3,7 @@ import { sql, type Kysely, type Transaction } from 'kysely';
 import { DatabaseService } from '../database/database.service';
 import { ensureNotArchived } from '../common/request-scope';
 import type { DB } from '../database/db';
-import { PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffPreviewDto, SeasonPlayoffSaveDto, SeasonPlayoffSuggestDto, SeasonSchedulePreviewDto, SeasonScheduleSaveDto, SeasonScheduleSuggestDto } from './league.dto';
+import { PlayoffOptionsDto, PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffPreviewDto, SeasonPlayoffSaveDto, SeasonPlayoffSuggestDto, SeasonSchedulePreviewDto, SeasonScheduleSaveDto, SeasonScheduleSuggestDto } from './league.dto';
 import { estimateCourtCapacity, planSchedule, teamGameCapacity, roundRobin, scheduleIssues, scheduleMatches, SchedulePlacementError, suggestSlots, validateSchedule, type ExistingGame, type ScheduleAvailability, type ScheduleGame, type ScheduleMatch } from './schedule-algorithm';
 import { calculateStandings } from './standings';
 import { bracketSlot, labelPending, parseBracketSlot, parseSavedSlot, pendingLabel } from './bracket';
@@ -149,14 +149,15 @@ export class ScheduleService {
 
   async status(user: string, divisionId: string) {
     const context = await this.context(user, divisionId, this.db);
-    const [schedule, games] = await Promise.all([
+    const [schedule, games, teams] = await Promise.all([
       this.db.selectFrom('league.division_schedules').selectAll().where('division_id', '=', divisionId).executeTakeFirst(),
       this.db.selectFrom('league.games').select(['stage', 'status']).where('division_id', '=', divisionId).execute(),
+      this.teams(this.db, divisionId),
     ]);
     const prelim = games.filter((game) => game.stage === 'preliminary');
     const semifinals = games.filter((game) => game.stage === 'semifinal');
     let playoffStage: 'semifinal' | 'final' | null = null;
-    if (schedule?.playoffs && prelim.length && prelim.every((game) => game.status === 'completed')) {
+    if (schedule && teams.length >= 4 && prelim.length && prelim.every((game) => game.status === 'completed')) {
       if (!semifinals.length) playoffStage = 'semifinal';
       else if (semifinals.length === 2 && !games.some((game) => game.stage === 'final' || game.stage === 'third_place')) playoffStage = 'final';
     }
@@ -177,7 +178,7 @@ export class ScheduleService {
     return season;
   }
 
-  private async seasonDivisions(db: Database, season: Awaited<ReturnType<ScheduleService['seasonContext']>>) {
+  private async seasonDivisions(db: Database, season: Awaited<ReturnType<ScheduleService['seasonContext']>>, thirdPlace?: boolean) {
     const divisions = await db.selectFrom('league.divisions').select(['id', 'name']).where('season_id', '=', season.seasonId).orderBy('name').orderBy('id').execute();
     return Promise.all(divisions.map(async (division) => {
       const context = { ...season, divisionId: division.id };
@@ -187,9 +188,9 @@ export class ScheduleService {
         db.selectFrom('league.games').select(['stage', 'status']).where('division_id', '=', division.id).execute(),
       ]);
       let playoff: Awaited<ReturnType<ScheduleService['playoffMatches']>> | null = null;
-      let playoffReason = !schedule?.playoffs ? 'Playoffs are not enabled.' : 'Complete the previous round before scheduling playoffs.';
-      if (schedule?.playoffs && season.status !== 'completed') {
-        try { playoff = await this.playoffMatches(db, context); }
+      let playoffReason = !schedule ? 'Generate the round robin first.' : 'Complete the previous round before scheduling playoffs.';
+      if (schedule && season.status !== 'completed') {
+        try { playoff = await this.playoffMatches(db, context, thirdPlace); }
         catch (error) {
           if (!(error instanceof BadRequestException)) throw error;
           playoffReason = error.message;
@@ -213,11 +214,11 @@ export class ScheduleService {
     return { divisions: divisions.map(({ context: _context, playoff: _playoff, labels: _labels, ...division }) => division) };
   }
 
-  private async seasonPlan(db: Database, season: Awaited<ReturnType<ScheduleService['seasonContext']>>, input: ScheduleAvailabilityRequestDto | SchedulePreviewDto, mode: 'preliminary' | 'playoffs', allowEmpty = false) {
+  private async seasonPlan(db: Database, season: Awaited<ReturnType<ScheduleService['seasonContext']>>, input: PlayoffOptionsDto | SchedulePreviewDto, mode: 'preliminary' | 'playoffs', allowEmpty = false) {
     if (season.status === 'completed') throw new BadRequestException('Completed seasons cannot be changed');
-    if (mode === 'preliminary' && 'thirdPlace' in input && input.thirdPlace && !input.playoffs) throw new BadRequestException('A third-place game requires playoffs');
+    if (mode === 'preliminary' && 'format' in input && input.thirdPlace && !input.playoffs) throw new BadRequestException('A third-place game requires playoffs');
     await this.validateVenues(db, season.leagueId, input.availability);
-    const divisions = await this.seasonDivisions(db, season);
+    const divisions = await this.seasonDivisions(db, season, mode === 'playoffs' ? input.thirdPlace : undefined);
     this.checkTeamAvailability(input.availability, divisions.flatMap((division) => division.teams.map((team) => team.id)));
     const included = divisions.filter((division) => mode === 'preliminary' ? division.canGeneratePreliminary : !!division.playoff);
     const details = divisions.map((division) => {
@@ -290,7 +291,7 @@ export class ScheduleService {
       unplaced, warnings: this.warnings(games, plan.included[0].context, input.availability.timeZone), divisions: plan.details };
   }
 
-  async estimateSeason(user: string, seasonId: string, input: ScheduleAvailabilityRequestDto | SchedulePreviewDto, mode: 'preliminary' | 'playoffs') {
+  async estimateSeason(user: string, seasonId: string, input: PlayoffOptionsDto | SchedulePreviewDto, mode: 'preliminary' | 'playoffs') {
     const season = await this.seasonContext(user, seasonId, this.db);
     const plan = await this.seasonPlan(this.db, season, input, mode, true);
     const existing = await this.existing(this.db, season.leagueId, input.availability);
@@ -391,13 +392,14 @@ export class ScheduleService {
         let scheduleId = division.playoff?.schedule.id;
         if (mode === 'preliminary') {
           const settings = input as SeasonScheduleSaveDto;
-          const playoffs = settings.playoffs && division.teamCount >= 4;
+          const playoffs = !!settings.playoffs && division.teamCount >= 4;
           const schedule = await tx.insertInto('league.division_schedules').values({ division_id: division.id, format: settings.format, playoffs,
-            third_place: playoffs && settings.thirdPlace, team_ids: division.teams.map((team) => team.id) }).returning('id').executeTakeFirstOrThrow();
+            third_place: playoffs && !!settings.thirdPlace, team_ids: division.teams.map((team) => team.id) }).returning('id').executeTakeFirstOrThrow();
           scheduleId = schedule.id;
         }
         if (!scheduleId) throw new BadRequestException('The playoff schedule changed; generate a new preview');
         await this.insert(tx, division.context, scheduleId, input.games.filter((game) => game.divisionId === division.id), division.playoff?.matches ?? []);
+        if (mode === 'playoffs') await this.recordPlayoffs(tx, scheduleId, division.playoff!.thirdPlace);
       }
       return { saved: input.games.length };
     });
@@ -420,20 +422,23 @@ export class ScheduleService {
       const existing = await this.existing(tx, context.leagueId, input.availability);
       this.trySchedule(() => validateSchedule(input.games, input.availability, existing));
       const schedule = await tx.insertInto('league.division_schedules').values({ division_id: divisionId, format: input.format,
-        playoffs: input.playoffs, third_place: input.thirdPlace, team_ids: teams.map((team) => team.id) }).returning('id').executeTakeFirstOrThrow();
+        playoffs: !!input.playoffs, third_place: !!input.thirdPlace, team_ids: teams.map((team) => team.id) }).returning('id').executeTakeFirstOrThrow();
       await this.insert(tx, context, schedule.id, input.games, []);
       return { saved: input.games.length };
     });
   }
 
-  private async playoffMatches(db: Database, context: DivisionContext) {
+  // Any division with a finished round robin and at least four teams can schedule playoffs; the third-place choice is made here.
+  private async playoffMatches(db: Database, context: DivisionContext, thirdPlaceChoice?: boolean) {
     this.editable(context);
     const [schedule, teams, games] = await Promise.all([
       db.selectFrom('league.division_schedules').selectAll().where('division_id', '=', context.divisionId).executeTakeFirst(),
       this.teams(db, context.divisionId),
       db.selectFrom('league.games').selectAll().where('division_id', '=', context.divisionId).execute(),
     ]);
-    if (!schedule?.playoffs) throw new BadRequestException('Playoffs were not enabled for this schedule');
+    if (!schedule) throw new BadRequestException('Generate the round robin before scheduling playoffs');
+    if (teams.length < 4) throw new BadRequestException('Playoffs need at least four teams');
+    const thirdPlace = thirdPlaceChoice ?? schedule.third_place;
     if (teams.length !== schedule.team_ids.length || teams.some((team) => !schedule.team_ids.includes(team.id))) throw new BadRequestException('Division teams changed since the schedule was generated');
     const preliminary = games.filter((game) => game.stage === 'preliminary');
     const expected = roundRobin(schedule.team_ids, schedule.format as 'single' | 'double');
@@ -453,7 +458,7 @@ export class ScheduleService {
       matches = pairs.map(([home, away], index) => ({ homeTeamId: home.id, awayTeamId: away.id, round: 1, stage: 'semifinal' as const,
         aliases: [slot(index ? 2 : 1, 'winner'), slot(index ? 2 : 1, 'loser')] }));
       matches.push({ homeTeamId: slot(1, 'winner'), awayTeamId: slot(2, 'winner'), round: 2, stage: 'final' });
-      if (schedule.third_place) matches.push({ homeTeamId: slot(1, 'loser'), awayTeamId: slot(2, 'loser'), round: 2, stage: 'third_place' });
+      if (thirdPlace) matches.push({ homeTeamId: slot(1, 'loser'), awayTeamId: slot(2, 'loser'), round: 2, stage: 'third_place' });
       const name = (id: string) => teams.find((team) => team.id === id)?.name ?? '';
       labels = [...teams, ...pairs.flatMap(([home, away], index) => (['winner', 'loser'] as const).map((outcome) => ({
         id: slot(index ? 2 : 1, outcome), name: pendingLabel(outcome, name(home.id), name(away.id)) })))];
@@ -467,17 +472,22 @@ export class ScheduleService {
         return (homeWon === (outcome === 'winner') ? game.home_season_team_id : game.away_season_team_id)!;
       };
       matches = [{ homeTeamId: side(semifinals[0], 'winner'), awayTeamId: side(semifinals[1], 'winner'), round: 2, stage: 'final' }];
-      if (schedule.third_place) matches.push({ homeTeamId: side(semifinals[0], 'loser'), awayTeamId: side(semifinals[1], 'loser'), round: 2, stage: 'third_place' });
+      if (thirdPlace) matches.push({ homeTeamId: side(semifinals[0], 'loser'), awayTeamId: side(semifinals[1], 'loser'), round: 2, stage: 'third_place' });
       const name = (id: string | null) => teams.find((team) => team.id === id)?.name ?? '';
       labels = [...teams, ...semifinals.filter((game) => game.status !== 'completed').flatMap((game) => (['winner', 'loser'] as const).map((outcome) => ({
         id: game.id + ':' + outcome, name: pendingLabel(outcome, name(game.home_season_team_id), name(game.away_season_team_id)) })))];
     }
-    return { teams, labels, matches, schedule };
+    return { teams, labels, matches, schedule, thirdPlace };
   }
 
-  async previewPlayoffs(user: string, divisionId: string, input: ScheduleAvailabilityRequestDto) {
+  // Once a bracket is saved the season requires its championship, and the third-place game if chosen.
+  private async recordPlayoffs(tx: Transaction<DB>, scheduleId: string, thirdPlace: boolean) {
+    await tx.updateTable('league.division_schedules').set({ playoffs: true, third_place: thirdPlace }).where('id', '=', scheduleId).execute();
+  }
+
+  async previewPlayoffs(user: string, divisionId: string, input: PlayoffOptionsDto) {
     const context = await this.context(user, divisionId, this.db);
-    const { teams, labels, matches } = await this.playoffMatches(this.db, context);
+    const { teams, labels, matches } = await this.playoffMatches(this.db, context, input.thirdPlace);
     await this.validateVenues(this.db, context.leagueId, input.availability);
     this.checkTeamAvailability(input.availability, teams.map((team) => team.id));
     const existing = await this.existing(this.db, context.leagueId, input.availability);
@@ -489,13 +499,14 @@ export class ScheduleService {
     return this.db.transaction().execute(async (tx) => {
       const context = await this.context(user, divisionId, tx, true);
       await this.leagueLock(tx, context.leagueId);
-      const { teams, matches, schedule } = await this.playoffMatches(tx, context);
+      const { teams, matches, schedule, thirdPlace } = await this.playoffMatches(tx, context, input.thirdPlace);
       await this.validateVenues(tx, context.leagueId, input.availability);
       this.checkTeamAvailability(input.availability, teams.map((team) => team.id));
       this.sameMatches(matches, input.games);
       const existing = await this.existing(tx, context.leagueId, input.availability);
       this.trySchedule(() => validateSchedule(this.withAliases(input.games, matches), input.availability, existing));
       await this.insert(tx, context, schedule.id, input.games, matches);
+      await this.recordPlayoffs(tx, schedule.id, thirdPlace);
       return { saved: input.games.length };
     });
   }
