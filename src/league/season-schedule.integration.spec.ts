@@ -34,6 +34,7 @@ databaseTests('season-wide scheduling against disposable PostgreSQL', () => {
     const owner = await login();
     const post = (url: string, body: object = {}, auth = owner) => request(app.getHttpServer()).post(`/league${url}`).set('Authorization', auth).send(body);
     const get = (url: string, auth = owner) => request(app.getHttpServer()).get(`/league${url}`).set('Authorization', auth);
+    const patch = (url: string, body: object) => request(app.getHttpServer()).patch(`/league${url}`).set('Authorization', owner).send(body);
     const org = (await post('/organizations', { name: 'Season schedule' }).expect(201)).body;
     const league = (await post(`/organizations/${org.id}/leagues`, { name: 'League' }).expect(201)).body;
     const season = (await post(`/leagues/${league.id}/seasons`, { name: 'Season' }).expect(201)).body;
@@ -49,7 +50,7 @@ databaseTests('season-wide scheduling against disposable PostgreSQL', () => {
     await post(`/seasons/${season.id}/games`, { homeTeamId: oldTeams[0].id, awayTeamId: oldTeams[1].id, venueId: venue.id, scheduledAt: '2026-11-10T08:00:00Z', durationMinutes: 60 }).expect(201);
     const availability = { startDate: '2026-11-10', endDate: '2026-11-12', windows: [{ weekdays: [0, 1, 2, 3, 4, 5, 6], startTime: '08:00', endTime: '20:00' }], timeZone: 'UTC', venueIds: [venue.id], durationMinutes: 60, restMinutes: 0 };
     const input = { format: 'single', playoffs: true, thirdPlace: true, availability };
-    return { post, get, org, league, season, open, small, empty, occupied, venue, input };
+    return { post, get, patch, org, league, season, open, small, empty, occupied, venue, input };
   }
 
   it('previews shared rounds, skips existing and empty divisions, and saves atomically', async () => {
@@ -124,14 +125,35 @@ databaseTests('season-wide scheduling against disposable PostgreSQL', () => {
     await f.post(`/seasons/${f.season.id}/status`, { status: 'active' }).expect(201);
     const games = (await f.get(`/seasons/${f.season.id}/games?scope=season&pageSize=100`).expect(200)).body.items;
     for (const game of games.filter((item: { division_id: string }) => item.division_id !== f.occupied.id)) await f.post(`/games/${game.id}/score`, { homeScore: 20, awayScore: 10 }).expect(201);
+    const lateGame = games.find((item: { division_id: string }) => item.division_id === f.occupied.id);
+    const lastPreliminaryGameAt = '2026-11-14T16:30:00.000Z'; // November 15 in Manila.
+    const lateGameSettings = { homeTeamId: lateGame.home_season_team_id, awayTeamId: lateGame.away_season_team_id, venueId: f.venue.id };
+    await f.patch(`/leagues/${f.league.id}`, { name: f.league.name, timeZone: 'Asia/Manila' }).expect(200);
+    await f.patch(`/games/${lateGame.id}`, { ...lateGameSettings, scheduledAt: lastPreliminaryGameAt }).expect(200);
+    expect((await f.get(`${base}/status`).expect(200)).body.lastPreliminaryGameAt).toBe(lastPreliminaryGameAt);
     const playoffs = `/seasons/${f.season.id}/playoffs`;
-    const playoffEstimate = (await f.post(`${playoffs}/estimate`, { availability: f.input.availability }).expect(201)).body;
+    const availability = { ...f.input.availability, startDate: '2026-11-16', endDate: '2026-11-18', timeZone: 'Asia/Manila' };
+    const overlapping = { ...availability, startDate: '2026-11-15' };
+    const wrongZone = await f.post(`${playoffs}/preview`, { availability: { ...overlapping, timeZone: 'UTC' } }).expect(400);
+    expect(wrongZone.body.message).toMatch(/league time zone/);
+    const playoffEstimate = (await f.post(`${playoffs}/estimate`, { availability }).expect(201)).body;
     expect(playoffEstimate.required).toBe(8);
-    const next = (await f.post(`${playoffs}/preview`, { availability: f.input.availability }).expect(201)).body;
+    const next = (await f.post(`${playoffs}/preview`, { availability }).expect(201)).body;
     expect(next.games).toHaveLength(8);
     for (const division of [f.open, f.small]) expect(next.games.filter((game: PreviewGame) => game.divisionId === division.id).map((game: PreviewGame) => game.stage).sort()).toEqual(['final', 'semifinal', 'semifinal', 'third_place']);
-    const payload = { availability: f.input.availability, divisionIds: [f.open.id, f.small.id], games: next.games };
+    const payload = { availability, divisionIds: [f.open.id, f.small.id], games: next.games };
+    for (const action of ['estimate', 'preview', 'validate', 'suggest', ''] as const) {
+      const body = action === 'estimate' || action === 'preview' ? { availability: overlapping }
+        : { ...payload, availability: overlapping, ...(action === 'suggest' ? { target: { index: 0 } } : {}) };
+      const result = await f.post(action ? `${playoffs}/${action}` : playoffs, body).expect(400);
+      expect(result.body.message).toMatch(/after the last elimination game.*2026-11-15/);
+    }
+    await f.post(`${playoffs}/estimate`, { availability: { ...availability, endDate: '2026-11-15' } }).expect(400);
     expect((await f.post(`${playoffs}/validate`, payload).expect(201)).body.issues).toEqual([]);
+    await f.patch(`/games/${lateGame.id}`, { ...lateGameSettings, scheduledAt: '2026-11-15T16:30:00.000Z' }).expect(200);
+    const stale = await f.post(playoffs, payload).expect(400);
+    expect(stale.body.message).toMatch(/after the last elimination game.*2026-11-16/);
+    await f.patch(`/games/${lateGame.id}`, { ...lateGameSettings, scheduledAt: lastPreliminaryGameAt }).expect(200);
     await f.post(playoffs, payload).expect(201);
     const after = (await f.get(`/seasons/${f.season.id}/games?scope=season&pageSize=100`).expect(200)).body.items;
     const waiting = after.filter((game: { stage: string }) => game.stage === 'final' || game.stage === 'third_place');

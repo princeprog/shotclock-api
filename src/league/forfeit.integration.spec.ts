@@ -172,10 +172,11 @@ databaseTests('game forfeits against disposable PostgreSQL', () => {
         await f.score(game.id, homeWins ? 10 : 0, homeWins ? 0 : 10).expect(201);
       }
     }
-    const bracket = (await f.post(`${playoffs}/preview`, { availability }).expect(201)).body;
+    const playoffAvailability = { ...availability, startDate: '2025-02-02' };
+    const bracket = (await f.post(`${playoffs}/preview`, { availability: playoffAvailability }).expect(201)).body;
     expect(bracket.games.filter((game: { stage: string }) => game.stage === 'semifinal').map((game: { homeTeamId: string; awayTeamId: string }) => [names.get(game.homeTeamId), names.get(game.awayTeamId)].sort().join(':')).sort())
       .toEqual(['Alpha:Delta', 'Bravo:Charlie']);
-    await f.post(playoffs, { availability, games: bracket.games }).expect(201);
+    await f.post(playoffs, { availability: playoffAvailability, games: bracket.games }).expect(201);
     await f.forfeit(target.id, alpha).expect(400);
     const alphaHome = target.home_season_team_id === alpha;
     await f.score(target.id, alphaHome ? 0 : 99, alphaHome ? 99 : 0).expect(400);

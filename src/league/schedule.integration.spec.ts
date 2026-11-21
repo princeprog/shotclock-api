@@ -64,11 +64,12 @@ databaseTests('automatic scheduling against disposable PostgreSQL', () => {
         { weekdays: [6], startTime: '08:00', endTime: '14:00' },
         { weekdays: [0], startTime: '10:00', endTime: '16:00' },
       ], timeZone: 'UTC', venueIds: [venue.id], durationMinutes: 60, restMinutes: 0 };
+    const playoffAvailability = { ...availability, startDate: '2025-02-02' };
     const schedule = `/divisions/${division.id}/schedule`;
     const playoffs = `/divisions/${division.id}/playoffs`;
     const games = async (): Promise<StoredGame[]> => (await get(`/seasons/${season.id}/games?divisionId=${division.id}`).expect(200)).body;
     const score = (id: string, homeScore: number, awayScore: number) => post(`/games/${id}/score`, { homeScore, awayScore });
-    return { owner, post, get, patch, del, league, season, division, teams, availability, schedule, playoffs, games, score };
+    return { owner, post, get, patch, del, league, season, division, teams, availability, playoffAvailability, schedule, playoffs, games, score };
   }
 
   it('isolates schedule status, previews, saves and removal by owner', async () => {
@@ -151,7 +152,7 @@ databaseTests('automatic scheduling against disposable PostgreSQL', () => {
     const input = { format: 'single', playoffs: true, thirdPlace, availability: f.availability };
     const preview = (await f.post(`${f.schedule}/preview`, input).expect(201)).body;
     await f.post(f.schedule, { ...input, games: preview.games }).expect(201);
-    await f.post(`${f.playoffs}/preview`, { availability: f.availability }).expect(400);
+    await f.post(`${f.playoffs}/preview`, { availability: f.playoffAvailability }).expect(400);
     await f.post(`/seasons/${f.season.id}/status`, { status: 'active' }).expect(201);
     const rank = new Map(f.teams.map((team) => [team.id, team.name]));
     const preliminaries = await f.games();
@@ -161,7 +162,9 @@ databaseTests('automatic scheduling against disposable PostgreSQL', () => {
     }
     await f.post(`/seasons/${f.season.id}/status`, { status: 'completed' }).expect(400);
     expect((await f.get(`${f.schedule}/status`).expect(200)).body.playoffStage).toBe('semifinal');
-    const bracket: { games: (PreviewGame & { homeName: string; awayName: string })[] } = (await f.post(`${f.playoffs}/preview`, { availability: f.availability }).expect(201)).body;
+    const overlapping = await f.post(`${f.playoffs}/preview`, { availability: f.availability }).expect(400);
+    expect(overlapping.body.message).toMatch(/after the last elimination game.*2025-02-01/);
+    const bracket: { games: (PreviewGame & { homeName: string; awayName: string })[] } = (await f.post(`${f.playoffs}/preview`, { availability: f.playoffAvailability }).expect(201)).body;
     expect(bracket.games.map((game) => game.stage).sort()).toEqual(thirdPlace ? ['final', 'semifinal', 'semifinal', 'third_place'] : ['final', 'semifinal', 'semifinal']);
     const semis = bracket.games.filter((game) => game.stage === 'semifinal');
     expect(semis.map((game) => game.scheduledAt).sort()).toEqual(['2025-02-02T10:00:00.000Z', '2025-02-02T11:00:00.000Z']);
@@ -172,9 +175,10 @@ databaseTests('automatic scheduling against disposable PostgreSQL', () => {
       expect(Date.parse(game.scheduledAt)).toBeGreaterThanOrEqual(Date.parse('2025-02-02T12:00:00.000Z'));
       expect(game.homeName).toMatch(game.stage === 'final' ? / winner$/ : / loser$/);
     }
-    await f.post(f.playoffs, { availability: f.availability, games: semis }).expect(400);
-    await f.post(f.playoffs, { availability: f.availability, games: bracket.games }).expect(201);
-    await f.post(`${f.playoffs}/preview`, { availability: f.availability }).expect(400);
+    await f.post(f.playoffs, { availability: f.availability, games: bracket.games }).expect(400);
+    await f.post(f.playoffs, { availability: f.playoffAvailability, games: semis }).expect(400);
+    await f.post(f.playoffs, { availability: f.playoffAvailability, games: bracket.games }).expect(201);
+    await f.post(`${f.playoffs}/preview`, { availability: f.playoffAvailability }).expect(400);
     expect((await f.get(`${f.schedule}/status`).expect(200)).body.playoffStage).toBeNull();
     const waiting = (await f.games()).filter((game) => game.stage === 'final' || game.stage === 'third_place');
     expect(waiting).toHaveLength(thirdPlace ? 2 : 1);
@@ -226,12 +230,12 @@ databaseTests('automatic scheduling against disposable PostgreSQL', () => {
     await f.post(`/seasons/${f.season.id}/status`, { status: 'active' }).expect(201);
     for (const game of await f.games()) await f.score(game.id, 10, 0).expect(201);
     expect((await f.get(`${f.schedule}/status`).expect(200)).body).toMatchObject({ playoffStage: 'semifinal', playoffs: false });
-    const withThird = (await f.post(`${f.playoffs}/preview`, { availability: f.availability, thirdPlace: true }).expect(201)).body;
+    const withThird = (await f.post(`${f.playoffs}/preview`, { availability: f.playoffAvailability, thirdPlace: true }).expect(201)).body;
     expect(withThird.games).toHaveLength(4);
-    const bracket = (await f.post(`${f.playoffs}/preview`, { availability: f.availability, thirdPlace: false }).expect(201)).body;
+    const bracket = (await f.post(`${f.playoffs}/preview`, { availability: f.playoffAvailability, thirdPlace: false }).expect(201)).body;
     expect(bracket.games.map((game: PreviewGame) => game.stage).sort()).toEqual(['final', 'semifinal', 'semifinal']);
-    await f.post(f.playoffs, { availability: f.availability, thirdPlace: false, games: withThird.games }).expect(400);
-    await f.post(f.playoffs, { availability: f.availability, thirdPlace: false, games: bracket.games }).expect(201);
+    await f.post(f.playoffs, { availability: f.playoffAvailability, thirdPlace: false, games: withThird.games }).expect(400);
+    await f.post(f.playoffs, { availability: f.playoffAvailability, thirdPlace: false, games: bracket.games }).expect(201);
     expect((await f.get(`${f.schedule}/status`).expect(200)).body).toMatchObject({ playoffStage: null, playoffs: true, thirdPlace: false });
     // A saved bracket must be finished before the season can complete.
     await f.post(`/seasons/${f.season.id}/status`, { status: 'completed' }).expect(400);
@@ -257,20 +261,20 @@ databaseTests('automatic scheduling against disposable PostgreSQL', () => {
     await f.post(f.schedule, { ...input, games: preview.games }).expect(201);
     await f.post(`/seasons/${f.season.id}/status`, { status: 'active' }).expect(201);
     for (const game of await f.games()) await f.score(game.id, 10, 0).expect(201);
-    const bracket = (await f.post(`${f.playoffs}/preview`, { availability: f.availability }).expect(201)).body;
-    await f.post(f.playoffs, { availability: f.availability, games: bracket.games }).expect(201);
+    const bracket = (await f.post(`${f.playoffs}/preview`, { availability: f.playoffAvailability }).expect(201)).body;
+    await f.post(f.playoffs, { availability: f.playoffAvailability, games: bracket.games }).expect(201);
     // Leave only the semifinals, as the earlier one-round flow did.
     for (const game of (await f.games()).filter((item) => item.stage === 'final' || item.stage === 'third_place')) await f.del(`/games/${game.id}`).expect(200);
     expect((await f.get(`${f.schedule}/status`).expect(200)).body.playoffStage).toBe('final');
     const semifinals = (await f.games()).filter((game) => game.stage === 'semifinal');
-    const next: { games: (PreviewGame & { homeName: string })[] } = (await f.post(`${f.playoffs}/preview`, { availability: f.availability }).expect(201)).body;
+    const next: { games: (PreviewGame & { homeName: string })[] } = (await f.post(`${f.playoffs}/preview`, { availability: f.playoffAvailability }).expect(201)).body;
     expect(next.games.map((game) => game.stage).sort()).toEqual(['final', 'third_place']);
     const semifinalEnd = Math.max(...semifinals.map((game) => Date.parse((game as StoredGame & { scheduled_at: string }).scheduled_at))) + 60 * 60000;
     for (const game of next.games) {
       expect(Date.parse(game.scheduledAt)).toBeGreaterThanOrEqual(semifinalEnd);
       expect(semifinals.map((semifinal) => semifinal.id + ':' + (game.stage === 'final' ? 'winner' : 'loser'))).toContain(game.homeTeamId);
     }
-    await f.post(f.playoffs, { availability: f.availability, games: next.games }).expect(201);
+    await f.post(f.playoffs, { availability: f.playoffAvailability, games: next.games }).expect(201);
     for (const game of semifinals) await f.score(game.id, 7, 9).expect(201);
     const final = (await f.games()).find((game) => game.stage === 'final')!;
     expect(new Set([final.home_season_team_id, final.away_season_team_id])).toEqual(new Set(semifinals.map((game) => game.away_season_team_id)));

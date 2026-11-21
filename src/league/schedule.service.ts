@@ -12,6 +12,14 @@ type Database = Kysely<DB> | Transaction<DB>;
 type DivisionContext = Awaited<ReturnType<ScheduleService['context']>>;
 type Named = { id: string; name: string };
 
+const calendarDateFormatter = (timeZone: string) => new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' });
+
+function calendarDate(formatter: Intl.DateTimeFormat, instant: Date): string {
+  const parts = formatter.formatToParts(instant);
+  const part = (type: string) => parts.find((item) => item.type === type)?.value;
+  return `${part('year')}-${part('month')}-${part('day')}`;
+}
+
 @Injectable()
 export class ScheduleService {
   constructor(private readonly database: DatabaseService) {}
@@ -22,7 +30,7 @@ export class ScheduleService {
       .innerJoin('league.seasons as s', 's.id', 'd.season_id')
       .innerJoin('league.leagues as l', 'l.id', 's.league_id')
       .innerJoin('league.organizations as o', 'o.id', 'l.organization_id')
-      .select(['d.id as divisionId', 's.id as seasonId', 's.league_id as leagueId', 's.status',
+      .select(['d.id as divisionId', 's.id as seasonId', 's.league_id as leagueId', 'l.time_zone as leagueTimeZone', 's.status',
         sql<string | null>`s.start_date::text`.as('startDate'), sql<string | null>`s.end_date::text`.as('endDate')])
       .where('d.id', '=', divisionId).where('o.owner_user_id', '=', user);
     if (lock) query = query.forUpdate('s');
@@ -52,6 +60,25 @@ export class ScheduleService {
     if (venues.length !== availability.venueIds.length) throw new BadRequestException('All venues must belong to this league');
   }
 
+  private async lastPreliminaryGameAt(db: Database, seasonId: string) {
+    const { latest } = await db.selectFrom('league.games').select((eb) => eb.fn.max<Date | null>('scheduled_at').as('latest'))
+      .where('season_id', '=', seasonId).where('stage', '=', 'preliminary').executeTakeFirstOrThrow();
+    return latest;
+  }
+
+  private async validatePlayoffDates(db: Database, season: Pick<DivisionContext, 'seasonId' | 'leagueTimeZone'>, availability: ScheduleAvailability) {
+    const latest = await this.lastPreliminaryGameAt(db, season.seasonId);
+    if (!latest) return;
+    const formatter = this.trySchedule(() => calendarDateFormatter(availability.timeZone));
+    if (season.leagueTimeZone && formatter.resolvedOptions().timeZone !== calendarDateFormatter(season.leagueTimeZone).resolvedOptions().timeZone) {
+      throw new BadRequestException('Use the league time zone when scheduling playoffs');
+    }
+    const lastDate = calendarDate(formatter, latest);
+    if (availability.startDate <= lastDate || availability.endDate <= lastDate) {
+      throw new BadRequestException(`Playoff dates must be after the last elimination game on ${lastDate}`);
+    }
+  }
+
   // Only games near the selected dates can conflict. The margin covers time-zone offsets, game length and the 7-day pacing rule.
   private async existing(db: Database, leagueId: string, availability?: ScheduleAvailability): Promise<ExistingGame[]> {
     let query = db.selectFrom('league.games as g').innerJoin('league.seasons as s', 's.id', 'g.season_id')
@@ -76,11 +103,9 @@ export class ScheduleService {
   }
 
   private warnings(games: ScheduleGame[], context: DivisionContext, zone: string) {
-    const formatter = new Intl.DateTimeFormat('en-CA', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit' });
+    const formatter = calendarDateFormatter(zone);
     const outside = games.some((game) => {
-      const parts = formatter.formatToParts(new Date(game.scheduledAt));
-      const part = (type: string) => parts.find((item) => item.type === type)?.value;
-      const date = `${part('year')}-${part('month')}-${part('day')}`;
+      const date = calendarDate(formatter, new Date(game.scheduledAt));
       return (context.startDate && date < context.startDate) || (context.endDate && date > context.endDate);
     });
     return outside ? ['Some games are outside the season dates.'] : [];
@@ -168,7 +193,7 @@ export class ScheduleService {
   private async seasonContext(user: string, seasonId: string, db: Database, lock = false) {
     let query = db.selectFrom('league.seasons as s').innerJoin('league.leagues as l', 'l.id', 's.league_id')
       .innerJoin('league.organizations as o', 'o.id', 'l.organization_id')
-      .select(['s.id as seasonId', 's.league_id as leagueId', 's.status', sql<string | null>`s.start_date::text`.as('startDate'), sql<string | null>`s.end_date::text`.as('endDate')])
+      .select(['s.id as seasonId', 's.league_id as leagueId', 'l.time_zone as leagueTimeZone', 's.status', sql<string | null>`s.start_date::text`.as('startDate'), sql<string | null>`s.end_date::text`.as('endDate')])
       .where('s.id', '=', seasonId).where('o.owner_user_id', '=', user);
     if (lock) query = query.forUpdate('s');
     const found = await query.select(['s.archived_at as seasonArchivedAt', 'l.archived_at as leagueArchivedAt', 'o.archived_at as organizationArchivedAt']).executeTakeFirst();
@@ -210,14 +235,16 @@ export class ScheduleService {
 
   async seasonStatus(user: string, seasonId: string) {
     const season = await this.seasonContext(user, seasonId, this.db);
-    const divisions = await this.seasonDivisions(this.db, season);
-    return { divisions: divisions.map(({ context: _context, playoff: _playoff, labels: _labels, ...division }) => division) };
+    const [divisions, latest] = await Promise.all([this.seasonDivisions(this.db, season), this.lastPreliminaryGameAt(this.db, seasonId)]);
+    return { lastPreliminaryGameAt: latest?.toISOString() ?? null,
+      divisions: divisions.map(({ context: _context, playoff: _playoff, labels: _labels, ...division }) => division) };
   }
 
   private async seasonPlan(db: Database, season: Awaited<ReturnType<ScheduleService['seasonContext']>>, input: PlayoffOptionsDto | SchedulePreviewDto, mode: 'preliminary' | 'playoffs', allowEmpty = false) {
     if (season.status === 'completed') throw new BadRequestException('Completed seasons cannot be changed');
     if (mode === 'preliminary' && 'format' in input && input.thirdPlace && !input.playoffs) throw new BadRequestException('A third-place game requires playoffs');
     await this.validateVenues(db, season.leagueId, input.availability);
+    if (mode === 'playoffs') await this.validatePlayoffDates(db, season, input.availability);
     const divisions = await this.seasonDivisions(db, season, mode === 'playoffs' ? input.thirdPlace : undefined);
     this.checkTeamAvailability(input.availability, divisions.flatMap((division) => division.teams.map((team) => team.id)));
     const included = divisions.filter((division) => mode === 'preliminary' ? division.canGeneratePreliminary : !!division.playoff);
@@ -489,6 +516,7 @@ export class ScheduleService {
     const context = await this.context(user, divisionId, this.db);
     const { teams, labels, matches } = await this.playoffMatches(this.db, context, input.thirdPlace);
     await this.validateVenues(this.db, context.leagueId, input.availability);
+    await this.validatePlayoffDates(this.db, context, input.availability);
     this.checkTeamAvailability(input.availability, teams.map((team) => team.id));
     const existing = await this.existing(this.db, context.leagueId, input.availability);
     const games = this.trySchedule(() => scheduleMatches(matches, input.availability, existing), labels).map(({ aliases: _aliases, ...game }) => game);
@@ -501,6 +529,7 @@ export class ScheduleService {
       await this.leagueLock(tx, context.leagueId);
       const { teams, matches, schedule, thirdPlace } = await this.playoffMatches(tx, context, input.thirdPlace);
       await this.validateVenues(tx, context.leagueId, input.availability);
+      await this.validatePlayoffDates(tx, context, input.availability);
       this.checkTeamAvailability(input.availability, teams.map((team) => team.id));
       this.sameMatches(matches, input.games);
       const existing = await this.existing(tx, context.leagueId, input.availability);
