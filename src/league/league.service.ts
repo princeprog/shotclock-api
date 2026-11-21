@@ -3,6 +3,7 @@ import { sql, type Kysely, type Selectable, type Transaction } from 'kysely';
 import { DatabaseService } from '../database/database.service';
 import type { DB } from '../database/db';
 import { calculateStandings } from './standings';
+import { labelPending } from './bracket';
 import { slugify, uniqueSlug } from './slug';
 import { ForfeitDto } from './forfeit.dto';
 import { paginationMeta } from '../common/pagination';
@@ -581,7 +582,7 @@ export class LeagueService {
     await this.venue(user, id);
     return this.db.updateTable('league.venues').set({ name: this.name(dto.name), address: dto.address?.trim() || null, updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow();
   }
-  async games(user: string, season: string, divisionId?: string) { await this.season(user, season); const division = await this.divisionForSeason(season, divisionId); return this.db.selectFrom('league.games as g').innerJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').innerJoin('league.teams as ht', 'ht.id', 'h.team_id').innerJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').innerJoin('league.teams as at', 'at.id', 'a.team_id').leftJoin('league.venues as v', 'v.id', 'g.venue_id').selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name']).where('g.season_id', '=', season).where('g.division_id', '=', division.id).orderBy('g.scheduled_at', 'asc').execute(); }
+  async games(user: string, season: string, divisionId?: string) { await this.season(user, season); const division = await this.divisionForSeason(season, divisionId); return this.db.selectFrom('league.games as g').leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id').leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id').leftJoin('league.venues as v', 'v.id', 'g.venue_id').selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name']).where('g.season_id', '=', season).where('g.division_id', '=', division.id).orderBy('g.scheduled_at', 'asc').execute().then((rows) => labelPending(this.db, rows)); }
   async filteredGames(user: string, id: string, filters: GameFilterDto) {
     const season = await this.season(user, id);
     if (filters.scope === 'season' && filters.divisionId) throw new BadRequestException('Choose either season scope or a division');
@@ -591,7 +592,7 @@ export class LeagueService {
     const date = (value?: string) => { if (!value) return undefined; if (!/(Z|[+-]\d\d:\d\d)$/.test(value) || Number.isNaN(Date.parse(value))) throw new BadRequestException('Date filters must include a timezone'); return new Date(value); };
     const from = date(filters.from); const to = date(filters.to);
     if (from && to && from >= to) throw new BadRequestException('Invalid date range');
-    let query = this.db.selectFrom('league.games as g').innerJoin('league.divisions as d', 'd.id', 'g.division_id').innerJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').innerJoin('league.teams as ht', 'ht.id', 'h.team_id').innerJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').innerJoin('league.teams as at', 'at.id', 'a.team_id').leftJoin('league.venues as v', 'v.id', 'g.venue_id').selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name', 'd.name as division_name']).where('g.season_id', '=', id);
+    let query = this.db.selectFrom('league.games as g').innerJoin('league.divisions as d', 'd.id', 'g.division_id').leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id').leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id').leftJoin('league.venues as v', 'v.id', 'g.venue_id').selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name', 'd.name as division_name']).where('g.season_id', '=', id);
     if (division) query = query.where('g.division_id', '=', division.id);
     if (filters.status) query = query.where('g.status', '=', filters.status);
     if (filters.teamId) { const teamId = filters.teamId; query = query.where((eb) => eb.or([eb('g.home_season_team_id', '=', teamId), eb('g.away_season_team_id', '=', teamId)])); }
@@ -602,17 +603,20 @@ export class LeagueService {
     if (search) { const pattern = `%${search.replace(/[\\%_]/g, '\\$&')}%`; query = query.where((eb) => eb.or([eb('ht.name', 'ilike', pattern), eb('at.name', 'ilike', pattern), eb('v.name', 'ilike', pattern)])); }
     const count = await query.clearSelect().select(({ fn }) => fn.countAll<string>().as('total')).executeTakeFirstOrThrow();
     const meta = paginationMeta(Number(count.total), filters.page ?? 1, filters.pageSize ?? 10);
-    const items = await query.orderBy('g.scheduled_at', filters.sort ?? 'asc').orderBy('g.id', 'asc').limit(meta.pageSize).offset((meta.page - 1) * meta.pageSize).execute();
+    const items = await labelPending(this.db, await query.orderBy('g.scheduled_at', filters.sort ?? 'asc').orderBy('g.id', 'asc').limit(meta.pageSize).offset((meta.page - 1) * meta.pageSize).execute());
     return { items, ...meta };
   }
-  private async gameValues(user: string, season: { id: string; league_id: string }, dto: GameDto, tx: Database) {
-    if (dto.homeTeamId === dto.awayTeamId) throw new BadRequestException('Teams must differ');
+  // A fixed side list keeps a generated game's teams, including sides still waiting for a semifinal.
+  private async gameValues(user: string, season: { id: string; league_id: string }, dto: GameDto, tx: Database, fixed?: { division_id: string; home: string | null; away: string | null }) {
+    if (!fixed && (!dto.homeTeamId || !dto.awayTeamId)) throw new BadRequestException('Choose a home team and an away team');
+    if (!fixed && dto.homeTeamId === dto.awayTeamId) throw new BadRequestException('Teams must differ');
     if (!/(Z|[+-]\d\d:\d\d)$/.test(dto.scheduledAt) || Number.isNaN(Date.parse(dto.scheduledAt))) throw new BadRequestException('A date and time with timezone is required');
-    const teams = await tx.selectFrom('league.season_teams').select(['id', 'division_id']).where('season_id', '=', season.id).where('id', 'in', [dto.homeTeamId, dto.awayTeamId]).execute();
+    if (dto.venueId) { const venue = await tx.selectFrom('league.venues').select('id').where('id', '=', dto.venueId).where('league_id', '=', season.league_id).executeTakeFirst(); if (!venue) throw new NotFoundException(); }
+    if (fixed) return { division_id: fixed.division_id, home_season_team_id: fixed.home, away_season_team_id: fixed.away, scheduled_at: new Date(dto.scheduledAt), venue_id: dto.venueId ?? null };
+    const teams = await tx.selectFrom('league.season_teams').select(['id', 'division_id']).where('season_id', '=', season.id).where('id', 'in', [dto.homeTeamId!, dto.awayTeamId!]).execute();
     if (teams.length !== 2) throw new NotFoundException();
     if (teams[0].division_id !== teams[1].division_id) throw new BadRequestException('Teams must belong to the same division');
-    if (dto.venueId) { const venue = await tx.selectFrom('league.venues').select('id').where('id', '=', dto.venueId).where('league_id', '=', season.league_id).executeTakeFirst(); if (!venue) throw new NotFoundException(); }
-    return { division_id: teams[0].division_id, home_season_team_id: dto.homeTeamId, away_season_team_id: dto.awayTeamId, scheduled_at: new Date(dto.scheduledAt), venue_id: dto.venueId ?? null };
+    return { division_id: teams[0].division_id, home_season_team_id: dto.homeTeamId! as string | null, away_season_team_id: dto.awayTeamId! as string | null, scheduled_at: new Date(dto.scheduledAt), venue_id: dto.venueId ?? null };
   }
   async createGame(user: string, id: string, dto: GameDto) { return this.db.transaction().execute(async (tx) => { const season = await this.season(user, id, tx, true); this.editable(season.status); await this.scheduleLock(season.league_id, tx); const values = await this.gameValues(user, season, dto, tx); return tx.insertInto('league.games').values({ season_id: id, ...values, duration_minutes: dto.durationMinutes ?? null, home_score: null, away_score: null }).returningAll().executeTakeFirstOrThrow(); }); }
   async editGame(user: string, id: string, dto: GameDto) { return this.db.transaction().execute(async (tx) => {
@@ -620,8 +624,9 @@ export class LeagueService {
     const season = await this.season(user, initial.season_id, tx, true); this.editable(season.status); await this.scheduleLock(season.league_id, tx);
     const game = await tx.selectFrom('league.games').selectAll().where('id', '=', id).executeTakeFirstOrThrow();
     if (game.status !== 'scheduled') throw new BadRequestException('A completed game cannot be rescheduled');
-    if (game.schedule_id && (game.home_season_team_id !== dto.homeTeamId || game.away_season_team_id !== dto.awayTeamId)) throw new BadRequestException('Generated game participants cannot be changed');
-    const values = await this.gameValues(user, season, dto, tx);
+    const pending = !game.home_season_team_id || !game.away_season_team_id;
+    if (game.schedule_id && ((dto.homeTeamId ?? game.home_season_team_id) !== game.home_season_team_id || (dto.awayTeamId ?? game.away_season_team_id) !== game.away_season_team_id)) throw new BadRequestException('Generated game participants cannot be changed');
+    const values = await this.gameValues(user, season, dto, tx, game.schedule_id || pending ? { division_id: game.division_id, home: game.home_season_team_id, away: game.away_season_team_id } : undefined);
     const duration = dto.durationMinutes ?? game.duration_minutes ?? 60;
     const scheduleChanged = (game.scheduled_at ? new Date(game.scheduled_at).getTime() : null) !== values.scheduled_at.getTime()
       || game.venue_id !== values.venue_id || (dto.durationMinutes !== undefined && game.duration_minutes !== dto.durationMinutes);
@@ -634,14 +639,36 @@ export class LeagueService {
       .select(['g.id', 'g.home_season_team_id', 'g.away_season_team_id', 'g.scheduled_at', 'g.venue_id', 'g.duration_minutes'])
       .where('s.league_id', '=', season.league_id).where('g.id', '!=', id).where('g.scheduled_at', 'is not', null)
       .where('g.scheduled_at', '<', new Date(end)).execute();
-    const teams = [values.home_season_team_id, values.away_season_team_id];
+    const teams = [values.home_season_team_id, values.away_season_team_id].filter((team): team is string => !!team);
     for (const other of existing) {
       if (!other.scheduled_at || other.id === id) continue;
       const otherStart = new Date(other.scheduled_at).getTime();
       if (otherStart >= end || otherStart + (other.duration_minutes ?? duration) * 60_000 <= start) continue;
-      if ((values.venue_id && values.venue_id === other.venue_id) || teams.includes(other.home_season_team_id) || teams.includes(other.away_season_team_id)) {
+      if ((values.venue_id && values.venue_id === other.venue_id) || (other.home_season_team_id && teams.includes(other.home_season_team_id)) || (other.away_season_team_id && teams.includes(other.away_season_team_id))) {
         throw new BadRequestException('Game conflicts with another game at this venue or involving a team');
       }
+    }
+    // The round robin ends before the division's semifinals start.
+    if (game.stage === 'preliminary' || game.stage === 'semifinal') {
+      const others = await tx.selectFrom('league.games').select(['scheduled_at', 'duration_minutes']).where('division_id', '=', game.division_id)
+        .where('stage', '=', game.stage === 'preliminary' ? 'semifinal' : 'preliminary').where('scheduled_at', 'is not', null).execute();
+      for (const other of others) {
+        const otherStart = new Date(other.scheduled_at!).getTime();
+        if (game.stage === 'preliminary' && end > otherStart) throw new BadRequestException('Round-robin games must end before the semifinals start');
+        if (game.stage === 'semifinal' && start < otherStart + (other.duration_minutes ?? duration) * 60_000) throw new BadRequestException('Semifinals must start after the round robin ends');
+      }
+    }
+    // Bracket order: a game waiting for a semifinal starts after it ends, and a semifinal ends before the games waiting for it.
+    const sources = [game.home_source_game_id, game.away_source_game_id].filter((source): source is string => !!source);
+    const linked = game.stage === 'semifinal' || sources.length ? await tx.selectFrom('league.games').select(['id', 'scheduled_at', 'duration_minutes', 'home_source_game_id', 'away_source_game_id'])
+      .where((eb) => eb.or([eb('home_source_game_id', '=', id), eb('away_source_game_id', '=', id), ...(sources.length ? [eb('id', 'in', sources)] : [])])).execute() : [];
+    for (const other of linked) {
+      if (!other.scheduled_at) continue;
+      const otherStart = new Date(other.scheduled_at).getTime();
+      const source = sources.includes(other.id);
+      if (!source && other.home_source_game_id !== id && other.away_source_game_id !== id) continue;
+      if (source && start < otherStart + (other.duration_minutes ?? duration) * 60_000) throw new BadRequestException('This game must start after the semifinal it waits for ends');
+      if (!source && end > otherStart) throw new BadRequestException('This semifinal must end before the playoff games that wait for its result');
     }
     const updated = await tx.updateTable('league.games').set({ ...values, ...(scheduleChanged ? { duration_minutes: duration } : {}), updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow();
     if (scheduleChanged) await tx.insertInto('league.game_schedule_changes').values({
@@ -663,8 +690,8 @@ export class LeagueService {
   private async preliminaryStandings(db: Database, seasonId: string, divisionId: string, proposed?: { game: Selectable<DB['league.games']>; score: ScoreDto }) {
     const teams = await db.selectFrom('league.season_teams as st').innerJoin('league.teams as t', 't.id', 'st.team_id').select(['st.id', 't.name']).where('st.season_id', '=', seasonId).where('st.division_id', '=', divisionId).execute();
     const games = await db.selectFrom('league.games').select(['id', 'home_season_team_id', 'away_season_team_id', 'home_score', 'away_score']).where('season_id', '=', seasonId).where('division_id', '=', divisionId).where('stage', '=', 'preliminary').where('status', '=', 'completed').where('home_score', 'is not', null).where('away_score', 'is not', null).execute();
-    const results = games.filter((game) => game.id !== proposed?.game.id).map((game) => ({ homeId: game.home_season_team_id, awayId: game.away_season_team_id, homeScore: game.home_score!, awayScore: game.away_score! }));
-    if (proposed) results.push({ homeId: proposed.game.home_season_team_id, awayId: proposed.game.away_season_team_id, homeScore: proposed.score.homeScore, awayScore: proposed.score.awayScore });
+    const results = games.filter((game) => game.id !== proposed?.game.id).map((game) => ({ homeId: game.home_season_team_id!, awayId: game.away_season_team_id!, homeScore: game.home_score!, awayScore: game.away_score! }));
+    if (proposed) results.push({ homeId: proposed.game.home_season_team_id!, awayId: proposed.game.away_season_team_id!, homeScore: proposed.score.homeScore, awayScore: proposed.score.awayScore });
     return calculateStandings(teams, results);
   }
   private semifinalPairings(standings: { id: string }[]) {
@@ -672,20 +699,59 @@ export class LeagueService {
     if (seeds.length < 4) return JSON.stringify(seeds);
     return JSON.stringify([[seeds[0], seeds[3]].sort(), [seeds[1], seeds[2]].sort()].sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1])));
   }
+  // Semifinals scheduled with the round robin take their teams from the final standings once every round-robin game is final.
+  private async fillSeededSemifinals(tx: Transaction<DB>, seasonId: string, divisionId: string) {
+    const waiting = await tx.selectFrom('league.games').select(['id', 'home_seed', 'away_seed']).where('division_id', '=', divisionId).where('stage', '=', 'semifinal')
+      .where('home_season_team_id', 'is', null).where('home_seed', 'is not', null).where('away_seed', 'is not', null).execute();
+    if (!waiting.length) return;
+    const unplayed = await tx.selectFrom('league.games').select('id').where('division_id', '=', divisionId).where('stage', '=', 'preliminary').where('status', '=', 'scheduled').executeTakeFirst();
+    if (unplayed) return;
+    const standings = await this.preliminaryStandings(tx, seasonId, divisionId);
+    if (standings.length < 4) throw new BadRequestException('Playoffs need at least four teams');
+    for (const semifinal of waiting) {
+      await tx.updateTable('league.games').set({ home_season_team_id: standings[semifinal.home_seed! - 1].id, away_season_team_id: standings[semifinal.away_seed! - 1].id, updated_at: new Date() })
+        .where('id', '=', semifinal.id).execute();
+    }
+  }
   private async writeGameResult(tx: Transaction<DB>, seasonId: string, game: Selectable<DB['league.games']>, dto: ScoreDto, forfeitingTeamId: string | null) {
+    if (!game.home_season_team_id || !game.away_season_team_id) throw new BadRequestException('Both teams must be known before recording a result');
     if (dto.homeScore === dto.awayScore) throw new BadRequestException('Final scores cannot be tied');
+    // Bracket games that take this semifinal's winner or loser.
+    const dependents = game.stage === 'semifinal' ? await tx.selectFrom('league.games').select(['id', 'status', 'home_source_game_id', 'home_source_outcome', 'away_source_game_id', 'away_source_outcome'])
+      .where((eb) => eb.or([eb('home_source_game_id', '=', game.id), eb('away_source_game_id', '=', game.id)])).execute()
+      .then((rows) => rows.filter((next) => next.home_source_game_id === game.id || next.away_source_game_id === game.id)) : [];
     if (game.stage === 'preliminary') {
-      const semifinal = await tx.selectFrom('league.games').select('id').where('season_id', '=', seasonId).where('division_id', '=', game.division_id).where('stage', '=', 'semifinal').executeTakeFirst();
+      // Seeded semifinals still waiting for the standings can change freely; once filled, their pairings are fixed.
+      const semifinal = await tx.selectFrom('league.games').select('id').where('season_id', '=', seasonId).where('division_id', '=', game.division_id).where('stage', '=', 'semifinal')
+        .where('home_season_team_id', 'is not', null).executeTakeFirst();
       if (semifinal) {
         const before = await this.preliminaryStandings(tx, seasonId, game.division_id);
         const after = await this.preliminaryStandings(tx, seasonId, game.division_id, { game, score: dto });
         if (this.semifinalPairings(before) !== this.semifinalPairings(after)) throw new BadRequestException('Score would change existing semifinal pairings');
       }
     } else if (game.stage === 'semifinal' && game.status === 'completed' && game.home_score !== null && game.away_score !== null && (game.home_score > game.away_score) !== (dto.homeScore > dto.awayScore)) {
-      const next = await tx.selectFrom('league.games').select('id').where('season_id', '=', seasonId).where('division_id', '=', game.division_id).where('schedule_id', '=', game.schedule_id).where('stage', 'in', ['final', 'third_place']).executeTakeFirst();
+      // Waiting games follow a corrected winner until they are played; finals created from known winners cannot change.
+      if (dependents.some((next) => next.status !== 'scheduled')) throw new BadRequestException('Semifinal winner cannot change after the championship or third-place game is played');
+      if (dependents.length) {
+        const stats = await tx.selectFrom('league.player_game_stats').select('id').where('game_id', 'in', dependents.map((next) => next.id)).executeTakeFirst();
+        if (stats) throw new BadRequestException('Semifinal winner cannot change after player statistics are recorded for the next game');
+      }
+      const next = await tx.selectFrom('league.games').select('id').where('season_id', '=', seasonId).where('division_id', '=', game.division_id).where('schedule_id', '=', game.schedule_id).where('stage', 'in', ['final', 'third_place'])
+        .where('home_source_game_id', 'is', null).where('away_source_game_id', 'is', null).executeTakeFirst();
       if (next) throw new BadRequestException('Semifinal winner cannot change after the final or third-place game is created');
     }
-    return tx.updateTable('league.games').set({ home_score: dto.homeScore, away_score: dto.awayScore, forfeited_by_season_team_id: forfeitingTeamId, status: 'completed', updated_at: new Date() }).where('id', '=', game.id).returningAll().executeTakeFirstOrThrow();
+    const saved = await tx.updateTable('league.games').set({ home_score: dto.homeScore, away_score: dto.awayScore, forfeited_by_season_team_id: forfeitingTeamId, status: 'completed', updated_at: new Date() }).where('id', '=', game.id).returningAll().executeTakeFirstOrThrow();
+    if (game.stage === 'preliminary') await this.fillSeededSemifinals(tx, seasonId, game.division_id);
+    // The semifinal's winner and loser move into the games waiting for them.
+    const winner = dto.homeScore > dto.awayScore ? game.home_season_team_id : game.away_season_team_id;
+    const loser = winner === game.home_season_team_id ? game.away_season_team_id : game.home_season_team_id;
+    for (const next of dependents) {
+      const team = (source: string | null, outcome: string | null) => source === game.id ? { team: outcome === 'loser' ? loser : winner } : null;
+      const home = team(next.home_source_game_id, next.home_source_outcome);
+      const away = team(next.away_source_game_id, next.away_source_outcome);
+      await tx.updateTable('league.games').set({ ...(home ? { home_season_team_id: home.team } : {}), ...(away ? { away_season_team_id: away.team } : {}), updated_at: new Date() }).where('id', '=', next.id).execute();
+    }
+    return saved;
   }
   async score(user: string, id: string, dto: ScoreDto) { return this.db.transaction().execute(async (tx) => {
     const initial = await tx.selectFrom('league.games').select(['season_id']).where('id', '=', id).executeTakeFirst(); if (!initial) throw new NotFoundException();
@@ -701,6 +767,7 @@ export class LeagueService {
     const game = await tx.selectFrom('league.games').selectAll().where('id', '=', id).executeTakeFirstOrThrow();
     if (season.status === 'draft' || (season.status === 'completed' && game.status !== 'completed')) throw new BadRequestException('Season is not active');
     if (game.status === 'completed' && !game.forfeited_by_season_team_id) throw new BadRequestException('A played result cannot be marked as a forfeit');
+    if (!game.home_season_team_id || !game.away_season_team_id) throw new BadRequestException('Both teams must be known before recording a result');
     if (dto.forfeitingTeamId !== game.home_season_team_id && dto.forfeitingTeamId !== game.away_season_team_id) throw new BadRequestException('The forfeiting team must be a participant in this game');
     const stats = await tx.selectFrom('league.player_game_stats').select('id').where('game_id', '=', id).executeTakeFirst();
     if (stats) throw new BadRequestException('A game with player statistics cannot be marked as a forfeit');

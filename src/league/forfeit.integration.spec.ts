@@ -172,10 +172,11 @@ databaseTests('game forfeits against disposable PostgreSQL', () => {
         await f.score(game.id, homeWins ? 10 : 0, homeWins ? 0 : 10).expect(201);
       }
     }
-    const semis = (await f.post(`${playoffs}/preview`, { availability }).expect(201)).body;
-    expect(semis.games.map((game: { homeTeamId: string; awayTeamId: string }) => [names.get(game.homeTeamId), names.get(game.awayTeamId)].sort().join(':')).sort())
+    const playoffAvailability = { ...availability, startDate: '2025-02-02' };
+    const bracket = (await f.post(`${playoffs}/preview`, { availability: playoffAvailability }).expect(201)).body;
+    expect(bracket.games.filter((game: { stage: string }) => game.stage === 'semifinal').map((game: { homeTeamId: string; awayTeamId: string }) => [names.get(game.homeTeamId), names.get(game.awayTeamId)].sort().join(':')).sort())
       .toEqual(['Alpha:Delta', 'Bravo:Charlie']);
-    await f.post(playoffs, { availability, games: semis.games }).expect(201);
+    await f.post(playoffs, { availability: playoffAvailability, games: bracket.games }).expect(201);
     await f.forfeit(target.id, alpha).expect(400);
     const alphaHome = target.home_season_team_id === alpha;
     await f.score(target.id, alphaHome ? 0 : 99, alphaHome ? 99 : 0).expect(400);
@@ -186,10 +187,10 @@ databaseTests('game forfeits against disposable PostgreSQL', () => {
     const semifinal = semifinalGames[0];
     await f.forfeit(semifinal.id, semifinal.away_season_team_id).expect(201);
     await f.score(semifinalGames[1].id, 20, 10).expect(201);
-    const final = (await f.post(`${playoffs}/preview`, { availability }).expect(201)).body;
-    expect(new Set([final.games[0].homeTeamId, final.games[0].awayTeamId]))
+    const final = (await f.games()).find((game) => game.stage === 'final')!;
+    expect(new Set([final.home_season_team_id, final.away_season_team_id]))
       .toEqual(new Set(semifinalGames.map((game) => game.home_season_team_id)));
-    await f.post(playoffs, { availability, games: final.games }).expect(201);
+    await f.score(final.id, 30, 20).expect(201);
     await f.forfeit(semifinal.id, semifinal.home_season_team_id).expect(400);
     await f.score(semifinal.id, 10, 20).expect(400);
     expect(await f.stored(semifinal.id)).toMatchObject({ home_score: 20, away_score: 0, forfeited_by_season_team_id: semifinal.away_season_team_id });

@@ -9,7 +9,7 @@ import { LeagueService } from './league.service';
 type Game = {
   id: string; season_id: string; division_id: string; stage: string; status: string;
   schedule_id: string | null; home_season_team_id: string; away_season_team_id: string;
-  home_score: number | null; away_score: number | null;
+  home_score: number | null; away_score: number | null; home_seed?: number | null; away_seed?: number | null;
 };
 
 const match = (id: string, home: string, away: string, stage = 'preliminary', homeScore: number | null = 10, awayScore: number | null = 0): Game => ({
@@ -119,6 +119,10 @@ function setup() {
           }
           if (text.includes('"home_score" is not null') && game.home_score === null) return false;
           if (text.includes('"away_score" is not null') && game.away_score === null) return false;
+          for (const key of ['home_season_team_id', 'home_seed', 'away_seed'] as const) {
+            if (text.includes('"' + key + '" is null') && game[key] != null) return false;
+            if (text.includes('"' + key + '" is not null') && game[key] == null) return false;
+          }
           return true;
         });
       } else if (text.includes('from "league"."rosters"')) rows = [];
