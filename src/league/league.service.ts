@@ -648,6 +648,16 @@ export class LeagueService {
         throw new BadRequestException('Game conflicts with another game at this venue or involving a team');
       }
     }
+    // The round robin ends before the division's semifinals start.
+    if (game.stage === 'preliminary' || game.stage === 'semifinal') {
+      const others = await tx.selectFrom('league.games').select(['scheduled_at', 'duration_minutes']).where('division_id', '=', game.division_id)
+        .where('stage', '=', game.stage === 'preliminary' ? 'semifinal' : 'preliminary').where('scheduled_at', 'is not', null).execute();
+      for (const other of others) {
+        const otherStart = new Date(other.scheduled_at!).getTime();
+        if (game.stage === 'preliminary' && end > otherStart) throw new BadRequestException('Round-robin games must end before the semifinals start');
+        if (game.stage === 'semifinal' && start < otherStart + (other.duration_minutes ?? duration) * 60_000) throw new BadRequestException('Semifinals must start after the round robin ends');
+      }
+    }
     // Bracket order: a game waiting for a semifinal starts after it ends, and a semifinal ends before the games waiting for it.
     const sources = [game.home_source_game_id, game.away_source_game_id].filter((source): source is string => !!source);
     const linked = game.stage === 'semifinal' || sources.length ? await tx.selectFrom('league.games').select(['id', 'scheduled_at', 'duration_minutes', 'home_source_game_id', 'away_source_game_id'])
@@ -689,6 +699,20 @@ export class LeagueService {
     if (seeds.length < 4) return JSON.stringify(seeds);
     return JSON.stringify([[seeds[0], seeds[3]].sort(), [seeds[1], seeds[2]].sort()].sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1])));
   }
+  // Semifinals scheduled with the round robin take their teams from the final standings once every round-robin game is final.
+  private async fillSeededSemifinals(tx: Transaction<DB>, seasonId: string, divisionId: string) {
+    const waiting = await tx.selectFrom('league.games').select(['id', 'home_seed', 'away_seed']).where('division_id', '=', divisionId).where('stage', '=', 'semifinal')
+      .where('home_season_team_id', 'is', null).where('home_seed', 'is not', null).where('away_seed', 'is not', null).execute();
+    if (!waiting.length) return;
+    const unplayed = await tx.selectFrom('league.games').select('id').where('division_id', '=', divisionId).where('stage', '=', 'preliminary').where('status', '=', 'scheduled').executeTakeFirst();
+    if (unplayed) return;
+    const standings = await this.preliminaryStandings(tx, seasonId, divisionId);
+    if (standings.length < 4) throw new BadRequestException('Playoffs need at least four teams');
+    for (const semifinal of waiting) {
+      await tx.updateTable('league.games').set({ home_season_team_id: standings[semifinal.home_seed! - 1].id, away_season_team_id: standings[semifinal.away_seed! - 1].id, updated_at: new Date() })
+        .where('id', '=', semifinal.id).execute();
+    }
+  }
   private async writeGameResult(tx: Transaction<DB>, seasonId: string, game: Selectable<DB['league.games']>, dto: ScoreDto, forfeitingTeamId: string | null) {
     if (!game.home_season_team_id || !game.away_season_team_id) throw new BadRequestException('Both teams must be known before recording a result');
     if (dto.homeScore === dto.awayScore) throw new BadRequestException('Final scores cannot be tied');
@@ -697,7 +721,9 @@ export class LeagueService {
       .where((eb) => eb.or([eb('home_source_game_id', '=', game.id), eb('away_source_game_id', '=', game.id)])).execute()
       .then((rows) => rows.filter((next) => next.home_source_game_id === game.id || next.away_source_game_id === game.id)) : [];
     if (game.stage === 'preliminary') {
-      const semifinal = await tx.selectFrom('league.games').select('id').where('season_id', '=', seasonId).where('division_id', '=', game.division_id).where('stage', '=', 'semifinal').executeTakeFirst();
+      // Seeded semifinals still waiting for the standings can change freely; once filled, their pairings are fixed.
+      const semifinal = await tx.selectFrom('league.games').select('id').where('season_id', '=', seasonId).where('division_id', '=', game.division_id).where('stage', '=', 'semifinal')
+        .where('home_season_team_id', 'is not', null).executeTakeFirst();
       if (semifinal) {
         const before = await this.preliminaryStandings(tx, seasonId, game.division_id);
         const after = await this.preliminaryStandings(tx, seasonId, game.division_id, { game, score: dto });
@@ -715,6 +741,7 @@ export class LeagueService {
       if (next) throw new BadRequestException('Semifinal winner cannot change after the final or third-place game is created');
     }
     const saved = await tx.updateTable('league.games').set({ home_score: dto.homeScore, away_score: dto.awayScore, forfeited_by_season_team_id: forfeitingTeamId, status: 'completed', updated_at: new Date() }).where('id', '=', game.id).returningAll().executeTakeFirstOrThrow();
+    if (game.stage === 'preliminary') await this.fillSeededSemifinals(tx, seasonId, game.division_id);
     // The semifinal's winner and loser move into the games waiting for them.
     const winner = dto.homeScore > dto.awayScore ? game.home_season_team_id : game.away_season_team_id;
     const loser = winner === game.home_season_team_id ? game.away_season_team_id : game.home_season_team_id;

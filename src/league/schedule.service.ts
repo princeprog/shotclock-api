@@ -6,7 +6,7 @@ import type { DB } from '../database/db';
 import { PlayoffOptionsDto, PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonPlayoffPreviewDto, SeasonPlayoffSaveDto, SeasonPlayoffSuggestDto, SeasonSchedulePreviewDto, SeasonScheduleSaveDto, SeasonScheduleSuggestDto } from './league.dto';
 import { estimateCourtCapacity, planSchedule, teamGameCapacity, roundRobin, scheduleIssues, scheduleMatches, SchedulePlacementError, suggestSlots, validateSchedule, type ExistingGame, type ScheduleAvailability, type ScheduleGame, type ScheduleMatch } from './schedule-algorithm';
 import { calculateStandings } from './standings';
-import { bracketSlot, labelPending, parseBracketSlot, parseSavedSlot, pendingLabel } from './bracket';
+import { bracketSlot, labelPending, parseBracketSlot, parseSavedSlot, parseSeedSlot, pendingLabel, seedLabel, seedSlot } from './bracket';
 
 type Database = Kysely<DB> | Transaction<DB>;
 type DivisionContext = Awaited<ReturnType<ScheduleService['context']>>;
@@ -82,17 +82,19 @@ export class ScheduleService {
   // Only games near the selected dates can conflict. The margin covers time-zone offsets, game length and the 7-day pacing rule.
   private async existing(db: Database, leagueId: string, availability?: ScheduleAvailability): Promise<ExistingGame[]> {
     let query = db.selectFrom('league.games as g').innerJoin('league.seasons as s', 's.id', 'g.season_id')
-      .select(['g.id', 'g.stage', 'g.home_season_team_id', 'g.away_season_team_id', 'g.home_source_game_id', 'g.home_source_outcome',
+      .select(['g.id', 'g.division_id', 'g.stage', 'g.home_season_team_id', 'g.away_season_team_id', 'g.home_seed', 'g.away_seed', 'g.home_source_game_id', 'g.home_source_outcome',
         'g.away_source_game_id', 'g.away_source_outcome', 'g.scheduled_at', 'g.venue_id', 'g.duration_minutes'])
       .where('s.league_id', '=', leagueId).where('g.scheduled_at', 'is not', null);
     const from = Date.parse(`${availability?.startDate}T00:00:00Z`) - 8 * 86400000;
     const to = Date.parse(`${availability?.endDate}T00:00:00Z`) + 9 * 86400000;
     if (Number.isFinite(from) && Number.isFinite(to)) query = query.where('g.scheduled_at', '>=', new Date(from)).where('g.scheduled_at', '<', new Date(to));
     const games = await query.execute();
-    // A side still waiting for a semifinal stands in as that semifinal's winner or loser, which the semifinal also counts for.
+    // A side still waiting stands in as its seed, or as a semifinal's winner or loser, which the semifinal also counts for.
+    const side = (team: string | null, seed: number | null, divisionId: string, source: string | null, outcome: string | null) =>
+      team ?? (seed ? seedSlot(divisionId, seed) : source + ':' + outcome);
     return games.map((game) => ({ id: game.id,
-      homeTeamId: game.home_season_team_id ?? game.home_source_game_id + ':' + game.home_source_outcome,
-      awayTeamId: game.away_season_team_id ?? game.away_source_game_id + ':' + game.away_source_outcome,
+      homeTeamId: side(game.home_season_team_id, game.home_seed, game.division_id, game.home_source_game_id, game.home_source_outcome),
+      awayTeamId: side(game.away_season_team_id, game.away_seed, game.division_id, game.away_source_game_id, game.away_source_outcome),
       ...(game.stage === 'semifinal' ? { aliases: [game.id + ':winner', game.id + ':loser'], round: 0 } : {}),
       scheduledAt: new Date(game.scheduled_at!).toISOString(), venueId: game.venue_id, durationMinutes: game.duration_minutes }));
   }
@@ -182,7 +184,7 @@ export class ScheduleService {
     const prelim = games.filter((game) => game.stage === 'preliminary');
     const semifinals = games.filter((game) => game.stage === 'semifinal');
     let playoffStage: 'semifinal' | 'final' | null = null;
-    if (schedule && teams.length >= 4 && prelim.length && prelim.every((game) => game.status === 'completed')) {
+    if (schedule && teams.length >= 4 && prelim.length) {
       if (!semifinals.length) playoffStage = 'semifinal';
       else if (semifinals.length === 2 && !games.some((game) => game.stage === 'final' || game.stage === 'third_place')) playoffStage = 'final';
     }
@@ -356,7 +358,7 @@ export class ScheduleService {
       .leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id')
       .leftJoin('league.venues as v', 'v.id', 'g.venue_id')
       .select(['g.id', 'g.scheduled_at', 'g.duration_minutes', 'g.venue_id', 'v.name as venueName', 'ht.name as home_name', 'at.name as away_name', 'd.name as divisionName',
-        'g.home_source_game_id', 'g.home_source_outcome', 'g.away_source_game_id', 'g.away_source_outcome'])
+        'g.home_seed', 'g.away_seed', 'g.home_source_game_id', 'g.home_source_outcome', 'g.away_source_game_id', 'g.away_source_outcome'])
       .where('s.league_id', '=', leagueId).where('g.id', 'in', ids).execute().then((rows) => labelPending(this.db, rows));
     return games.map((game) => ({ id: game.id, scheduledAt: new Date(game.scheduled_at!).toISOString(), durationMinutes: game.duration_minutes,
       venueId: game.venue_id, venueName: game.venueName, homeName: game.home_name, awayName: game.away_name, divisionName: game.divisionName }));
@@ -396,7 +398,7 @@ export class ScheduleService {
       .leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id')
       .leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id')
       .select(['g.id', 'g.scheduled_at', 'g.duration_minutes', 'g.venue_id', 'ht.name as home_name', 'at.name as away_name', 'd.name as divisionName',
-        'g.home_source_game_id', 'g.home_source_outcome', 'g.away_source_game_id', 'g.away_source_outcome'])
+        'g.home_seed', 'g.away_seed', 'g.home_source_game_id', 'g.home_source_outcome', 'g.away_source_game_id', 'g.away_source_outcome'])
       .where('s.league_id', '=', season.leagueId).where('g.venue_id', 'in', input.availability.venueIds)
       .where('g.scheduled_at', '>=', start).where('g.scheduled_at', '<', end).limit(10001).execute().then((rows) => labelPending(this.db, rows));
     if (games.length > 10000) throw new BadRequestException('Too many existing games to display. Shorten the date range.');
@@ -455,7 +457,25 @@ export class ScheduleService {
     });
   }
 
-  // Any division with a finished round robin and at least four teams can schedule playoffs; the third-place choice is made here.
+  // Semifinals 1 vs 4 and 2 vs 3 in round 1, then the championship and optional third-place game for their winners and losers.
+  private bracket(divisionId: string, seeds: Named[], thirdPlace: boolean) {
+    const pairs = [[seeds[0], seeds[3]], [seeds[1], seeds[2]]] as const;
+    const slot = (semifinal: 1 | 2, outcome: 'winner' | 'loser') => bracketSlot(divisionId, semifinal, outcome);
+    const matches: ScheduleMatch[] = pairs.map(([home, away], index) => ({ homeTeamId: home.id, awayTeamId: away.id, round: 1, stage: 'semifinal' as const,
+      aliases: [slot(index ? 2 : 1, 'winner'), slot(index ? 2 : 1, 'loser')] }));
+    matches.push({ homeTeamId: slot(1, 'winner'), awayTeamId: slot(2, 'winner'), round: 2, stage: 'final' });
+    if (thirdPlace) matches.push({ homeTeamId: slot(1, 'loser'), awayTeamId: slot(2, 'loser'), round: 2, stage: 'third_place' });
+    const labels = [...seeds, ...pairs.flatMap(([home, away], index) => (['winner', 'loser'] as const).map((outcome) => ({
+      id: slot(index ? 2 : 1, outcome), name: pendingLabel(outcome, home.name, away.name) })))];
+    return { matches, labels };
+  }
+
+  // Seeds stand in for the top four teams until the final standings decide them.
+  private seeds(divisionId: string): Named[] {
+    return [1, 2, 3, 4].map((seed) => ({ id: seedSlot(divisionId, seed), name: seedLabel(seed) }));
+  }
+
+  // Any division with a generated round robin and at least four teams can schedule playoffs; the third-place choice is made here.
   private async playoffMatches(db: Database, context: DivisionContext, thirdPlaceChoice?: boolean) {
     this.editable(context);
     const [schedule, teams, games] = await Promise.all([
@@ -472,23 +492,18 @@ export class ScheduleService {
     const generated = preliminary.filter((game) => game.schedule_id === schedule.id);
     this.sameMatches(expected, generated.map((game) => ({ homeTeamId: game.home_season_team_id!, awayTeamId: game.away_season_team_id!,
       round: game.round ?? 0, stage: 'preliminary', scheduledAt: '', venueId: '', durationMinutes: 1 })));
-    if (preliminary.some((game) => game.status !== 'completed')) throw new BadRequestException('Complete all preliminary games before generating playoffs');
     const semifinals = games.filter((game) => game.stage === 'semifinal');
     if (games.some((game) => game.stage === 'final' || game.stage === 'third_place')) throw new BadRequestException('Playoff games are already scheduled.');
     let matches: ScheduleMatch[];
     let labels: Named[] = teams;
     if (!semifinals.length) {
-      // The whole bracket at once: semifinals in round 1, then the championship and third-place game for their winners and losers.
-      const standings = calculateStandings(teams, preliminary.map((game) => ({ homeId: game.home_season_team_id!, awayId: game.away_season_team_id!, homeScore: game.home_score!, awayScore: game.away_score! })));
-      const pairs = [[standings[0], standings[3]], [standings[1], standings[2]]] as const;
-      const slot = (semifinal: 1 | 2, outcome: 'winner' | 'loser') => bracketSlot(context.divisionId, semifinal, outcome);
-      matches = pairs.map(([home, away], index) => ({ homeTeamId: home.id, awayTeamId: away.id, round: 1, stage: 'semifinal' as const,
-        aliases: [slot(index ? 2 : 1, 'winner'), slot(index ? 2 : 1, 'loser')] }));
-      matches.push({ homeTeamId: slot(1, 'winner'), awayTeamId: slot(2, 'winner'), round: 2, stage: 'final' });
-      if (thirdPlace) matches.push({ homeTeamId: slot(1, 'loser'), awayTeamId: slot(2, 'loser'), round: 2, stage: 'third_place' });
-      const name = (id: string) => teams.find((team) => team.id === id)?.name ?? '';
-      labels = [...teams, ...pairs.flatMap(([home, away], index) => (['winner', 'loser'] as const).map((outcome) => ({
-        id: slot(index ? 2 : 1, outcome), name: pendingLabel(outcome, name(home.id), name(away.id)) })))];
+      // The whole bracket at once. Until every round-robin game is final, the semifinals take seeds that the standings fill in later.
+      const complete = preliminary.every((game) => game.status === 'completed');
+      const seeds = complete ? calculateStandings(teams, preliminary.map((game) => ({ homeId: game.home_season_team_id!, awayId: game.away_season_team_id!,
+        homeScore: game.home_score!, awayScore: game.away_score! }))).slice(0, 4) : this.seeds(context.divisionId);
+      const bracket = this.bracket(context.divisionId, seeds, thirdPlace);
+      matches = bracket.matches;
+      labels = [...teams, ...bracket.labels];
     } else {
       // Semifinals saved on their own: the later games take each result now if it is in, or when it is recorded.
       if (semifinals.length !== 2) throw new BadRequestException('Playoffs need exactly two semifinals');
@@ -541,20 +556,31 @@ export class ScheduleService {
   }
 
   // Games whose sides wait for a semifinal are saved after it, pointing at it until its result fills in the team.
+  // Semifinals record their seeds; a seeded side has no team until the final standings fill it in.
   private async insert(tx: Transaction<DB>, context: DivisionContext, scheduleId: string, games: ScheduleGame[], matches: ScheduleMatch[]) {
     const isSlot = (id: string) => !!parseBracketSlot(id) || !!parseSavedSlot(id);
     const pending = (game: ScheduleGame) => isSlot(game.homeTeamId) || isSlot(game.awayTeamId);
     const row = (game: ScheduleGame) => ({ season_id: context.seasonId, division_id: context.divisionId, scheduled_at: new Date(game.scheduledAt),
       venue_id: game.venueId, duration_minutes: game.durationMinutes, stage: game.stage, round: game.round, schedule_id: scheduleId });
+    // Semifinal 1 is seeds 1 and 4 and semifinal 2 is seeds 2 and 3; the number comes from the slots its winner and loser fill.
+    const semifinalNumber = (game: ScheduleGame) => matches.find((item) => item.stage === 'semifinal' && item.homeTeamId === game.homeTeamId && item.awayTeamId === game.awayTeamId)
+      ?.aliases?.map(parseBracketSlot).find((slot) => slot)?.semifinal;
+    const team = (id: string) => {
+      const seed = parseSeedSlot(id);
+      if (seed && seed.divisionId !== context.divisionId) throw new BadRequestException('The schedule has changed; generate a new preview');
+      return seed ? null : id;
+    };
     const known = games.filter((game) => !pending(game));
-    const saved = known.length ? await tx.insertInto('league.games').values(known.map((game) => ({ ...row(game),
-      home_season_team_id: game.homeTeamId, away_season_team_id: game.awayTeamId }))).returning(['id', 'stage', 'home_season_team_id', 'away_season_team_id']).execute() : [];
+    const saved = known.length ? await tx.insertInto('league.games').values(known.map((game) => {
+      const number = game.stage === 'semifinal' ? semifinalNumber(game) : undefined;
+      return { ...row(game), home_season_team_id: team(game.homeTeamId), away_season_team_id: team(game.awayTeamId),
+        home_seed: number ?? null, away_seed: number ? 5 - number : null };
+    })).returning(['id', 'stage', 'home_seed']).execute() : [];
     const later = games.filter(pending);
     if (!later.length) return;
     const savedSemifinals = new Set((await tx.selectFrom('league.games').select('id').where('division_id', '=', context.divisionId).where('stage', '=', 'semifinal').execute()).map((game) => game.id));
     const semifinalId = (number: 1 | 2) => {
-      const match = matches.find((item) => item.stage === 'semifinal' && item.aliases?.some((alias) => parseBracketSlot(alias)?.semifinal === number));
-      const game = match && saved.find((item) => item.stage === 'semifinal' && item.home_season_team_id === match.homeTeamId && item.away_season_team_id === match.awayTeamId);
+      const game = saved.find((item) => item.stage === 'semifinal' && item.home_seed === number);
       if (!game) throw new BadRequestException('Schedule both semifinals with the rest of the bracket');
       return game.id;
     };

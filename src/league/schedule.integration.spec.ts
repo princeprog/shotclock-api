@@ -152,7 +152,6 @@ databaseTests('automatic scheduling against disposable PostgreSQL', () => {
     const input = { format: 'single', playoffs: true, thirdPlace, availability: f.availability };
     const preview = (await f.post(`${f.schedule}/preview`, input).expect(201)).body;
     await f.post(f.schedule, { ...input, games: preview.games }).expect(201);
-    await f.post(`${f.playoffs}/preview`, { availability: f.playoffAvailability }).expect(400);
     await f.post(`/seasons/${f.season.id}/status`, { status: 'active' }).expect(201);
     const rank = new Map(f.teams.map((team) => [team.id, team.name]));
     const preliminaries = await f.games();
@@ -220,6 +219,36 @@ databaseTests('automatic scheduling against disposable PostgreSQL', () => {
     }
     await f.post(`/seasons/${f.season.id}/status`, { status: 'completed' }).expect(201);
     await f.del(`/games/${finalGame.id}`).expect(400);
+  });
+
+  it('schedules a seeded bracket before the round robin ends and fills it from the final standings', async () => {
+    const f = await fixture();
+    const input = { format: 'single', availability: f.availability };
+    const preview = (await f.post(`${f.schedule}/preview`, input).expect(201)).body;
+    await f.post(f.schedule, { ...input, games: preview.games }).expect(201);
+    await f.post(`/seasons/${f.season.id}/status`, { status: 'active' }).expect(201);
+    const later = { ...f.availability, startDate: '2025-02-08', endDate: '2025-02-09' };
+    const bracket: { games: (PreviewGame & { homeName: string; awayName: string })[] } = (await f.post(`${f.playoffs}/preview`, { availability: later, thirdPlace: true }).expect(201)).body;
+    expect(bracket.games.filter((game) => game.stage === 'semifinal').map((game) => `${game.homeName} vs ${game.awayName}`).sort()).toEqual(['1st seed vs 4th seed', '2nd seed vs 3rd seed']);
+    expect(bracket.games.find((game) => game.stage === 'final')!.homeName).toBe('1st seed / 4th seed winner');
+    await f.post(f.playoffs, { availability: later, thirdPlace: true, games: bracket.games }).expect(201);
+    type SeededGame = StoredGame & { home_seed: number | null; away_seed: number | null; home_name: string; away_name: string };
+    let stored = await f.games() as SeededGame[];
+    const semifinals = stored.filter((game) => game.stage === 'semifinal');
+    expect(semifinals.every((game) => game.home_season_team_id === null && game.away_season_team_id === null)).toBe(true);
+    expect(semifinals.map((game) => [game.home_seed, game.away_seed]).sort()).toEqual([[1, 4], [2, 3]]);
+    expect(semifinals.map((game) => game.home_name).sort()).toEqual(['1st seed', '2nd seed']);
+    const preliminaries = stored.filter((game) => game.stage === 'preliminary');
+    const late = await f.patch(`/games/${preliminaries[0].id}`, { scheduledAt: '2025-02-09T15:00:00Z', venueId: f.availability.venueIds[0], durationMinutes: 60 }).expect(400);
+    expect(late.body.message).toMatch(/before the semifinals start/);
+    const rank = new Map(f.teams.map((team) => [team.id, team.name]));
+    for (const game of preliminaries) {
+      const homeWins = rank.get(game.home_season_team_id)! < rank.get(game.away_season_team_id)!;
+      await f.score(game.id, homeWins ? 10 : 0, homeWins ? 0 : 10).expect(201);
+    }
+    stored = await f.games() as SeededGame[];
+    expect(stored.filter((game) => game.stage === 'semifinal').map((game) => `${rank.get(game.home_season_team_id)}:${rank.get(game.away_season_team_id)}`).sort()).toEqual(['Alpha:Delta', 'Bravo:Charlie']);
+    expect(stored.find((game) => game.stage === 'final')!.home_name).toMatch(/^Alpha \/ Delta winner$/);
   });
 
   it('decides playoffs and the third-place game when they are scheduled, not with the round robin', async () => {

@@ -158,7 +158,7 @@ export class PublicService {
       .leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id')
       .leftJoin('league.venues as v', 'v.id', 'g.venue_id')
       .select(['g.id', 'g.scheduled_at', 'g.status', 'g.stage', 'g.round', 'g.duration_minutes', 'g.home_score', 'g.away_score', 'g.forfeited_by_season_team_id',
-        'g.home_source_game_id', 'g.home_source_outcome', 'g.away_source_game_id', 'g.away_source_outcome',
+        'g.home_seed', 'g.away_seed', 'g.home_source_game_id', 'g.home_source_outcome', 'g.away_source_game_id', 'g.away_source_outcome',
         'h.id as home_id', 'ht.id as home_team_id', 'ht.name as home_name', 'ht.abbreviation as home_abbreviation',
         'a.id as away_id', 'at.id as away_team_id', 'at.name as away_name', 'at.abbreviation as away_abbreviation',
         'v.name as venue_name', 'v.address as venue_address']);
