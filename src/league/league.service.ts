@@ -779,5 +779,59 @@ export class LeagueService {
     const division = await this.divisionForSeason(season, divisionId);
     return this.preliminaryStandings(this.db, season, division.id);
   }
-  async dashboard(user: string, season: string, divisionId?: string) { await this.season(user, season); const division = await this.divisionForSeason(season, divisionId); const [teams, games, standings] = await Promise.all([this.seasonTeams(user, season, division.id), this.games(user, season, division.id), this.standings(user, season, division.id)]); return { teamCount: teams.length, upcoming: games.filter((g) => g.status === 'scheduled' && g.scheduled_at !== null && new Date(g.scheduled_at).getTime() >= Date.now()), recent: games.filter((g) => g.status === 'completed').reverse(), standings }; }
+  // Season-wide summary for the Overview page: totals, the next and latest games, games that ended without a score,
+  // registrations with short rosters, and each division's progress, standings and playoff stage.
+  async dashboard(user: string, seasonId: string) {
+    const season = await this.season(user, seasonId);
+    const [divisions, registrations, venues, games] = await Promise.all([
+      this.db.selectFrom('league.divisions as d').leftJoin('league.division_schedules as ds', 'ds.division_id', 'd.id')
+        .select(['d.id', 'd.name', 'ds.id as schedule_id']).where('d.season_id', '=', seasonId).orderBy('d.created_at').orderBy('d.name').execute(),
+      this.db.selectFrom('league.season_teams as st').innerJoin('league.teams as t', 't.id', 'st.team_id').innerJoin('league.divisions as d', 'd.id', 'st.division_id')
+        .leftJoin('league.rosters as r', 'r.season_team_id', 'st.id')
+        .select(['st.id', 'st.division_id', 't.name', 'd.name as division_name', sql<number>`count(r.id)::int`.as('players')])
+        .where('st.season_id', '=', seasonId).groupBy(['st.id', 't.name', 'd.name']).orderBy('t.name').execute(),
+      this.db.selectFrom('league.venues').select(sql<number>`count(*)::int`.as('count')).where('league_id', '=', season.league_id).executeTakeFirstOrThrow(),
+      this.db.selectFrom('league.games as g').innerJoin('league.divisions as d', 'd.id', 'g.division_id')
+        .leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id')
+        .leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id')
+        .leftJoin('league.venues as v', 'v.id', 'g.venue_id')
+        .selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name', 'd.name as division_name'])
+        .where('g.season_id', '=', seasonId).orderBy('g.scheduled_at', 'asc').orderBy('g.id').execute().then((rows) => labelPending(this.db, rows)),
+    ]);
+    const standings = await Promise.all(divisions.map((division) => this.preliminaryStandings(this.db, seasonId, division.id)));
+    const now = Date.now();
+    const startsAt = (game: (typeof games)[number]) => game.scheduled_at ? new Date(game.scheduled_at).getTime() : null;
+    const hasEnded = (game: (typeof games)[number]) => { const start = startsAt(game); return start !== null && start + (game.duration_minutes ?? 60) * 60_000 <= now; };
+    const completed = games.filter((game) => game.status === 'completed');
+    const awaiting = games.filter((game) => game.status === 'scheduled' && game.home_season_team_id && game.away_season_team_id && hasEnded(game));
+    const shortRosters = registrations.filter((registration) => registration.players < 5);
+    return {
+      totals: { divisions: divisions.length, teams: registrations.length, players: registrations.reduce((sum, registration) => sum + registration.players, 0),
+        venues: venues.count, games: games.length, completedGames: completed.length },
+      upcoming: games.filter((game) => game.status === 'scheduled' && (startsAt(game) ?? -1) >= now).slice(0, 6),
+      awaitingResults: { count: awaiting.length, games: awaiting.slice(0, 5) },
+      recent: [...completed].sort((a, b) => (startsAt(b) ?? 0) - (startsAt(a) ?? 0)).slice(0, 5),
+      shortRosters: { count: shortRosters.length, teams: shortRosters.slice(0, 5).map((registration) => ({ seasonTeamId: registration.id, name: registration.name, divisionName: registration.division_name, players: registration.players })) },
+      divisions: divisions.map((division, index) => {
+        const divisionGames = games.filter((game) => game.division_id === division.id);
+        const divisionTeams = registrations.filter((registration) => registration.division_id === division.id);
+        return { id: division.id, name: division.name, teams: divisionTeams.length, players: divisionTeams.reduce((sum, registration) => sum + registration.players, 0),
+          games: divisionGames.length, completedGames: divisionGames.filter((game) => game.status === 'completed').length,
+          scheduled: !!division.schedule_id || divisionGames.length > 0, playoffs: this.playoffStatus(divisionGames), standings: standings[index] };
+      }),
+    };
+  }
+  // A division's playoff stage: waiting for the round robin, semifinals, the championship, or complete with a champion.
+  private playoffStatus<T extends { stage: string; status: string; home_name: string; away_name: string; home_score: number | null; away_score: number | null }>(games: T[]) {
+    const playoffGames = games.filter((game) => game.stage !== 'preliminary');
+    if (!playoffGames.length) return null;
+    const championship = playoffGames.find((game) => game.stage === 'final');
+    if (championship?.status === 'completed') {
+      return { stage: 'complete' as const, nextGame: null, champion: championship.home_score! > championship.away_score! ? championship.home_name : championship.away_name };
+    }
+    const roundRobinLeft = games.some((game) => game.stage === 'preliminary' && game.status === 'scheduled');
+    const semifinalsLeft = playoffGames.some((game) => game.stage === 'semifinal' && game.status === 'scheduled');
+    const stage = roundRobinLeft ? 'waiting' as const : semifinalsLeft ? 'semifinals' as const : 'final' as const;
+    return { stage, nextGame: playoffGames.find((game) => game.status === 'scheduled') ?? null, champion: null };
+  }
 }

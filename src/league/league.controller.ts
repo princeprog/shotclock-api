@@ -88,5 +88,5 @@ export class LeagueController {
   @Post('games/:id/score') async score(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: ScoreDto) { return this.league.score(await this.user(h), id, dto); }
   @Post('games/:id/forfeit') async forfeit(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Body() dto: ForfeitDto) { return this.league.forfeit(await this.user(h), id, dto); }
   @Get('seasons/:id/standings') async standings(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Query() filters: DivisionFilterDto) { return this.league.standings(await this.user(h), id, filters.divisionId); }
-  @Get('seasons/:id/dashboard') async dashboard(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string, @Query() filters: DivisionFilterDto) { return this.league.dashboard(await this.user(h), id, filters.divisionId); }
+  @Get('seasons/:id/dashboard') async dashboard(@Headers('authorization') h: string, @Param('id', ParseUUIDPipe) id: string) { return this.league.dashboard(await this.user(h), id); }
 }
