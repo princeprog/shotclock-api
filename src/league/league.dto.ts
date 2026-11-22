@@ -1,4 +1,4 @@
-import { ArrayMaxSize, ArrayNotEmpty, ArrayUnique, IsArray, IsBoolean, IsDateString, IsDefined, IsIn, IsInt, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min, MinLength, ValidateIf, ValidateNested } from 'class-validator';
+import { ArrayMaxSize, ArrayNotEmpty, ArrayUnique, IsArray, IsBoolean, IsDateString, IsDefined, IsEmail, IsIn, IsInt, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min, MinLength, ValidateIf, ValidateNested } from 'class-validator';
 import { Type } from 'class-transformer';
 import { SLUG_MAX, SLUG_MIN, SLUG_PATTERN } from './slug';
 import { TEAM_OR_SLOT } from './bracket';
@@ -218,4 +218,11 @@ export class SeasonScheduleSuggestDto extends SchedulePreviewDto {
   @IsArray() @ArrayNotEmpty() @ArrayUnique() @ArrayMaxSize(5000) @IsUUID('all', { each: true }) divisionIds!: string[];
   @IsArray() @ArrayMaxSize(5000) @ValidateNested({ each: true }) @Type(() => SeasonScheduleGameDto) games!: SeasonScheduleGameDto[];
   @IsDefined() @ValidateNested() @Type(() => ScheduleSuggestTargetDto) target!: ScheduleSuggestTargetDto;
+}
+
+export class InvitationDto {
+  @IsEmail() @MaxLength(320) email!: string;
+}
+export class InvitationTokenDto {
+  @IsString() @MinLength(20) @MaxLength(200) token!: string;
 }

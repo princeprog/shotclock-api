@@ -150,6 +150,7 @@ export class LeagueService {
     await db.deleteFrom('league.teams').where('league_id', 'in', leagueIds).execute();
     await db.deleteFrom('league.venues').where('league_id', 'in', leagueIds).execute();
     await db.deleteFrom('league.league_members').where('league_id', 'in', leagueIds).execute();
+    await db.deleteFrom('league.invitations').where('league_id', 'in', leagueIds).execute();
     await db.deleteFrom('league.leagues').where('id', 'in', leagueIds).execute();
   }
   private async seasonIdsForLeagues(db: Database, leagueIds: string[]) {
