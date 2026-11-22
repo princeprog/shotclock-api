@@ -123,6 +123,8 @@ export class LeagueService {
     if (!seasonIds.length) return false;
     const result = await db.selectFrom('league.games').select('id').where('season_id', 'in', seasonIds).where('status', '=', 'completed').executeTakeFirst();
     if (result) return true;
+    const play = await db.selectFrom('league.game_events as e').innerJoin('league.games as g', 'g.id', 'e.game_id').select('e.id').where('g.season_id', 'in', seasonIds).executeTakeFirst();
+    if (play) return true;
     const stat = await db.selectFrom('league.player_game_stats as pgs').innerJoin('league.games as g', 'g.id', 'pgs.game_id').select('pgs.id').where('g.season_id', 'in', seasonIds).executeTakeFirst();
     return !!stat;
   }
@@ -135,6 +137,8 @@ export class LeagueService {
     const games = db.selectFrom('league.games').select('id').where('season_id', 'in', seasonIds);
     const rosters = db.selectFrom('league.rosters').select('id').where('season_id', 'in', seasonIds);
     await db.deleteFrom('league.player_game_stats').where((eb) => eb.or([eb('game_id', 'in', games), eb('roster_id', 'in', rosters)])).execute();
+    await db.deleteFrom('league.game_events').where('game_id', 'in', games).execute();
+    await db.deleteFrom('league.game_live_states').where('game_id', 'in', games).execute();
     await db.deleteFrom('league.games').where('season_id', 'in', seasonIds).execute();
     await db.deleteFrom('league.division_schedules').where('division_id', 'in', db.selectFrom('league.divisions').select('id').where('season_id', 'in', seasonIds)).execute();
     await db.deleteFrom('league.rosters').where('season_id', 'in', seasonIds).execute();
@@ -272,7 +276,12 @@ export class LeagueService {
   }
   async createLeague(user: string, org: string, dto: LeagueDto) { await this.org(user, org); return this.db.insertInto('league.leagues').values({ organization_id: org, name: this.name(dto.name), location: dto.location?.trim() || null, time_zone: this.timeZone(dto.timeZone) }).returningAll().executeTakeFirstOrThrow(); }
   async getLeague(user: string, id: string) { return this.league(user, id); }
-  async editLeague(user: string, id: string, dto: LeagueDto) { const league = await this.league(user, id); return this.db.updateTable('league.leagues').set({ name: this.name(dto.name), location: dto.location?.trim() || null, time_zone: dto.timeZone === undefined ? league.time_zone : this.timeZone(dto.timeZone), updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow(); }
+  async editLeague(user: string, id: string, dto: LeagueDto) {
+    const league = await this.league(user, id);
+    return this.db.updateTable('league.leagues').set({ name: this.name(dto.name), location: dto.location?.trim() || null, time_zone: dto.timeZone === undefined ? league.time_zone : this.timeZone(dto.timeZone),
+      period_count: dto.periodCount ?? league.period_count, period_minutes: dto.periodMinutes ?? league.period_minutes, overtime_minutes: dto.overtimeMinutes ?? league.overtime_minutes, bonus_fouls: dto.bonusFouls ?? league.bonus_fouls,
+      updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow();
+  }
   // Publishing shows the league on the public website. The first publish derives a web address from the league name.
   async publication(user: string, id: string, dto: PublicationDto) { return this.db.transaction().execute(async (tx) => {
     const league = await this.league(user, id, tx);
@@ -624,7 +633,7 @@ export class LeagueService {
     const initial = await tx.selectFrom('league.games').select(['season_id']).where('id', '=', id).executeTakeFirst(); if (!initial) throw new NotFoundException();
     const season = await this.season(user, initial.season_id, tx, true); this.editable(season.status); await this.scheduleLock(season.league_id, tx);
     const game = await tx.selectFrom('league.games').selectAll().where('id', '=', id).executeTakeFirstOrThrow();
-    if (game.status !== 'scheduled') throw new BadRequestException('A completed game cannot be rescheduled');
+    if (game.status !== 'scheduled') throw new BadRequestException(game.status === 'live' ? 'A live game cannot be rescheduled' : 'A completed game cannot be rescheduled');
     const pending = !game.home_season_team_id || !game.away_season_team_id;
     if (game.schedule_id && ((dto.homeTeamId ?? game.home_season_team_id) !== game.home_season_team_id || (dto.awayTeamId ?? game.away_season_team_id) !== game.away_season_team_id)) throw new BadRequestException('Generated game participants cannot be changed');
     const values = await this.gameValues(user, season, dto, tx, game.schedule_id || pending ? { division_id: game.division_id, home: game.home_season_team_id, away: game.away_season_team_id } : undefined);
@@ -705,7 +714,7 @@ export class LeagueService {
     const waiting = await tx.selectFrom('league.games').select(['id', 'home_seed', 'away_seed']).where('division_id', '=', divisionId).where('stage', '=', 'semifinal')
       .where('home_season_team_id', 'is', null).where('home_seed', 'is not', null).where('away_seed', 'is not', null).execute();
     if (!waiting.length) return;
-    const unplayed = await tx.selectFrom('league.games').select('id').where('division_id', '=', divisionId).where('stage', '=', 'preliminary').where('status', '=', 'scheduled').executeTakeFirst();
+    const unplayed = await tx.selectFrom('league.games').select('id').where('division_id', '=', divisionId).where('stage', '=', 'preliminary').where('status', '!=', 'completed').executeTakeFirst();
     if (unplayed) return;
     const standings = await this.preliminaryStandings(tx, seasonId, divisionId);
     if (standings.length < 4) throw new BadRequestException('Playoffs need at least four teams');
@@ -754,11 +763,17 @@ export class LeagueService {
     }
     return saved;
   }
+  // Live scoring finishes a game through the same result path as a manual score.
+  recordGameResult(tx: Transaction<DB>, seasonId: string, game: Selectable<DB['league.games']>, dto: ScoreDto) {
+    return this.writeGameResult(tx, seasonId, game, dto, null);
+  }
   async score(user: string, id: string, dto: ScoreDto) { return this.db.transaction().execute(async (tx) => {
     const initial = await tx.selectFrom('league.games').select(['season_id']).where('id', '=', id).executeTakeFirst(); if (!initial) throw new NotFoundException();
     const season = await this.season(user, initial.season_id, tx, true);
     const game = await tx.selectFrom('league.games').selectAll().where('id', '=', id).executeTakeFirstOrThrow();
     if (season.status === 'draft' || (season.status === 'completed' && game.status !== 'completed')) throw new BadRequestException('Season is not active');
+    const live = await tx.selectFrom('league.game_live_states').select('game_id').where('game_id', '=', id).executeTakeFirst();
+    if (live) throw new BadRequestException('This game is scored live. Reopen it in the scorekeeper console to correct it.');
     return this.writeGameResult(tx, season.id, game, dto, null);
   }); }
   async forfeit(user: string, id: string, dto: ForfeitDto) { return this.db.transaction().execute(async (tx) => {
@@ -768,6 +783,8 @@ export class LeagueService {
     const game = await tx.selectFrom('league.games').selectAll().where('id', '=', id).executeTakeFirstOrThrow();
     if (season.status === 'draft' || (season.status === 'completed' && game.status !== 'completed')) throw new BadRequestException('Season is not active');
     if (game.status === 'completed' && !game.forfeited_by_season_team_id) throw new BadRequestException('A played result cannot be marked as a forfeit');
+    const live = await tx.selectFrom('league.game_live_states').select('game_id').where('game_id', '=', id).executeTakeFirst();
+    if (live) throw new BadRequestException('This game is scored live. Reopen it in the scorekeeper console to correct it.');
     if (!game.home_season_team_id || !game.away_season_team_id) throw new BadRequestException('Both teams must be known before recording a result');
     if (dto.forfeitingTeamId !== game.home_season_team_id && dto.forfeitingTeamId !== game.away_season_team_id) throw new BadRequestException('The forfeiting team must be a participant in this game');
     const stats = await tx.selectFrom('league.player_game_stats').select('id').where('game_id', '=', id).executeTakeFirst();
@@ -830,9 +847,9 @@ export class LeagueService {
     if (championship?.status === 'completed') {
       return { stage: 'complete' as const, nextGame: null, champion: championship.home_score! > championship.away_score! ? championship.home_name : championship.away_name };
     }
-    const roundRobinLeft = games.some((game) => game.stage === 'preliminary' && game.status === 'scheduled');
-    const semifinalsLeft = playoffGames.some((game) => game.stage === 'semifinal' && game.status === 'scheduled');
+    const roundRobinLeft = games.some((game) => game.stage === 'preliminary' && game.status !== 'completed');
+    const semifinalsLeft = playoffGames.some((game) => game.stage === 'semifinal' && game.status !== 'completed');
     const stage = roundRobinLeft ? 'waiting' as const : semifinalsLeft ? 'semifinals' as const : 'final' as const;
-    return { stage, nextGame: playoffGames.find((game) => game.status === 'scheduled') ?? null, champion: null };
+    return { stage, nextGame: playoffGames.find((game) => game.status !== 'completed') ?? null, champion: null };
   }
 }

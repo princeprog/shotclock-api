@@ -11,6 +11,10 @@ export class NameDto {
 export class LeagueDto extends NameDto {
   @IsOptional() @IsString() @MaxLength(160) location?: string | null;
   @IsOptional() @IsString() @MaxLength(100) timeZone?: string | null;
+  @IsOptional() @IsInt() @Min(1) @Max(8) periodCount?: number;
+  @IsOptional() @IsInt() @Min(1) @Max(30) periodMinutes?: number;
+  @IsOptional() @IsInt() @Min(1) @Max(15) overtimeMinutes?: number;
+  @IsOptional() @IsInt() @Min(1) @Max(10) bonusFouls?: number;
 }
 export class ArchivedFilterDto {
   @IsOptional() @IsIn(['true', 'false']) archived?: 'true' | 'false';
@@ -226,3 +230,32 @@ export class InvitationDto {
 export class InvitationTokenDto {
   @IsString() @MinLength(20) @MaxLength(200) token!: string;
 }
+
+export class LiveDeviceDto {
+  @IsUUID() deviceId!: string;
+}
+export class LiveStartDto extends LiveDeviceDto {
+  @IsInt() @Min(1) @Max(8) periodCount!: number;
+  @IsInt() @Min(1) @Max(30) periodMinutes!: number;
+  @IsInt() @Min(1) @Max(15) overtimeMinutes!: number;
+  @IsInt() @Min(1) @Max(10) bonusFouls!: number;
+}
+export class LiveEventDto {
+  @IsUUID() id!: string;
+  @IsIn(['points', 'rebound', 'assist', 'steal', 'block', 'turnover', 'foul', 'timeout']) kind!: 'points' | 'rebound' | 'assist' | 'steal' | 'block' | 'turnover' | 'foul' | 'timeout';
+  @IsOptional() @IsInt() @Min(1) @Max(3) points?: number;
+  @IsUUID() seasonTeamId!: string;
+  @IsOptional() @IsUUID() rosterId?: string;
+  @IsInt() @Min(1) @Max(20) period!: number;
+  @IsOptional() @IsInt() @Min(0) @Max(3_600_000) clockMs?: number;
+  @IsDateString({ strict: true }) recordedAt!: string;
+}
+export class LiveEventsDto extends LiveDeviceDto {
+  @IsArray() @ArrayNotEmpty() @ArrayMaxSize(100) @ValidateNested({ each: true }) @Type(() => LiveEventDto) events!: LiveEventDto[];
+}
+export class LiveClockDto extends LiveDeviceDto {
+  @IsBoolean() running!: boolean;
+  @IsInt() @Min(0) @Max(3_600_000) remainingMs!: number;
+  @IsDateString({ strict: true }) at!: string;
+}
+
