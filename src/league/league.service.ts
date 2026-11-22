@@ -19,6 +19,12 @@ const sortDirection = (dir?: 'asc' | 'desc') => sql.raw(dir === 'desc' ? 'desc' 
 
 type Database = Kysely<DB> | Transaction<DB>;
 const seasonDates = [sql<string | null>`start_date::text`.as('start_date'), sql<string | null>`end_date::text`.as('end_date')] as const;
+// Whether a game was scored live, and the running score of a live game, for game lists.
+const liveColumns = [
+  sql<boolean>`exists (select 1 from league.game_live_states ls where ls.game_id = g.id)`.as('live_scored'),
+  sql<number | null>`(select coalesce(sum(e.points), 0)::int from league.game_events e where e.game_id = g.id and e.voided_at is null and e.season_team_id = g.home_season_team_id)`.as('live_home_score'),
+  sql<number | null>`(select coalesce(sum(e.points), 0)::int from league.game_events e where e.game_id = g.id and e.voided_at is null and e.season_team_id = g.away_season_team_id)`.as('live_away_score'),
+] as const;
 
 @Injectable()
 export class LeagueService {
@@ -592,7 +598,7 @@ export class LeagueService {
     await this.venue(user, id);
     return this.db.updateTable('league.venues').set({ name: this.name(dto.name), address: dto.address?.trim() || null, updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow();
   }
-  async games(user: string, season: string, divisionId?: string) { await this.season(user, season); const division = await this.divisionForSeason(season, divisionId); return this.db.selectFrom('league.games as g').leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id').leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id').leftJoin('league.venues as v', 'v.id', 'g.venue_id').selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name']).where('g.season_id', '=', season).where('g.division_id', '=', division.id).orderBy('g.scheduled_at', 'asc').execute().then((rows) => labelPending(this.db, rows)); }
+  async games(user: string, season: string, divisionId?: string) { await this.season(user, season); const division = await this.divisionForSeason(season, divisionId); return this.db.selectFrom('league.games as g').leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id').leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id').leftJoin('league.venues as v', 'v.id', 'g.venue_id').selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name']).select(liveColumns).where('g.season_id', '=', season).where('g.division_id', '=', division.id).orderBy('g.scheduled_at', 'asc').execute().then((rows) => labelPending(this.db, rows)); }
   async filteredGames(user: string, id: string, filters: GameFilterDto) {
     const season = await this.season(user, id);
     if (filters.scope === 'season' && filters.divisionId) throw new BadRequestException('Choose either season scope or a division');
@@ -602,9 +608,10 @@ export class LeagueService {
     const date = (value?: string) => { if (!value) return undefined; if (!/(Z|[+-]\d\d:\d\d)$/.test(value) || Number.isNaN(Date.parse(value))) throw new BadRequestException('Date filters must include a timezone'); return new Date(value); };
     const from = date(filters.from); const to = date(filters.to);
     if (from && to && from >= to) throw new BadRequestException('Invalid date range');
-    let query = this.db.selectFrom('league.games as g').innerJoin('league.divisions as d', 'd.id', 'g.division_id').leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id').leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id').leftJoin('league.venues as v', 'v.id', 'g.venue_id').selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name', 'd.name as division_name']).where('g.season_id', '=', id);
+    let query = this.db.selectFrom('league.games as g').innerJoin('league.divisions as d', 'd.id', 'g.division_id').leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id').leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id').leftJoin('league.venues as v', 'v.id', 'g.venue_id').selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name', 'd.name as division_name']).select(liveColumns).where('g.season_id', '=', id);
     if (division) query = query.where('g.division_id', '=', division.id);
-    if (filters.status) query = query.where('g.status', '=', filters.status);
+    // Live games stay with the scheduled games until they are final.
+    if (filters.status) query = query.where('g.status', 'in', filters.status === 'scheduled' ? ['scheduled', 'live'] : ['completed']);
     if (filters.teamId) { const teamId = filters.teamId; query = query.where((eb) => eb.or([eb('g.home_season_team_id', '=', teamId), eb('g.away_season_team_id', '=', teamId)])); }
     if (filters.venueId) query = query.where('g.venue_id', '=', filters.venueId);
     if (from) query = query.where('g.scheduled_at', '>=', from);

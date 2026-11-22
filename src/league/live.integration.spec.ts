@@ -77,6 +77,8 @@ databaseTests('live scoring against isolated PostgreSQL', () => {
     const repeated = (await post(`${live}/events`, { deviceId: deviceA, events: batch }, keeper.auth).expect(201)).body;
     expect(repeated).toMatchObject({ home: { score: 3, timeouts: 1, inBonus: true }, away: { score: 2, teamFouls: 2 } });
     expect(repeated.plays).toHaveLength(6);
+    const listed = (await get(`/seasons/${season.id}/games?scope=season&status=scheduled`).expect(200)).body.items;
+    expect(listed).toEqual([expect.objectContaining({ id: game.id, status: 'live', live_scored: true, live_home_score: 3, live_away_score: 2 })]);
     await post(`${live}/events`, { deviceId: deviceA, events: [play('points', hawks.id, roster[hawks.id][0])] }, keeper.auth).expect(400);
     await post(`${live}/events`, { deviceId: deviceA, events: [play('rebound', hawks.id, roster[owls.id][0])] }, keeper.auth).expect(400);
     await post(`${live}/events`, { deviceId: deviceA, events: [play('timeout', hawks.id, roster[hawks.id][0])] }, keeper.auth).expect(400);
