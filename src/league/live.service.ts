@@ -99,7 +99,7 @@ export class LiveService {
       period, clock: state ? { remainingMs: this.remaining(state, now), running: !!state.clock_running_since, serverTime: new Date(now).toISOString() } : null,
       home: { ...home, inBonus: away.teamFouls >= format.bonus_fouls }, away: { ...away, inBonus: home.teamFouls >= format.bonus_fouls },
       finalScore: game.status === 'completed' ? { home: game.home_score, away: game.away_score } : null,
-      plays: events.slice(-30).reverse().map((event) => ({ id: event.id, sequence: event.sequence, kind: event.kind, points: event.points, seasonTeamId: event.season_team_id,
+      plays: events.slice(-30).reverse().map((event) => ({ id: event.id, sequence: event.sequence, kind: event.kind, points: event.points, seasonTeamId: event.season_team_id, rosterId: event.roster_id,
         player: event.roster_id ? names.get(event.roster_id) ?? null : null, period: event.period, clockMs: event.clock_ms, voided: !!event.voided_at })),
       scorer: includeScorer && state?.scorer_device_id ? { deviceId: state.scorer_device_id, name: state.scorer_name?.trim() || state.scorer_email } : null,
       live: !!state, startedAt: state?.started_at ?? null, finishedAt: state?.finished_at ?? null,
