@@ -7,6 +7,7 @@ import { AuthMailer } from '../auth/auth-mailer.service';
 import { RateLimitService } from '../common/rate-limit.service';
 import { ensureNotArchived } from '../common/request-scope';
 import { labelPending } from './bracket';
+import { liveColumns } from './league.service';
 
 type Database = Kysely<DB> | Transaction<DB>;
 const INVITATION_DAYS = 7;
@@ -135,7 +136,9 @@ export class ScorekeepersService {
       .leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id')
       .leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id')
       .leftJoin('league.venues as v', 'v.id', 'g.venue_id')
+      .leftJoin('league.game_live_states as ls', 'ls.game_id', 'g.id')
       .selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name', 'd.name as division_name', 's.name as season_name', 'l.name as league_name', 'l.time_zone'])
+      .select(liveColumns).select(['ls.period', 'ls.period_count'])
       .where('l.id', 'in', leagues.map((league) => league.id)).where('s.status', '=', 'active').where('s.archived_at', 'is', null)
       .where((eb) => eb.or([
         eb('g.status', '=', 'live'),

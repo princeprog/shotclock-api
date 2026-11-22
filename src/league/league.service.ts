@@ -20,7 +20,7 @@ const sortDirection = (dir?: 'asc' | 'desc') => sql.raw(dir === 'desc' ? 'desc' 
 type Database = Kysely<DB> | Transaction<DB>;
 const seasonDates = [sql<string | null>`start_date::text`.as('start_date'), sql<string | null>`end_date::text`.as('end_date')] as const;
 // Whether a game was scored live, and the running score of a live game, for game lists.
-const liveColumns = [
+export const liveColumns = [
   sql<boolean>`exists (select 1 from league.game_live_states ls where ls.game_id = g.id)`.as('live_scored'),
   sql<number | null>`(select coalesce(sum(e.points), 0)::int from league.game_events e where e.game_id = g.id and e.voided_at is null and e.season_team_id = g.home_season_team_id)`.as('live_home_score'),
   sql<number | null>`(select coalesce(sum(e.points), 0)::int from league.game_events e where e.game_id = g.id and e.voided_at is null and e.season_team_id = g.away_season_team_id)`.as('live_away_score'),
