@@ -3,6 +3,7 @@ import { sql } from 'kysely';
 import { DatabaseService } from '../database/database.service';
 import { calculateStandings } from '../league/standings';
 import { labelPending } from '../league/bracket';
+import { liveSnapshot } from '../league/live-snapshot';
 import { statLeaders, teamForm, teamStats, winPct, type ResultGame, type StatTeam } from './team-stats';
 
 // Read-only data for the public website. Only published leagues in unarchived organizations, and their
@@ -20,6 +21,8 @@ type GameRow = {
   home_id: string | null; home_team_id: string | null; home_name: string; home_abbreviation: string | null;
   away_id: string | null; away_team_id: string | null; away_name: string; away_abbreviation: string | null;
   venue_name: string | null; venue_address: string | null;
+  // The running score of a live game, from its plays.
+  live_home_score: number | null; live_away_score: number | null;
 };
 
 const escapeLike = (value: string) => value.replace(/[\\%_]/g, '\\$&');
@@ -38,13 +41,13 @@ function gameView(row: GameRow) {
   return {
     id: row.id,
     scheduledAt: row.scheduled_at ? new Date(row.scheduled_at).toISOString() : null,
-    status: row.status as 'scheduled' | 'completed',
+    status: row.status as 'scheduled' | 'live' | 'completed',
     stage: row.stage,
     round: row.round,
     durationMinutes: row.duration_minutes,
     venue: row.venue_name ? { name: row.venue_name, address: row.venue_address } : null,
-    home: { id: row.home_id, teamId: row.home_team_id, name: row.home_name, abbreviation: row.home_abbreviation, score: row.home_score },
-    away: { id: row.away_id, teamId: row.away_team_id, name: row.away_name, abbreviation: row.away_abbreviation, score: row.away_score },
+    home: { id: row.home_id, teamId: row.home_team_id, name: row.home_name, abbreviation: row.home_abbreviation, score: row.status === 'live' ? row.live_home_score : row.home_score },
+    away: { id: row.away_id, teamId: row.away_team_id, name: row.away_name, abbreviation: row.away_abbreviation, score: row.status === 'live' ? row.live_away_score : row.away_score },
     forfeit: row.forfeited_by_season_team_id === null ? null : row.forfeited_by_season_team_id === row.home_id ? 'home' as const : 'away' as const,
   };
 }
@@ -106,7 +109,7 @@ export class PublicService {
     };
   }
 
-  // Scheduled games in the next seven days across all published leagues.
+  // Live games, then scheduled games in the next seven days, across all published leagues.
   async upcoming(limit = 8) {
     const rows = await labelPending(this.db, await this.gameQuery()
       .innerJoin('league.seasons as s', 's.id', 'g.season_id').innerJoin('league.leagues as l', 'l.id', 's.league_id')
@@ -114,8 +117,8 @@ export class PublicService {
       .select(['l.slug as league_slug', 'l.name as league_name', 'l.time_zone', 's.slug as season_slug', 'd.id as division_id', 'd.name as division_name'])
       .where('l.published_at', 'is not', null).where('l.slug', 'is not', null).where('l.archived_at', 'is', null).where('o.archived_at', 'is', null)
       .where('s.status', 'in', PUBLIC_SEASON_STATUSES).where('s.archived_at', 'is', null)
-      .where('g.status', '=', 'scheduled').where('g.scheduled_at', '>=', sql<Date>`now()`).where('g.scheduled_at', '<', sql<Date>`now() + interval '7 days'`)
-      .orderBy('g.scheduled_at').orderBy('g.id').limit(limit).execute());
+      .where((eb) => eb.or([eb('g.status', '=', 'live'), eb.and([eb('g.status', '=', 'scheduled'), eb('g.scheduled_at', '>=', sql<Date>`now()`), eb('g.scheduled_at', '<', sql<Date>`now() + interval '7 days'`)])]))
+      .orderBy(sql`g.status = 'live'`, 'desc').orderBy('g.scheduled_at').orderBy('g.id').limit(limit).execute());
     return rows.map((row) => ({ ...gameView(row), league: { slug: row.league_slug!, name: row.league_name, timeZone: row.time_zone }, season: { slug: row.season_slug }, division: { id: row.division_id, name: row.division_name } }));
   }
 
@@ -161,7 +164,9 @@ export class PublicService {
         'g.home_seed', 'g.away_seed', 'g.home_source_game_id', 'g.home_source_outcome', 'g.away_source_game_id', 'g.away_source_outcome',
         'h.id as home_id', 'ht.id as home_team_id', 'ht.name as home_name', 'ht.abbreviation as home_abbreviation',
         'a.id as away_id', 'at.id as away_team_id', 'at.name as away_name', 'at.abbreviation as away_abbreviation',
-        'v.name as venue_name', 'v.address as venue_address']);
+        'v.name as venue_name', 'v.address as venue_address',
+        sql<number | null>`(select coalesce(sum(e.points), 0)::int from league.game_events e where e.game_id = g.id and e.voided_at is null and e.season_team_id = g.home_season_team_id)`.as('live_home_score'),
+        sql<number | null>`(select coalesce(sum(e.points), 0)::int from league.game_events e where e.game_id = g.id and e.voided_at is null and e.season_team_id = g.away_season_team_id)`.as('live_away_score')]);
   }
 
   private divisionGames(seasonId: string, divisionId: string): Promise<GameRow[]> {
@@ -200,7 +205,7 @@ export class PublicService {
     const { division, teams, games } = await this.divisionData(leagueSlug, seasonSlug, divisionId);
     if (teamId && !teams.some((team) => team.id === teamId)) throw new NotFoundException();
     let rows = teamId ? games.filter((game) => game.home_id === teamId || game.away_id === teamId) : games;
-    if (view === 'upcoming') rows = rows.filter((game) => game.status === 'scheduled');
+    if (view === 'upcoming') rows = rows.filter((game) => game.status !== 'completed');
     if (view === 'results') rows = rows.filter((game) => game.status === 'completed').reverse();
     return { division, games: rows.map(gameView) };
   }
@@ -245,5 +250,20 @@ export class PublicService {
       stats: teamStats([team], results)[0],
       games: games.filter((game) => game.home_id === seasonTeamId || game.away_id === seasonTeamId).map(gameView),
     };
+  }
+
+  // One game with its live state, box score and recent plays. Player names and stats are public once a league is published.
+  async game(leagueSlug: string, seasonSlug: string, gameId: string) {
+    const { league, season } = await this.resolveSeason(leagueSlug, seasonSlug);
+    const game = await this.db.selectFrom('league.games').select('id').where('id', '=', gameId).where('season_id', '=', season.id).executeTakeFirst();
+    if (!game) throw new NotFoundException();
+    return { league: leagueView(league), season: seasonView(season), game: await liveSnapshot(this.db, gameId, false) };
+  }
+
+  // A live stream is only opened for games in published leagues and their visible seasons.
+  async publishedGame(gameId: string) {
+    const game = await this.db.selectFrom('league.games as g').innerJoin('league.seasons as s', 's.id', 'g.season_id').select(['s.league_id']).where('g.id', '=', gameId)
+      .where('s.status', 'in', PUBLIC_SEASON_STATUSES).where('s.archived_at', 'is', null).executeTakeFirst();
+    if (!game || !await this.leagues().where('l.id', '=', game.league_id).executeTakeFirst()) throw new NotFoundException();
   }
 }
