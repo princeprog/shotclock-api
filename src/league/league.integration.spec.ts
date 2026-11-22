@@ -590,4 +590,63 @@ databaseTests('league management against isolated PostgreSQL', () => {
     expect(standings[0]).toMatchObject({ name: 'B', wins: 1, losses: 0, pointDifference: 10 });
     await get(`/seasons/${season.id}/dashboard`, other).expect(404);
   });
+  it('summarizes the whole season for the overview', async () => {
+    const owner = await login();
+    const other = await login();
+    const post = (url: string, body: object) => request(app.getHttpServer()).post(`/league${url}`).set('Authorization', owner).send(body);
+    const get = (url: string, auth = owner) => request(app.getHttpServer()).get(`/league${url}`).set('Authorization', auth);
+    const db = app.get(DatabaseService).db;
+    const org = (await post('/organizations', { name: 'Overview' }).expect(201)).body;
+    const league = (await post(`/organizations/${org.id}/leagues`, { name: 'Overview league' }).expect(201)).body;
+    const season = (await post(`/leagues/${league.id}/seasons`, { name: 'Overview season', startDate: '2026-01-01' }).expect(201)).body;
+    const open = (await get(`/seasons/${season.id}/divisions`).expect(200)).body.find((item: { name: string }) => item.name === 'Open');
+    const seniors = (await post(`/seasons/${season.id}/divisions`, { name: 'Seniors' }).expect(201)).body;
+    for (const name of ['Aces', 'Bolts', 'Comets', 'Drift']) await post(`/leagues/${league.id}/teams`, { name, seasonId: season.id, divisionId: open.id }).expect(201);
+    for (const name of ['Elders', 'Founders']) await post(`/leagues/${league.id}/teams`, { name, seasonId: season.id, divisionId: seniors.id }).expect(201);
+    const openTeams = (await get(`/seasons/${season.id}/teams?divisionId=${open.id}`).expect(200)).body as { id: string; name: string }[];
+    const seniorTeams = (await get(`/seasons/${season.id}/teams?divisionId=${seniors.id}`).expect(200)).body as { id: string; name: string }[];
+    const [aces, bolts, comets, drift] = openTeams;
+    for (let index = 0; index < 5; index += 1) {
+      const player = (await post(`/organizations/${org.id}/players`, { firstName: 'Player', lastName: String(index), dateOfBirth: '2000-01-01' }).expect(201)).body;
+      await post(`/season-teams/${aces.id}/roster`, { playerId: player.id }).expect(201);
+    }
+    const venue = (await post(`/leagues/${league.id}/venues`, { name: 'Main gym' }).expect(201)).body;
+    const hours = (value: number) => new Date(Date.now() + value * 3_600_000);
+    const schedule = await db.insertInto('league.division_schedules').values({ division_id: open.id, format: 'single', playoffs: true, third_place: false, team_ids: openTeams.map((team) => team.id) }).returning('id').executeTakeFirstOrThrow();
+    const game = (values: object) => db.insertInto('league.games').values({ season_id: season.id, venue_id: venue.id, duration_minutes: 60, ...values } as never).returning('id').executeTakeFirstOrThrow();
+    const played = await game({ division_id: open.id, schedule_id: schedule.id, round: 1, stage: 'preliminary', status: 'completed', home_season_team_id: aces.id, away_season_team_id: bolts.id, home_score: 80, away_score: 70, scheduled_at: hours(-72) });
+    const unscored = await game({ division_id: open.id, schedule_id: schedule.id, round: 1, stage: 'preliminary', status: 'scheduled', home_season_team_id: comets.id, away_season_team_id: drift.id, scheduled_at: hours(-48) });
+    const next = await game({ division_id: open.id, schedule_id: schedule.id, round: 2, stage: 'preliminary', status: 'scheduled', home_season_team_id: aces.id, away_season_team_id: comets.id, scheduled_at: hours(48) });
+    const semifinalOne = await game({ division_id: open.id, schedule_id: schedule.id, stage: 'semifinal', status: 'scheduled', home_seed: 1, away_seed: 4, scheduled_at: hours(120) });
+    const semifinalTwo = await game({ division_id: open.id, schedule_id: schedule.id, stage: 'semifinal', status: 'scheduled', home_seed: 2, away_seed: 3, scheduled_at: hours(122) });
+    const championship = await game({ division_id: open.id, schedule_id: schedule.id, stage: 'final', status: 'scheduled', home_source_game_id: semifinalOne.id, home_source_outcome: 'winner', away_source_game_id: semifinalTwo.id, away_source_outcome: 'winner', scheduled_at: hours(168) });
+    const seniorGame = await game({ division_id: seniors.id, stage: 'preliminary', status: 'completed', home_season_team_id: seniorTeams[0].id, away_season_team_id: seniorTeams[1].id, home_score: 60, away_score: 65, scheduled_at: hours(-24) });
+
+    const overview = (await get(`/seasons/${season.id}/dashboard`).expect(200)).body;
+    expect(overview.totals).toEqual({ divisions: 2, teams: 6, players: 5, venues: 1, games: 7, completedGames: 2 });
+    expect(overview.upcoming.map((item: { id: string }) => item.id)).toEqual([next.id, semifinalOne.id, semifinalTwo.id, championship.id]);
+    expect(overview.upcoming[1]).toMatchObject({ home_name: '1st seed', away_name: '4th seed', division_name: 'Open', venue_name: 'Main gym' });
+    expect(overview.awaitingResults).toMatchObject({ count: 1, games: [{ id: unscored.id, home_name: 'Comets', away_name: 'Drift' }] });
+    expect(overview.recent.map((item: { id: string }) => item.id)).toEqual([seniorGame.id, played.id]);
+    expect(overview.shortRosters.count).toBe(5);
+    expect(overview.shortRosters.teams).toHaveLength(5);
+    expect(overview.shortRosters.teams.map((team: { name: string }) => team.name)).not.toContain('Aces');
+    expect(overview.divisions.map((division: { name: string }) => division.name)).toEqual(['Open', 'Seniors']);
+    expect(overview.divisions[0]).toMatchObject({ teams: 4, players: 5, games: 6, completedGames: 1, scheduled: true, playoffs: { stage: 'waiting', nextGame: { id: semifinalOne.id }, champion: null } });
+    expect(overview.divisions[0].standings[0]).toMatchObject({ name: 'Aces', wins: 1, losses: 0 });
+    expect(overview.divisions[1]).toMatchObject({ teams: 2, games: 1, completedGames: 1, scheduled: true, playoffs: null });
+    expect(overview.divisions[1].standings[0]).toMatchObject({ name: 'Founders', wins: 1 });
+
+    const finish = (id: string, values: object) => db.updateTable('league.games').set({ status: 'completed', ...values } as never).where('id', '=', id).execute();
+    await finish(unscored.id, { home_score: 70, away_score: 60 });
+    await finish(next.id, { home_score: 75, away_score: 65 });
+    const stage = async () => (await get(`/seasons/${season.id}/dashboard`).expect(200)).body.divisions[0].playoffs;
+    expect(await stage()).toMatchObject({ stage: 'semifinals', nextGame: { id: semifinalOne.id } });
+    await finish(semifinalOne.id, { home_season_team_id: aces.id, away_season_team_id: drift.id, home_score: 90, away_score: 80 });
+    await finish(semifinalTwo.id, { home_season_team_id: comets.id, away_season_team_id: bolts.id, home_score: 85, away_score: 80 });
+    expect(await stage()).toMatchObject({ stage: 'final', nextGame: { id: championship.id } });
+    await finish(championship.id, { home_season_team_id: aces.id, away_season_team_id: comets.id, home_score: 70, away_score: 72 });
+    expect(await stage()).toEqual({ stage: 'complete', nextGame: null, champion: 'Comets' });
+    await get(`/seasons/${season.id}/dashboard`, other).expect(404);
+  });
 });

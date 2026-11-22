@@ -13,6 +13,6 @@ import { SecurityEventsService } from '../common/security-events.service';
   imports: [JwtModule.register({})],
   controllers: [AuthController],
   providers: [DatabaseService, AuthService, AuthMailer, AuthRateLimitGuard, AuthCleanup, RateLimitService, SecurityEventsService],
-  exports: [AuthService, DatabaseService, RateLimitService, SecurityEventsService],
+  exports: [AuthService, AuthMailer, DatabaseService, RateLimitService, SecurityEventsService],
 })
 export class AuthModule {}

@@ -1,7 +1,7 @@
 import { databaseSsl } from '../database/database-ssl';
 import { leagueBucket } from '../league/league-rate-limit.guard';
 
-const limits = { read: 300, write: 60, schedule: 20, anonymous: 60 };
+const limits = { read: 300, write: 60, schedule: 20, live: 600, anonymous: 60 };
 const env = (values: Record<string, string>) => ({ get: (key: string) => values[key] });
 
 describe('league rate limit buckets', () => {
@@ -11,6 +11,8 @@ describe('league rate limit buckets', () => {
     }
   });
   it('separates reads, other writes and anonymous requests', () => {
+    expect(leagueBucket('POST', '/league/games/g/live/events', true, limits)).toEqual(['live', 600]);
+    expect(leagueBucket('GET', '/league/games/g/live', true, limits)).toEqual(['live', 600]);
     expect(leagueBucket('GET', '/league/seasons/s/schedule/status', true, limits)).toEqual(['read', 300]);
     expect(leagueBucket('PATCH', '/league/games/g', true, limits)).toEqual(['write', 60]);
     expect(leagueBucket('DELETE', '/league/teams/t', true, limits)).toEqual(['write', 60]);

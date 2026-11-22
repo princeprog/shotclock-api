@@ -19,6 +19,15 @@ const sortDirection = (dir?: 'asc' | 'desc') => sql.raw(dir === 'desc' ? 'desc' 
 
 type Database = Kysely<DB> | Transaction<DB>;
 const seasonDates = [sql<string | null>`start_date::text`.as('start_date'), sql<string | null>`end_date::text`.as('end_date')] as const;
+// Whether a game was scored live, the running score of a live game, and the best player of a finished one, for game lists.
+// The best player lookup uses the partial unique index on player_game_stats(game_id) where best_player.
+export const liveColumns = [
+  sql<boolean>`exists (select 1 from league.game_live_states ls where ls.game_id = g.id)`.as('live_scored'),
+  sql<number | null>`(select coalesce(sum(e.points), 0)::int from league.game_events e where e.game_id = g.id and e.voided_at is null and e.season_team_id = g.home_season_team_id)`.as('live_home_score'),
+  sql<number | null>`(select coalesce(sum(e.points), 0)::int from league.game_events e where e.game_id = g.id and e.voided_at is null and e.season_team_id = g.away_season_team_id)`.as('live_away_score'),
+  sql<{ name: string; points: number; rebounds: number; assists: number } | null>`(select json_build_object('name', p.first_name || ' ' || p.last_name, 'points', pgs.points, 'rebounds', pgs.rebounds, 'assists', pgs.assists)
+    from league.player_game_stats pgs join league.rosters r on r.id = pgs.roster_id join league.players p on p.id = r.player_id where pgs.game_id = g.id and pgs.best_player)`.as('best_player'),
+] as const;
 
 @Injectable()
 export class LeagueService {
@@ -123,6 +132,8 @@ export class LeagueService {
     if (!seasonIds.length) return false;
     const result = await db.selectFrom('league.games').select('id').where('season_id', 'in', seasonIds).where('status', '=', 'completed').executeTakeFirst();
     if (result) return true;
+    const play = await db.selectFrom('league.game_events as e').innerJoin('league.games as g', 'g.id', 'e.game_id').select('e.id').where('g.season_id', 'in', seasonIds).executeTakeFirst();
+    if (play) return true;
     const stat = await db.selectFrom('league.player_game_stats as pgs').innerJoin('league.games as g', 'g.id', 'pgs.game_id').select('pgs.id').where('g.season_id', 'in', seasonIds).executeTakeFirst();
     return !!stat;
   }
@@ -135,6 +146,8 @@ export class LeagueService {
     const games = db.selectFrom('league.games').select('id').where('season_id', 'in', seasonIds);
     const rosters = db.selectFrom('league.rosters').select('id').where('season_id', 'in', seasonIds);
     await db.deleteFrom('league.player_game_stats').where((eb) => eb.or([eb('game_id', 'in', games), eb('roster_id', 'in', rosters)])).execute();
+    await db.deleteFrom('league.game_events').where('game_id', 'in', games).execute();
+    await db.deleteFrom('league.game_live_states').where('game_id', 'in', games).execute();
     await db.deleteFrom('league.games').where('season_id', 'in', seasonIds).execute();
     await db.deleteFrom('league.division_schedules').where('division_id', 'in', db.selectFrom('league.divisions').select('id').where('season_id', 'in', seasonIds)).execute();
     await db.deleteFrom('league.rosters').where('season_id', 'in', seasonIds).execute();
@@ -150,6 +163,7 @@ export class LeagueService {
     await db.deleteFrom('league.teams').where('league_id', 'in', leagueIds).execute();
     await db.deleteFrom('league.venues').where('league_id', 'in', leagueIds).execute();
     await db.deleteFrom('league.league_members').where('league_id', 'in', leagueIds).execute();
+    await db.deleteFrom('league.invitations').where('league_id', 'in', leagueIds).execute();
     await db.deleteFrom('league.leagues').where('id', 'in', leagueIds).execute();
   }
   private async seasonIdsForLeagues(db: Database, leagueIds: string[]) {
@@ -271,7 +285,12 @@ export class LeagueService {
   }
   async createLeague(user: string, org: string, dto: LeagueDto) { await this.org(user, org); return this.db.insertInto('league.leagues').values({ organization_id: org, name: this.name(dto.name), location: dto.location?.trim() || null, time_zone: this.timeZone(dto.timeZone) }).returningAll().executeTakeFirstOrThrow(); }
   async getLeague(user: string, id: string) { return this.league(user, id); }
-  async editLeague(user: string, id: string, dto: LeagueDto) { const league = await this.league(user, id); return this.db.updateTable('league.leagues').set({ name: this.name(dto.name), location: dto.location?.trim() || null, time_zone: dto.timeZone === undefined ? league.time_zone : this.timeZone(dto.timeZone), updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow(); }
+  async editLeague(user: string, id: string, dto: LeagueDto) {
+    const league = await this.league(user, id);
+    return this.db.updateTable('league.leagues').set({ name: this.name(dto.name), location: dto.location?.trim() || null, time_zone: dto.timeZone === undefined ? league.time_zone : this.timeZone(dto.timeZone),
+      period_count: dto.periodCount ?? league.period_count, period_minutes: dto.periodMinutes ?? league.period_minutes, overtime_minutes: dto.overtimeMinutes ?? league.overtime_minutes, bonus_fouls: dto.bonusFouls ?? league.bonus_fouls,
+      updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow();
+  }
   // Publishing shows the league on the public website. The first publish derives a web address from the league name.
   async publication(user: string, id: string, dto: PublicationDto) { return this.db.transaction().execute(async (tx) => {
     const league = await this.league(user, id, tx);
@@ -582,7 +601,7 @@ export class LeagueService {
     await this.venue(user, id);
     return this.db.updateTable('league.venues').set({ name: this.name(dto.name), address: dto.address?.trim() || null, updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow();
   }
-  async games(user: string, season: string, divisionId?: string) { await this.season(user, season); const division = await this.divisionForSeason(season, divisionId); return this.db.selectFrom('league.games as g').leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id').leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id').leftJoin('league.venues as v', 'v.id', 'g.venue_id').selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name']).where('g.season_id', '=', season).where('g.division_id', '=', division.id).orderBy('g.scheduled_at', 'asc').execute().then((rows) => labelPending(this.db, rows)); }
+  async games(user: string, season: string, divisionId?: string) { await this.season(user, season); const division = await this.divisionForSeason(season, divisionId); return this.db.selectFrom('league.games as g').leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id').leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id').leftJoin('league.venues as v', 'v.id', 'g.venue_id').selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name']).select(liveColumns).where('g.season_id', '=', season).where('g.division_id', '=', division.id).orderBy('g.scheduled_at', 'asc').execute().then((rows) => labelPending(this.db, rows)); }
   async filteredGames(user: string, id: string, filters: GameFilterDto) {
     const season = await this.season(user, id);
     if (filters.scope === 'season' && filters.divisionId) throw new BadRequestException('Choose either season scope or a division');
@@ -592,9 +611,10 @@ export class LeagueService {
     const date = (value?: string) => { if (!value) return undefined; if (!/(Z|[+-]\d\d:\d\d)$/.test(value) || Number.isNaN(Date.parse(value))) throw new BadRequestException('Date filters must include a timezone'); return new Date(value); };
     const from = date(filters.from); const to = date(filters.to);
     if (from && to && from >= to) throw new BadRequestException('Invalid date range');
-    let query = this.db.selectFrom('league.games as g').innerJoin('league.divisions as d', 'd.id', 'g.division_id').leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id').leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id').leftJoin('league.venues as v', 'v.id', 'g.venue_id').selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name', 'd.name as division_name']).where('g.season_id', '=', id);
+    let query = this.db.selectFrom('league.games as g').innerJoin('league.divisions as d', 'd.id', 'g.division_id').leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id').leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id').leftJoin('league.venues as v', 'v.id', 'g.venue_id').selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name', 'd.name as division_name']).select(liveColumns).where('g.season_id', '=', id);
     if (division) query = query.where('g.division_id', '=', division.id);
-    if (filters.status) query = query.where('g.status', '=', filters.status);
+    // Live games stay with the scheduled games until they are final.
+    if (filters.status) query = query.where('g.status', 'in', filters.status === 'scheduled' ? ['scheduled', 'live'] : ['completed']);
     if (filters.teamId) { const teamId = filters.teamId; query = query.where((eb) => eb.or([eb('g.home_season_team_id', '=', teamId), eb('g.away_season_team_id', '=', teamId)])); }
     if (filters.venueId) query = query.where('g.venue_id', '=', filters.venueId);
     if (from) query = query.where('g.scheduled_at', '>=', from);
@@ -623,7 +643,7 @@ export class LeagueService {
     const initial = await tx.selectFrom('league.games').select(['season_id']).where('id', '=', id).executeTakeFirst(); if (!initial) throw new NotFoundException();
     const season = await this.season(user, initial.season_id, tx, true); this.editable(season.status); await this.scheduleLock(season.league_id, tx);
     const game = await tx.selectFrom('league.games').selectAll().where('id', '=', id).executeTakeFirstOrThrow();
-    if (game.status !== 'scheduled') throw new BadRequestException('A completed game cannot be rescheduled');
+    if (game.status !== 'scheduled') throw new BadRequestException(game.status === 'live' ? 'A live game cannot be rescheduled' : 'A completed game cannot be rescheduled');
     const pending = !game.home_season_team_id || !game.away_season_team_id;
     if (game.schedule_id && ((dto.homeTeamId ?? game.home_season_team_id) !== game.home_season_team_id || (dto.awayTeamId ?? game.away_season_team_id) !== game.away_season_team_id)) throw new BadRequestException('Generated game participants cannot be changed');
     const values = await this.gameValues(user, season, dto, tx, game.schedule_id || pending ? { division_id: game.division_id, home: game.home_season_team_id, away: game.away_season_team_id } : undefined);
@@ -704,7 +724,7 @@ export class LeagueService {
     const waiting = await tx.selectFrom('league.games').select(['id', 'home_seed', 'away_seed']).where('division_id', '=', divisionId).where('stage', '=', 'semifinal')
       .where('home_season_team_id', 'is', null).where('home_seed', 'is not', null).where('away_seed', 'is not', null).execute();
     if (!waiting.length) return;
-    const unplayed = await tx.selectFrom('league.games').select('id').where('division_id', '=', divisionId).where('stage', '=', 'preliminary').where('status', '=', 'scheduled').executeTakeFirst();
+    const unplayed = await tx.selectFrom('league.games').select('id').where('division_id', '=', divisionId).where('stage', '=', 'preliminary').where('status', '!=', 'completed').executeTakeFirst();
     if (unplayed) return;
     const standings = await this.preliminaryStandings(tx, seasonId, divisionId);
     if (standings.length < 4) throw new BadRequestException('Playoffs need at least four teams');
@@ -753,11 +773,17 @@ export class LeagueService {
     }
     return saved;
   }
+  // Live scoring finishes a game through the same result path as a manual score.
+  recordGameResult(tx: Transaction<DB>, seasonId: string, game: Selectable<DB['league.games']>, dto: ScoreDto) {
+    return this.writeGameResult(tx, seasonId, game, dto, null);
+  }
   async score(user: string, id: string, dto: ScoreDto) { return this.db.transaction().execute(async (tx) => {
     const initial = await tx.selectFrom('league.games').select(['season_id']).where('id', '=', id).executeTakeFirst(); if (!initial) throw new NotFoundException();
     const season = await this.season(user, initial.season_id, tx, true);
     const game = await tx.selectFrom('league.games').selectAll().where('id', '=', id).executeTakeFirstOrThrow();
     if (season.status === 'draft' || (season.status === 'completed' && game.status !== 'completed')) throw new BadRequestException('Season is not active');
+    const live = await tx.selectFrom('league.game_live_states').select('game_id').where('game_id', '=', id).executeTakeFirst();
+    if (live) throw new BadRequestException('This game is scored live. Reopen it in the scorekeeper console to correct it.');
     return this.writeGameResult(tx, season.id, game, dto, null);
   }); }
   async forfeit(user: string, id: string, dto: ForfeitDto) { return this.db.transaction().execute(async (tx) => {
@@ -767,6 +793,8 @@ export class LeagueService {
     const game = await tx.selectFrom('league.games').selectAll().where('id', '=', id).executeTakeFirstOrThrow();
     if (season.status === 'draft' || (season.status === 'completed' && game.status !== 'completed')) throw new BadRequestException('Season is not active');
     if (game.status === 'completed' && !game.forfeited_by_season_team_id) throw new BadRequestException('A played result cannot be marked as a forfeit');
+    const live = await tx.selectFrom('league.game_live_states').select('game_id').where('game_id', '=', id).executeTakeFirst();
+    if (live) throw new BadRequestException('This game is scored live. Reopen it in the scorekeeper console to correct it.');
     if (!game.home_season_team_id || !game.away_season_team_id) throw new BadRequestException('Both teams must be known before recording a result');
     if (dto.forfeitingTeamId !== game.home_season_team_id && dto.forfeitingTeamId !== game.away_season_team_id) throw new BadRequestException('The forfeiting team must be a participant in this game');
     const stats = await tx.selectFrom('league.player_game_stats').select('id').where('game_id', '=', id).executeTakeFirst();
@@ -779,5 +807,72 @@ export class LeagueService {
     const division = await this.divisionForSeason(season, divisionId);
     return this.preliminaryStandings(this.db, season, division.id);
   }
-  async dashboard(user: string, season: string, divisionId?: string) { await this.season(user, season); const division = await this.divisionForSeason(season, divisionId); const [teams, games, standings] = await Promise.all([this.seasonTeams(user, season, division.id), this.games(user, season, division.id), this.standings(user, season, division.id)]); return { teamCount: teams.length, upcoming: games.filter((g) => g.status === 'scheduled' && g.scheduled_at !== null && new Date(g.scheduled_at).getTime() >= Date.now()), recent: games.filter((g) => g.status === 'completed').reverse(), standings }; }
+  // Season-wide summary for the Overview page: totals, the next and latest games, games that ended without a score,
+  // registrations with short rosters, and each division's progress, standings and playoff stage.
+  async dashboard(user: string, seasonId: string) {
+    const season = await this.season(user, seasonId);
+    const [divisions, registrations, venues, games] = await Promise.all([
+      this.db.selectFrom('league.divisions as d').leftJoin('league.division_schedules as ds', 'ds.division_id', 'd.id')
+        .select(['d.id', 'd.name', 'ds.id as schedule_id']).where('d.season_id', '=', seasonId).orderBy('d.created_at').orderBy('d.name').execute(),
+      this.db.selectFrom('league.season_teams as st').innerJoin('league.teams as t', 't.id', 'st.team_id').innerJoin('league.divisions as d', 'd.id', 'st.division_id')
+        .leftJoin('league.rosters as r', 'r.season_team_id', 'st.id')
+        .select(['st.id', 'st.division_id', 't.name', 'd.name as division_name', sql<number>`count(r.id)::int`.as('players')])
+        .where('st.season_id', '=', seasonId).groupBy(['st.id', 't.name', 'd.name']).orderBy('t.name').execute(),
+      this.db.selectFrom('league.venues').select(sql<number>`count(*)::int`.as('count')).where('league_id', '=', season.league_id).executeTakeFirstOrThrow(),
+      this.db.selectFrom('league.games as g').innerJoin('league.divisions as d', 'd.id', 'g.division_id')
+        .leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id')
+        .leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id')
+        .leftJoin('league.venues as v', 'v.id', 'g.venue_id')
+        .selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name', 'd.name as division_name']).select(liveColumns)
+        .where('g.season_id', '=', seasonId).orderBy('g.scheduled_at', 'asc').orderBy('g.id').execute().then((rows) => labelPending(this.db, rows)),
+    ]);
+    const [standings, playerRows] = await Promise.all([
+      Promise.all(divisions.map((division) => this.preliminaryStandings(this.db, seasonId, division.id))),
+      this.db.selectFrom('league.player_game_stats as pgs').innerJoin('league.games as g', 'g.id', 'pgs.game_id').innerJoin('league.rosters as r', 'r.id', 'pgs.roster_id')
+        .innerJoin('league.players as p', 'p.id', 'r.player_id').innerJoin('league.season_teams as st', 'st.id', 'r.season_team_id').innerJoin('league.teams as t', 't.id', 'st.team_id').innerJoin('league.divisions as d', 'd.id', 'st.division_id')
+        .select(['r.id', 'p.first_name', 'p.last_name', 't.name as team_name', 'd.name as division_name', sql<number>`count(distinct pgs.game_id)::int`.as('games'),
+          sql<number>`sum(pgs.points)::int`.as('points'), sql<number>`sum(pgs.rebounds)::int`.as('rebounds'), sql<number>`sum(pgs.assists)::int`.as('assists')])
+        .where('g.season_id', '=', seasonId).where('g.status', '=', 'completed').groupBy(['r.id', 'p.first_name', 'p.last_name', 't.name', 'd.name']).execute(),
+    ]);
+    // The season's top five per-game scorers, rebounders and passers across all divisions.
+    const leaders = Object.fromEntries((['points', 'rebounds', 'assists'] as const).map((key) => [key, playerRows
+      .map((row) => ({ rosterId: row.id, name: `${row.first_name} ${row.last_name}`, teamName: row.team_name, divisionName: row.division_name, games: row.games, perGame: Math.round((row[key] / row.games) * 10) / 10 }))
+      .filter((row) => row.perGame > 0).sort((a, b) => b.perGame - a.perGame || a.name.localeCompare(b.name)).slice(0, 5)]));
+    const now = Date.now();
+    const startsAt = (game: (typeof games)[number]) => game.scheduled_at ? new Date(game.scheduled_at).getTime() : null;
+    const hasEnded = (game: (typeof games)[number]) => { const start = startsAt(game); return start !== null && start + (game.duration_minutes ?? 60) * 60_000 <= now; };
+    const completed = games.filter((game) => game.status === 'completed');
+    const awaiting = games.filter((game) => game.status === 'scheduled' && game.home_season_team_id && game.away_season_team_id && hasEnded(game));
+    const shortRosters = registrations.filter((registration) => registration.players < 5);
+    return {
+      totals: { divisions: divisions.length, teams: registrations.length, players: registrations.reduce((sum, registration) => sum + registration.players, 0),
+        venues: venues.count, games: games.length, completedGames: completed.length },
+      live: games.filter((game) => game.status === 'live'),
+      leaders,
+      upcoming: games.filter((game) => game.status === 'scheduled' && (startsAt(game) ?? -1) >= now).slice(0, 6),
+      awaitingResults: { count: awaiting.length, games: awaiting.slice(0, 5) },
+      recent: [...completed].sort((a, b) => (startsAt(b) ?? 0) - (startsAt(a) ?? 0)).slice(0, 5),
+      shortRosters: { count: shortRosters.length, teams: shortRosters.slice(0, 5).map((registration) => ({ seasonTeamId: registration.id, name: registration.name, divisionName: registration.division_name, players: registration.players })) },
+      divisions: divisions.map((division, index) => {
+        const divisionGames = games.filter((game) => game.division_id === division.id);
+        const divisionTeams = registrations.filter((registration) => registration.division_id === division.id);
+        return { id: division.id, name: division.name, teams: divisionTeams.length, players: divisionTeams.reduce((sum, registration) => sum + registration.players, 0),
+          games: divisionGames.length, completedGames: divisionGames.filter((game) => game.status === 'completed').length,
+          scheduled: !!division.schedule_id || divisionGames.length > 0, playoffs: this.playoffStatus(divisionGames), standings: standings[index] };
+      }),
+    };
+  }
+  // A division's playoff stage: waiting for the round robin, semifinals, the championship, or complete with a champion.
+  private playoffStatus<T extends { stage: string; status: string; home_name: string; away_name: string; home_score: number | null; away_score: number | null }>(games: T[]) {
+    const playoffGames = games.filter((game) => game.stage !== 'preliminary');
+    if (!playoffGames.length) return null;
+    const championship = playoffGames.find((game) => game.stage === 'final');
+    if (championship?.status === 'completed') {
+      return { stage: 'complete' as const, nextGame: null, champion: championship.home_score! > championship.away_score! ? championship.home_name : championship.away_name };
+    }
+    const roundRobinLeft = games.some((game) => game.stage === 'preliminary' && game.status !== 'completed');
+    const semifinalsLeft = playoffGames.some((game) => game.stage === 'semifinal' && game.status !== 'completed');
+    const stage = roundRobinLeft ? 'waiting' as const : semifinalsLeft ? 'semifinals' as const : 'final' as const;
+    return { stage, nextGame: playoffGames.find((game) => game.status !== 'completed') ?? null, champion: null };
+  }
 }

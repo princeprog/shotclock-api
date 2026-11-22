@@ -94,6 +94,42 @@ export interface LeagueDivisionSchedules {
   third_place: boolean;
 }
 
+export interface LeagueGameEvents {
+  client_recorded_at: Timestamp | null;
+  clock_ms: number | null;
+  created_at: Generated<Timestamp>;
+  device_id: string | null;
+  game_id: string;
+  id: string;
+  kind: string;
+  period: number;
+  points: number | null;
+  recorded_by_user_id: string | null;
+  roster_id: string | null;
+  season_team_id: string | null;
+  sequence: number;
+  voided_at: Timestamp | null;
+  voided_by_user_id: string | null;
+}
+
+export interface LeagueGameLiveStates {
+  bonus_fouls: number;
+  clock_remaining_ms: number;
+  clock_running_since: Timestamp | null;
+  finished_at: Timestamp | null;
+  game_id: string;
+  overtime_minutes: number;
+  period: Generated<number>;
+  period_count: number;
+  period_minutes: number;
+  scorer_device_id: string | null;
+  scorer_user_id: string | null;
+  started_at: Generated<Timestamp>;
+  started_by_user_id: string | null;
+  updated_at: Generated<Timestamp>;
+  version: Generated<number>;
+}
+
 export interface LeagueGames {
   away_score: number | null;
   away_season_team_id: string | null;
@@ -133,6 +169,20 @@ export interface LeagueGameScheduleChanges {
   old_venue_id: string | null;
 }
 
+export interface LeagueInvitations {
+  accepted_at: Timestamp | null;
+  accepted_by_user_id: string | null;
+  created_at: Generated<Timestamp>;
+  email: string;
+  expires_at: Timestamp;
+  id: Generated<string>;
+  invited_by_user_id: string;
+  league_id: string;
+  revoked_at: Timestamp | null;
+  role: Generated<string>;
+  token_hash: string;
+}
+
 export interface LeagueLeagueMembers {
   created_at: Generated<Timestamp>;
   id: Generated<string>;
@@ -144,11 +194,15 @@ export interface LeagueLeagueMembers {
 
 export interface LeagueLeagues {
   archived_at: Timestamp | null;
+  bonus_fouls: Generated<number>;
   created_at: Generated<Timestamp>;
   id: Generated<string>;
   location: string | null;
   name: string;
   organization_id: string;
+  overtime_minutes: Generated<number>;
+  period_count: Generated<number>;
+  period_minutes: Generated<number>;
   published_at: Timestamp | null;
   slug: string | null;
   time_zone: string | null;
@@ -171,6 +225,7 @@ export interface LeagueOrganizations {
 
 export interface LeaguePlayerGameStats {
   assists: Generated<number>;
+  best_player: Generated<boolean>;
   blocks: Generated<number>;
   created_at: Generated<Timestamp>;
   fouls: Generated<number>;
@@ -257,8 +312,11 @@ export interface DB {
   "auth.users": AuthUsers;
   "league.division_schedules": LeagueDivisionSchedules;
   "league.divisions": LeagueDivisions;
+  "league.game_events": LeagueGameEvents;
+  "league.game_live_states": LeagueGameLiveStates;
   "league.game_schedule_changes": LeagueGameScheduleChanges;
   "league.games": LeagueGames;
+  "league.invitations": LeagueInvitations;
   "league.league_members": LeagueLeagueMembers;
   "league.leagues": LeagueLeagues;
   "league.organization_players": LeagueOrganizationPlayers;

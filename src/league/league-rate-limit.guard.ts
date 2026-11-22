@@ -5,13 +5,16 @@ import { AuthService } from '../auth/auth.service';
 import { RateLimitService } from '../common/rate-limit.service';
 import { clientIp, trustedGateway, type TrustedGateway } from '../common/client-ip';
 
-export type LeagueLimits = { read: number; write: number; schedule: number; anonymous: number };
+export type LeagueLimits = { read: number; write: number; schedule: number; live: number; anonymous: number };
 const WINDOW_SECONDS = 60;
 // Schedule planning and saving can do heavy work, so they get the tightest budget.
 const SCHEDULE_ROUTE = /\/(schedule|playoffs)(\/(preview|estimate|suggest|validate|calendar))?$/;
+// Live scoring records a play every few seconds, so it has its own, larger budget.
+const LIVE_ROUTE = /^\/league\/games\/[^/]+\/live(\/|$)/;
 
 export function leagueBucket(method: string, path: string, authenticated: boolean, limits: LeagueLimits): [string, number] {
   if (!authenticated) return ['anonymous', limits.anonymous];
+  if (LIVE_ROUTE.test(path)) return ['live', limits.live];
   if (method !== 'GET' && SCHEDULE_ROUTE.test(path)) return ['schedule', limits.schedule];
   if (method === 'GET' || method === 'HEAD') return ['read', limits.read];
   return ['write', limits.write];
@@ -30,7 +33,7 @@ export class LeagueRateLimitGuard implements CanActivate {
   private readonly limits: LeagueLimits;
   constructor(private readonly counters: RateLimitService, private readonly auth: AuthService, config: ConfigService) {
     this.gateway = trustedGateway(config);
-    this.limits = { read: positive(config, 'LEAGUE_RATE_LIMIT_READ', 300), write: positive(config, 'LEAGUE_RATE_LIMIT_WRITE', 60), schedule: positive(config, 'LEAGUE_RATE_LIMIT_SCHEDULE', 20), anonymous: positive(config, 'LEAGUE_RATE_LIMIT_ANONYMOUS', 60) };
+    this.limits = { read: positive(config, 'LEAGUE_RATE_LIMIT_READ', 300), write: positive(config, 'LEAGUE_RATE_LIMIT_WRITE', 60), schedule: positive(config, 'LEAGUE_RATE_LIMIT_SCHEDULE', 20), live: positive(config, 'LEAGUE_RATE_LIMIT_LIVE', 600), anonymous: positive(config, 'LEAGUE_RATE_LIMIT_ANONYMOUS', 60) };
   }
 
   async canActivate(context: ExecutionContext): Promise<boolean> {

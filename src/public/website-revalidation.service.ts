@@ -7,12 +7,14 @@ type Resource = 'organizations' | 'leagues' | 'seasons' | 'divisions' | 'teams' 
 const RESOURCES = new Set<string>(['organizations', 'leagues', 'seasons', 'divisions', 'teams', 'season-teams', 'venues', 'games']);
 // Schedule planning requests only compute previews and change nothing.
 const DIAGNOSTIC_ROUTE = /\/(preview|estimate|validate|suggest|calendar)$/;
+// Individual plays, clock changes and takeovers change nothing on the website until a live game finishes.
+const LIVE_PLAY_ROUTE = /\/live\/(events|clock|period|claim)(\/|$)/;
 const ROUTE = /^\/league\/([a-z-]+)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\/|$)/i;
 
 export type Snapshot = { leagueIds: string[]; slugs: string[] };
 
 export function routeResource(method: string, path: string): { resource: Resource; id: string } | null {
-  if (['GET', 'HEAD', 'OPTIONS'].includes(method) || DIAGNOSTIC_ROUTE.test(path)) return null;
+  if (['GET', 'HEAD', 'OPTIONS'].includes(method) || DIAGNOSTIC_ROUTE.test(path) || LIVE_PLAY_ROUTE.test(path)) return null;
   const match = ROUTE.exec(path);
   if (!match || !RESOURCES.has(match[1])) return null;
   return { resource: match[1] as Resource, id: match[2].toLowerCase() };

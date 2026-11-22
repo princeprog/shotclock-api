@@ -5,11 +5,12 @@ import { PublicRateLimitGuard } from './public-rate-limit.guard';
 import { PublicRevalidationInterceptor } from './public-revalidation.interceptor';
 import { PublicService } from './public.service';
 import { WebsiteRevalidationService } from './website-revalidation.service';
+import { LiveStreamService } from './live-stream.service';
 
 @Module({
   imports: [AuthModule],
   controllers: [PublicController],
-  providers: [PublicService, PublicRateLimitGuard, WebsiteRevalidationService, PublicRevalidationInterceptor],
+  providers: [PublicService, PublicRateLimitGuard, WebsiteRevalidationService, PublicRevalidationInterceptor, LiveStreamService],
   exports: [WebsiteRevalidationService, PublicRevalidationInterceptor],
 })
 export class PublicModule {}

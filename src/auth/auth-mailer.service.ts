@@ -66,6 +66,13 @@ export class AuthMailer {
     await this.deliver(email, subject, text);
   }
 
+  // The token goes in the URL fragment, like authentication links, so it is not sent to servers or logs.
+  async sendInvitation(email: string, leagueName: string, inviterName: string, token: string): Promise<void> {
+    const url = new URL('/invitations/accept', this.frontend);
+    url.hash = new URLSearchParams({ token }).toString();
+    await this.deliver(email, `Keep score for ${leagueName}`, `${inviterName} invited you to keep score for ${leagueName} on Shotclock. This link expires in 7 days: ${url}`);
+  }
+
   private async deliver(email: string, subject: string, text: string): Promise<void> {
     try {
       await this.transport.sendMail({ from: this.from, to: email, subject, text });
