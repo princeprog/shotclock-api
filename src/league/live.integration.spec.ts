@@ -102,7 +102,8 @@ databaseTests('live scoring against isolated PostgreSQL', () => {
     await post(`${live}/events`, { deviceId: deviceB, events: [play('points', owls.id, roster[owls.id][1], { points: 1, period: 3 }), play('rebound', owls.id, roster[owls.id][1], { period: 3 })] }).expect(201);
     await post(`${live}/period`, { deviceId: deviceB }).expect(400);
     const finished = (await post(`${live}/finish`, { deviceId: deviceB }).expect(201)).body;
-    expect(finished).toMatchObject({ status: 'completed', finalScore: { home: 2, away: 3 } });
+    expect(finished).toMatchObject({ status: 'completed', finalScore: { home: 2, away: 3 },
+      periodScores: [{ period: 1, home: 0, away: 2 }, { period: 2, home: 2, away: 0 }, { period: 3, home: 0, away: 1 }] });
     // Both Owls scorers have an efficiency of 2, so the one with more points is the best player.
     expect(finished.bestPlayer).toMatchObject({ rosterId: roster[owls.id][0], seasonTeamId: owls.id, teamName: 'Owls', points: 2 });
     const stats = await db.selectFrom('league.player_game_stats').selectAll().where('game_id', '=', game.id).execute();

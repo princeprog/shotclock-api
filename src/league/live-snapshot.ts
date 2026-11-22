@@ -48,6 +48,14 @@ export async function liveSnapshot(db: Database, gameId: string, includeScorer =
   };
   const home = side(game.home_season_team_id, game.home_name);
   const away = side(game.away_season_team_id, game.away_name);
+  // Points per period for the line score, through the regulation periods and any overtime played.
+  const periodScores = Array.from({ length: state ? Math.max(period, format.period_count) : 0 }, (_, index) => ({ period: index + 1, home: 0, away: 0 }));
+  for (const event of counted) {
+    const line = periodScores[event.period - 1];
+    if (!line || !event.points) continue;
+    if (event.season_team_id === game.home_season_team_id) line.home += event.points;
+    else if (event.season_team_id === game.away_season_team_id) line.away += event.points;
+  }
   const names = new Map(rosters.map((roster) => [roster.id, `${roster.first_name} ${roster.last_name}`]));
   const bestSide = [home, away].find((side) => side.players.some((player) => player.rosterId === game.best_roster_id));
   const best = bestSide?.players.find((player) => player.rosterId === game.best_roster_id);
@@ -58,6 +66,7 @@ export async function liveSnapshot(db: Database, gameId: string, includeScorer =
     format: { periodCount: format.period_count, periodMinutes: format.period_minutes, overtimeMinutes: format.overtime_minutes, bonusFouls: format.bonus_fouls },
     period, clock: state ? { remainingMs: remaining(state, now), running: !!state.clock_running_since, serverTime: new Date(now).toISOString() } : null,
     home: { ...home, inBonus: away.teamFouls >= format.bonus_fouls }, away: { ...away, inBonus: home.teamFouls >= format.bonus_fouls },
+    periodScores,
     finalScore: game.status === 'completed' ? { home: game.home_score, away: game.away_score } : null,
     bestPlayer: bestSide && best ? { ...best, seasonTeamId: bestSide.seasonTeamId, teamName: bestSide.name } : null,
     plays: events.slice(-30).reverse().map((event) => ({ id: event.id, sequence: event.sequence, kind: event.kind, points: event.points, seasonTeamId: event.season_team_id, rosterId: event.roster_id,
