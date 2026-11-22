@@ -7,7 +7,8 @@ import { liveSnapshot } from '../league/live-snapshot';
 import { statLeaders, teamForm, teamStats, winPct, type ResultGame, type StatTeam } from './team-stats';
 
 // Read-only data for the public website. Only published leagues in unarchived organizations, and their
-// active or completed unarchived seasons, are visible; everything else is a 404. No player or account data is returned.
+// active or completed unarchived seasons, are visible; everything else is a 404. Players appear only by name,
+// jersey number and game stats; no account, birth date or contact data is returned.
 const PUBLIC_SEASON_STATUSES = ['active', 'completed'];
 const DIRECTORY_PAGE_SIZE = 12;
 
@@ -249,6 +250,7 @@ export class PublicService {
       standing: this.standingsRows(teams, games).rows.find((row) => row.team.id === seasonTeamId)!,
       stats: teamStats([team], results)[0],
       games: games.filter((game) => game.home_id === seasonTeamId || game.away_id === seasonTeamId).map(gameView),
+      players: await this.playerStats(season.id, { seasonTeamId }),
     };
   }
 
@@ -266,4 +268,35 @@ export class PublicService {
       .where('s.status', 'in', PUBLIC_SEASON_STATUSES).where('s.archived_at', 'is', null).executeTakeFirst();
     if (!game || !await this.leagues().where('l.id', '=', game.league_id).executeTakeFirst()) throw new NotFoundException();
   }
+
+  // Per-player totals and per-game averages from final games with recorded stats, best scorers first.
+  private async playerStats(seasonId: string, filter: { divisionId?: string; seasonTeamId?: string }) {
+    let query = this.db.selectFrom('league.player_game_stats as pgs').innerJoin('league.games as g', 'g.id', 'pgs.game_id').innerJoin('league.rosters as r', 'r.id', 'pgs.roster_id')
+      .innerJoin('league.players as p', 'p.id', 'r.player_id').innerJoin('league.season_teams as st', 'st.id', 'r.season_team_id').innerJoin('league.teams as t', 't.id', 'st.team_id')
+      .select(['r.id as roster_id', 'r.jersey_number', 'p.first_name', 'p.last_name', 'st.id as season_team_id', 't.id as team_id', 't.name as team_name', 't.abbreviation',
+        sql<number>`count(distinct pgs.game_id)::int`.as('games'), sql<number>`sum(pgs.points)::int`.as('points'), sql<number>`sum(pgs.rebounds)::int`.as('rebounds'),
+        sql<number>`sum(pgs.assists)::int`.as('assists'), sql<number>`sum(pgs.steals)::int`.as('steals'), sql<number>`sum(pgs.blocks)::int`.as('blocks'),
+        sql<number>`sum(pgs.turnovers)::int`.as('turnovers'), sql<number>`sum(pgs.fouls)::int`.as('fouls')])
+      .where('g.season_id', '=', seasonId).where('g.status', '=', 'completed')
+      .groupBy(['r.id', 'r.jersey_number', 'p.first_name', 'p.last_name', 'st.id', 't.id', 't.name', 't.abbreviation']);
+    if (filter.divisionId) query = query.where('g.division_id', '=', filter.divisionId);
+    if (filter.seasonTeamId) query = query.where('r.season_team_id', '=', filter.seasonTeamId);
+    const average = (total: number, games: number) => Math.round((total / games) * 10) / 10;
+    return (await query.execute()).map((row) => {
+      const totals = { points: row.points, rebounds: row.rebounds, assists: row.assists, steals: row.steals, blocks: row.blocks, turnovers: row.turnovers, fouls: row.fouls };
+      return {
+        player: { rosterId: row.roster_id, name: `${row.first_name} ${row.last_name}`, jersey: row.jersey_number },
+        team: { id: row.season_team_id, teamId: row.team_id, name: row.team_name, abbreviation: row.abbreviation },
+        games: row.games, totals,
+        perGame: Object.fromEntries(Object.entries(totals).map(([key, value]) => [key, average(value, row.games)])) as typeof totals,
+      };
+    }).sort((a, b) => b.perGame.points - a.perGame.points || a.player.name.localeCompare(b.player.name));
+  }
+
+  async playerLeaders(leagueSlug: string, seasonSlug: string, divisionId?: string) {
+    const { season, divisions } = await this.resolveSeason(leagueSlug, seasonSlug);
+    const division = this.division(divisions, divisionId);
+    return { division: divisionView(division), players: await this.playerStats(season.id, { divisionId: division.id }) };
+  }
+
 }

@@ -82,6 +82,12 @@ databaseTests('public live games against isolated PostgreSQL', () => {
     expect((await nextSnapshot(reader, buffer, (data) => data.home.score === 3)).home.score).toBe(3);
     abort.abort();
     expect((await request(app.getHttpServer()).get(`/public/leagues/${slug}/seasons/${season.slug}/games?view=upcoming`).expect(200)).body.games[0].home.score).toBe(3);
+
+    for (let period = 1; period < 4; period += 1) await post(`/games/${game.id}/live/period`, { deviceId }).expect(201);
+    await post(`/games/${game.id}/live/finish`, { deviceId }).expect(201);
+    const leaders = (await request(app.getHttpServer()).get(`/public/leagues/${slug}/seasons/${season.slug}/stats/players`).expect(200)).body;
+    expect(leaders.players).toEqual([expect.objectContaining({ player: { rosterId: roster.id, name: 'Lia Santos', jersey: 9 }, team: expect.objectContaining({ id: rays.id, name: 'Rays' }), games: 1, perGame: expect.objectContaining({ points: 3 }) })]);
+    expect((await request(app.getHttpServer()).get(`/public/leagues/${slug}/seasons/${season.slug}/teams/${rays.id}`).expect(200)).body.players[0].totals.points).toBe(3);
   });
 });
 
