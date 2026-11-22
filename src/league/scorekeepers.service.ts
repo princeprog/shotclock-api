@@ -118,7 +118,7 @@ export class ScorekeepersService {
     });
   }
 
-  // Leagues the user owns or keeps score for, with their live games and the games from today through the next 7 days.
+  // Leagues the user owns or keeps score for, with their live games and the next upcoming scheduled games from today on.
   async scorekeeping(user: string) {
     const owned = this.db.selectFrom('league.leagues as l').innerJoin('league.organizations as o', 'o.id', 'l.organization_id')
       .select(['l.id', 'l.name', 'l.time_zone', 'o.name as organization_name', sql<string>`'owner'`.as('role')])
@@ -139,7 +139,7 @@ export class ScorekeepersService {
       .where('l.id', 'in', leagues.map((league) => league.id)).where('s.status', '=', 'active').where('s.archived_at', 'is', null)
       .where((eb) => eb.or([
         eb('g.status', '=', 'live'),
-        eb.and([eb('g.status', '=', 'scheduled'), eb('g.scheduled_at', '>=', todayStart), eb('g.scheduled_at', '<', sql<Date>`${todayStart} + interval '8 days'`)]),
+        eb.and([eb('g.status', '=', 'scheduled'), eb('g.scheduled_at', '>=', todayStart)]),
       ]))
       .orderBy(sql`g.status = 'live'`, 'desc').orderBy('g.scheduled_at').orderBy('g.id').limit(50).execute();
     return { leagues, games: await labelPending(this.db, rows) };
