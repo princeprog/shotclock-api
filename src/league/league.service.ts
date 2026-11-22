@@ -820,7 +820,7 @@ export class LeagueService {
         .leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id')
         .leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id')
         .leftJoin('league.venues as v', 'v.id', 'g.venue_id')
-        .selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name', 'd.name as division_name'])
+        .selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name', 'd.name as division_name']).select(liveColumns)
         .where('g.season_id', '=', seasonId).orderBy('g.scheduled_at', 'asc').orderBy('g.id').execute().then((rows) => labelPending(this.db, rows)),
     ]);
     const standings = await Promise.all(divisions.map((division) => this.preliminaryStandings(this.db, seasonId, division.id)));
@@ -833,6 +833,7 @@ export class LeagueService {
     return {
       totals: { divisions: divisions.length, teams: registrations.length, players: registrations.reduce((sum, registration) => sum + registration.players, 0),
         venues: venues.count, games: games.length, completedGames: completed.length },
+      live: games.filter((game) => game.status === 'live'),
       upcoming: games.filter((game) => game.status === 'scheduled' && (startsAt(game) ?? -1) >= now).slice(0, 6),
       awaitingResults: { count: awaiting.length, games: awaiting.slice(0, 5) },
       recent: [...completed].sort((a, b) => (startsAt(b) ?? 0) - (startsAt(a) ?? 0)).slice(0, 5),
