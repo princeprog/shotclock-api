@@ -823,7 +823,18 @@ export class LeagueService {
         .selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name', 'd.name as division_name']).select(liveColumns)
         .where('g.season_id', '=', seasonId).orderBy('g.scheduled_at', 'asc').orderBy('g.id').execute().then((rows) => labelPending(this.db, rows)),
     ]);
-    const standings = await Promise.all(divisions.map((division) => this.preliminaryStandings(this.db, seasonId, division.id)));
+    const [standings, playerRows] = await Promise.all([
+      Promise.all(divisions.map((division) => this.preliminaryStandings(this.db, seasonId, division.id))),
+      this.db.selectFrom('league.player_game_stats as pgs').innerJoin('league.games as g', 'g.id', 'pgs.game_id').innerJoin('league.rosters as r', 'r.id', 'pgs.roster_id')
+        .innerJoin('league.players as p', 'p.id', 'r.player_id').innerJoin('league.season_teams as st', 'st.id', 'r.season_team_id').innerJoin('league.teams as t', 't.id', 'st.team_id').innerJoin('league.divisions as d', 'd.id', 'st.division_id')
+        .select(['r.id', 'p.first_name', 'p.last_name', 't.name as team_name', 'd.name as division_name', sql<number>`count(distinct pgs.game_id)::int`.as('games'),
+          sql<number>`sum(pgs.points)::int`.as('points'), sql<number>`sum(pgs.rebounds)::int`.as('rebounds'), sql<number>`sum(pgs.assists)::int`.as('assists')])
+        .where('g.season_id', '=', seasonId).where('g.status', '=', 'completed').groupBy(['r.id', 'p.first_name', 'p.last_name', 't.name', 'd.name']).execute(),
+    ]);
+    // The season's top five per-game scorers, rebounders and passers across all divisions.
+    const leaders = Object.fromEntries((['points', 'rebounds', 'assists'] as const).map((key) => [key, playerRows
+      .map((row) => ({ rosterId: row.id, name: `${row.first_name} ${row.last_name}`, teamName: row.team_name, divisionName: row.division_name, games: row.games, perGame: Math.round((row[key] / row.games) * 10) / 10 }))
+      .filter((row) => row.perGame > 0).sort((a, b) => b.perGame - a.perGame || a.name.localeCompare(b.name)).slice(0, 5)]));
     const now = Date.now();
     const startsAt = (game: (typeof games)[number]) => game.scheduled_at ? new Date(game.scheduled_at).getTime() : null;
     const hasEnded = (game: (typeof games)[number]) => { const start = startsAt(game); return start !== null && start + (game.duration_minutes ?? 60) * 60_000 <= now; };
@@ -834,6 +845,7 @@ export class LeagueService {
       totals: { divisions: divisions.length, teams: registrations.length, players: registrations.reduce((sum, registration) => sum + registration.players, 0),
         venues: venues.count, games: games.length, completedGames: completed.length },
       live: games.filter((game) => game.status === 'live'),
+      leaders,
       upcoming: games.filter((game) => game.status === 'scheduled' && (startsAt(game) ?? -1) >= now).slice(0, 6),
       awaitingResults: { count: awaiting.length, games: awaiting.slice(0, 5) },
       recent: [...completed].sort((a, b) => (startsAt(b) ?? 0) - (startsAt(a) ?? 0)).slice(0, 5),

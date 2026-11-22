@@ -116,6 +116,9 @@ databaseTests('live scoring against isolated PostgreSQL', () => {
     await post(`${live}/claim`, { deviceId: deviceA }, keeper.auth).expect(201);
     await post(`${live}/events`, { deviceId: deviceA, events: [play('points', hawks.id, roster[hawks.id][0], { points: 3, period: 3 })] }, keeper.auth).expect(201);
     expect((await post(`${live}/finish`, { deviceId: deviceA }, keeper.auth).expect(201)).body.finalScore).toEqual({ home: 5, away: 3 });
+    const leaders = (await get(`/seasons/${season.id}/dashboard`).expect(200)).body.leaders;
+    expect(leaders.points[0]).toMatchObject({ rosterId: roster[hawks.id][0], perGame: 3, teamName: 'Hawks', games: 1 });
+    expect(leaders.rebounds).toEqual([expect.objectContaining({ rosterId: roster[owls.id][1], perGame: 1 })]);
     await post(`/seasons/${season.id}/status`, { status: 'draft' }).expect(400);
   });
 });
