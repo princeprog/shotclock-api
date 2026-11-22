@@ -19,11 +19,14 @@ const sortDirection = (dir?: 'asc' | 'desc') => sql.raw(dir === 'desc' ? 'desc' 
 
 type Database = Kysely<DB> | Transaction<DB>;
 const seasonDates = [sql<string | null>`start_date::text`.as('start_date'), sql<string | null>`end_date::text`.as('end_date')] as const;
-// Whether a game was scored live, and the running score of a live game, for game lists.
+// Whether a game was scored live, the running score of a live game, and the best player of a finished one, for game lists.
+// The best player lookup uses the partial unique index on player_game_stats(game_id) where best_player.
 export const liveColumns = [
   sql<boolean>`exists (select 1 from league.game_live_states ls where ls.game_id = g.id)`.as('live_scored'),
   sql<number | null>`(select coalesce(sum(e.points), 0)::int from league.game_events e where e.game_id = g.id and e.voided_at is null and e.season_team_id = g.home_season_team_id)`.as('live_home_score'),
   sql<number | null>`(select coalesce(sum(e.points), 0)::int from league.game_events e where e.game_id = g.id and e.voided_at is null and e.season_team_id = g.away_season_team_id)`.as('live_away_score'),
+  sql<{ name: string; points: number; rebounds: number; assists: number } | null>`(select json_build_object('name', p.first_name || ' ' || p.last_name, 'points', pgs.points, 'rebounds', pgs.rebounds, 'assists', pgs.assists)
+    from league.player_game_stats pgs join league.rosters r on r.id = pgs.roster_id join league.players p on p.id = r.player_id where pgs.game_id = g.id and pgs.best_player)`.as('best_player'),
 ] as const;
 
 @Injectable()

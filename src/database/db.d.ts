@@ -225,6 +225,7 @@ export interface LeagueOrganizations {
 
 export interface LeaguePlayerGameStats {
   assists: Generated<number>;
+  best_player: Generated<boolean>;
   blocks: Generated<number>;
   created_at: Generated<Timestamp>;
   fouls: Generated<number>;

@@ -18,7 +18,8 @@ export async function liveSnapshot(db: Database, gameId: string, includeScorer =
     db.selectFrom('league.games as g').innerJoin('league.seasons as s', 's.id', 'g.season_id').innerJoin('league.leagues as l', 'l.id', 's.league_id').innerJoin('league.divisions as d', 'd.id', 'g.division_id')
       .leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id')
       .leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id').leftJoin('league.venues as v', 'v.id', 'g.venue_id')
-      .selectAll('g').select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name', 'd.name as division_name', 's.name as season_name', 's.status as season_status', 'l.name as league_name', 'l.time_zone',
+      .selectAll('g').select((eb) => eb.selectFrom('league.player_game_stats as pgs').select('pgs.roster_id').whereRef('pgs.game_id', '=', 'g.id').where('pgs.best_player', '=', true).as('best_roster_id'))
+      .select(['ht.name as home_name', 'at.name as away_name', 'v.name as venue_name', 'd.name as division_name', 's.name as season_name', 's.status as season_status', 'l.name as league_name', 'l.time_zone',
         'l.period_count', 'l.period_minutes', 'l.overtime_minutes', 'l.bonus_fouls'])
       .where('g.id', '=', gameId).execute().then((found) => labelPending(db, found)),
     db.selectFrom('league.game_live_states as ls').leftJoin('auth.users as u', 'u.id', 'ls.scorer_user_id').selectAll('ls').select(['u.name as scorer_name', 'u.email as scorer_email']).where('ls.game_id', '=', gameId).executeTakeFirst(),
@@ -48,6 +49,8 @@ export async function liveSnapshot(db: Database, gameId: string, includeScorer =
   const home = side(game.home_season_team_id, game.home_name);
   const away = side(game.away_season_team_id, game.away_name);
   const names = new Map(rosters.map((roster) => [roster.id, `${roster.first_name} ${roster.last_name}`]));
+  const bestSide = [home, away].find((side) => side.players.some((player) => player.rosterId === game.best_roster_id));
+  const best = bestSide?.players.find((player) => player.rosterId === game.best_roster_id);
   const now = Date.now();
   return {
     gameId: game.id, status: game.status, version: state?.version ?? 0, stage: game.stage, scheduledAt: game.scheduled_at,
@@ -56,6 +59,7 @@ export async function liveSnapshot(db: Database, gameId: string, includeScorer =
     period, clock: state ? { remainingMs: remaining(state, now), running: !!state.clock_running_since, serverTime: new Date(now).toISOString() } : null,
     home: { ...home, inBonus: away.teamFouls >= format.bonus_fouls }, away: { ...away, inBonus: home.teamFouls >= format.bonus_fouls },
     finalScore: game.status === 'completed' ? { home: game.home_score, away: game.away_score } : null,
+    bestPlayer: bestSide && best ? { ...best, seasonTeamId: bestSide.seasonTeamId, teamName: bestSide.name } : null,
     plays: events.slice(-30).reverse().map((event) => ({ id: event.id, sequence: event.sequence, kind: event.kind, points: event.points, seasonTeamId: event.season_team_id, rosterId: event.roster_id,
       player: event.roster_id ? names.get(event.roster_id) ?? null : null, period: event.period, clockMs: event.clock_ms, voided: !!event.voided_at })),
     scorer: includeScorer && state?.scorer_device_id ? { deviceId: state.scorer_device_id, name: state.scorer_name?.trim() || state.scorer_email } : null,

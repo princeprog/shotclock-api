@@ -5,6 +5,7 @@ import type { DB } from '../database/db';
 import { ensureNotArchived } from '../common/request-scope';
 import { LeagueService } from './league.service';
 import { liveSnapshot } from './live-snapshot';
+import { bestPlayer } from './best-player';
 import type { LiveClockDto, LiveEventDto, LiveStartDto } from './league.dto';
 
 type Database = Kysely<DB> | Transaction<DB>;
@@ -137,7 +138,7 @@ export class LiveService {
   }); return this.snapshot(gameId); }
 
   // Finishing writes the final score through the normal result path, so standings and brackets update as usual,
-  // and replaces the game's player stats with the totals of its plays.
+  // and replaces the game's player stats with the totals of its plays, flagging the winning team's best player.
   async finish(user: string, gameId: string, deviceId: string) { await this.db.transaction().execute(async (tx) => {
     const game = await this.writable(user, gameId, tx);
     const state = await this.liveState(tx, gameId, deviceId);
@@ -147,8 +148,9 @@ export class LiveService {
     if (current.home.score === current.away.score) throw new BadRequestException('The score is tied. Start overtime to decide the game.');
     await tx.deleteFrom('league.player_game_stats').where('game_id', '=', gameId).execute();
     const lines = [...current.home.players, ...current.away.players].filter((line) => line.points + line.rebounds + line.assists + line.steals + line.blocks + line.turnovers + line.fouls > 0);
+    const best = bestPlayer((current.home.score > current.away.score ? current.home : current.away).players);
     if (lines.length) await tx.insertInto('league.player_game_stats').values(lines.map((line) => ({ game_id: gameId, roster_id: line.rosterId, points: line.points, rebounds: line.rebounds,
-      assists: line.assists, steals: line.steals, blocks: line.blocks, turnovers: line.turnovers, fouls: line.fouls }))).execute();
+      assists: line.assists, steals: line.steals, blocks: line.blocks, turnovers: line.turnovers, fouls: line.fouls, best_player: line.rosterId === best?.rosterId }))).execute();
     const { period_count: _a, period_minutes: _b, overtime_minutes: _c, bonus_fouls: _d, season_status: _e, season_archived_at: _f, league_archived_at: _g, organization_archived_at: _h, owner_user_id: _i, member_id: _j, ...row } = game;
     await this.league.recordGameResult(tx, game.season_id, row, { homeScore: current.home.score, awayScore: current.away.score });
     await this.bump(tx, gameId, { finished_at: new Date(), clock_running_since: null });

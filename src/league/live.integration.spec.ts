@@ -103,19 +103,25 @@ databaseTests('live scoring against isolated PostgreSQL', () => {
     await post(`${live}/period`, { deviceId: deviceB }).expect(400);
     const finished = (await post(`${live}/finish`, { deviceId: deviceB }).expect(201)).body;
     expect(finished).toMatchObject({ status: 'completed', finalScore: { home: 2, away: 3 } });
+    // Both Owls scorers have an efficiency of 2, so the one with more points is the best player.
+    expect(finished.bestPlayer).toMatchObject({ rosterId: roster[owls.id][0], seasonTeamId: owls.id, teamName: 'Owls', points: 2 });
     const stats = await db.selectFrom('league.player_game_stats').selectAll().where('game_id', '=', game.id).execute();
+    expect(stats.filter((row) => row.best_player).map((row) => row.roster_id)).toEqual([roster[owls.id][0]]);
     expect(stats.find((row) => row.roster_id === roster[owls.id][1])).toMatchObject({ points: 1, rebounds: 1, fouls: 1 });
     expect(stats.find((row) => row.roster_id === roster[hawks.id][0])).toBeUndefined();
     expect((await get(`/seasons/${season.id}/standings`).expect(200)).body[0]).toMatchObject({ id: owls.id, wins: 1 });
     await post(`/games/${game.id}/forfeit`, { forfeitingTeamId: hawks.id }).expect(400);
 
     await post(`${live}/reopen`, {}, keeper.auth).expect(404);
-    expect((await post(`${live}/reopen`, {}).expect(201)).body).toMatchObject({ status: 'live', period: 3, scorer: null });
+    expect((await post(`${live}/reopen`, {}).expect(201)).body).toMatchObject({ status: 'live', period: 3, scorer: null, bestPlayer: null });
     expect(await db.selectFrom('league.player_game_stats').select('id').where('game_id', '=', game.id).execute()).toEqual([]);
     await post(`${live}/events`, { deviceId: deviceB, events: [play('points', hawks.id, roster[hawks.id][0], { points: 2, period: 3 })] }).expect(409);
     await post(`${live}/claim`, { deviceId: deviceA }, keeper.auth).expect(201);
     await post(`${live}/events`, { deviceId: deviceA, events: [play('points', hawks.id, roster[hawks.id][0], { points: 3, period: 3 })] }, keeper.auth).expect(201);
-    expect((await post(`${live}/finish`, { deviceId: deviceA }, keeper.auth).expect(201)).body.finalScore).toEqual({ home: 5, away: 3 });
+    const refinished = (await post(`${live}/finish`, { deviceId: deviceA }, keeper.auth).expect(201)).body;
+    expect(refinished).toMatchObject({ finalScore: { home: 5, away: 3 }, bestPlayer: { rosterId: roster[hawks.id][0], teamName: 'Hawks', points: 3 } });
+    const results = (await get(`/seasons/${season.id}/games?scope=season&status=completed`).expect(200)).body.items;
+    expect(results).toEqual([expect.objectContaining({ id: game.id, best_player: expect.objectContaining({ points: 3 }) })]);
     const leaders = (await get(`/seasons/${season.id}/dashboard`).expect(200)).body.leaders;
     expect(leaders.points[0]).toMatchObject({ rosterId: roster[hawks.id][0], perGame: 3, teamName: 'Hawks', games: 1 });
     expect(leaders.rebounds).toEqual([expect.objectContaining({ rosterId: roster[owls.id][1], perGame: 1 })]);
