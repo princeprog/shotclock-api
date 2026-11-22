@@ -133,6 +133,20 @@ export interface LeagueGameScheduleChanges {
   old_venue_id: string | null;
 }
 
+export interface LeagueInvitations {
+  accepted_at: Timestamp | null;
+  accepted_by_user_id: string | null;
+  created_at: Generated<Timestamp>;
+  email: string;
+  expires_at: Timestamp;
+  id: Generated<string>;
+  invited_by_user_id: string;
+  league_id: string;
+  revoked_at: Timestamp | null;
+  role: Generated<string>;
+  token_hash: string;
+}
+
 export interface LeagueLeagueMembers {
   created_at: Generated<Timestamp>;
   id: Generated<string>;
@@ -259,6 +273,7 @@ export interface DB {
   "league.divisions": LeagueDivisions;
   "league.game_schedule_changes": LeagueGameScheduleChanges;
   "league.games": LeagueGames;
+  "league.invitations": LeagueInvitations;
   "league.league_members": LeagueLeagueMembers;
   "league.leagues": LeagueLeagues;
   "league.organization_players": LeagueOrganizationPlayers;
