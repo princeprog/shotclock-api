@@ -11,6 +11,7 @@ describe('website revalidation routing', () => {
   it('ignores reads, schedule previews and data the website never shows', () => {
     expect(routeResource('GET', `/league/games/${id}`)).toBeNull();
     expect(routeResource('POST', `/league/seasons/${id}/schedule/preview`)).toBeNull();
+    for (const suffix of ['', '/heartbeat', '/mode', '/claim']) expect(routeResource('POST', `/league/games/${id}/live/shot-clock${suffix}`)).toBeNull();
     expect(routeResource('PATCH', `/league/rosters/${id}`)).toBeNull();
     expect(routeResource('PATCH', `/league/players/${id}`)).toBeNull();
     expect(routeResource('POST', '/league/organizations')).toBeNull();

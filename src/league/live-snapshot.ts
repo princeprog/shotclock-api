@@ -14,7 +14,7 @@ export function remaining(state: { clock_remaining_ms: number; clock_running_sin
 
 // Everything a console or viewer needs: score, clock, team fouls and timeouts, player lines and recent plays.
 export async function liveSnapshot(db: Database, gameId: string, includeScorer = true) {
-  const [rows, state, events] = await Promise.all([
+  const [rows, state, events, shot] = await Promise.all([
     db.selectFrom('league.games as g').innerJoin('league.seasons as s', 's.id', 'g.season_id').innerJoin('league.leagues as l', 'l.id', 's.league_id').innerJoin('league.divisions as d', 'd.id', 'g.division_id')
       .leftJoin('league.season_teams as h', 'h.id', 'g.home_season_team_id').leftJoin('league.teams as ht', 'ht.id', 'h.team_id')
       .leftJoin('league.season_teams as a', 'a.id', 'g.away_season_team_id').leftJoin('league.teams as at', 'at.id', 'a.team_id').leftJoin('league.venues as v', 'v.id', 'g.venue_id')
@@ -24,6 +24,7 @@ export async function liveSnapshot(db: Database, gameId: string, includeScorer =
       .where('g.id', '=', gameId).execute().then((found) => labelPending(db, found)),
     db.selectFrom('league.game_live_states as ls').leftJoin('auth.users as u', 'u.id', 'ls.scorer_user_id').selectAll('ls').select(['u.name as scorer_name', 'u.email as scorer_email']).where('ls.game_id', '=', gameId).executeTakeFirst(),
     db.selectFrom('league.game_events').select(['id', 'sequence', 'kind', 'points', 'season_team_id', 'roster_id', 'period', 'clock_ms', 'voided_at']).where('game_id', '=', gameId).orderBy('sequence').execute() as Promise<Event[]>,
+    db.selectFrom('league.game_shot_clocks as sc').leftJoin('auth.users as u', 'u.id', 'sc.operator_user_id').selectAll('sc').select(['u.name as operator_name', 'u.email as operator_email']).where('sc.game_id', '=', gameId).executeTakeFirst(),
   ]);
   const game = rows[0];
   if (!game) throw new NotFoundException();
@@ -60,10 +61,24 @@ export async function liveSnapshot(db: Database, gameId: string, includeScorer =
   const bestSide = [home, away].find((side) => side.players.some((player) => player.rosterId === game.best_roster_id));
   const best = bestSide?.players.find((player) => player.rosterId === game.best_roster_id);
   const now = Date.now();
+  const shotEnd = shot?.running_since && state?.clock_running_since
+    ? Math.min(now, new Date(state.clock_running_since).getTime() + state.clock_remaining_ms) : now;
+  const shotRemaining = shot ? Math.max(0, shot.remaining_ms - (shot.running_since ? Math.max(0, shotEnd - new Date(shot.running_since).getTime()) : 0)) : 0;
+  const shotRunning = !!(shot?.running_since && state?.clock_running_since && shotRemaining > 0 && remaining(state, now) > 0 && !state.finished_at);
+  const operator = shot?.mode === 'single'
+    ? state?.scorer_device_id ? { deviceId: state.scorer_device_id, name: state.scorer_name?.trim() || state.scorer_email } : null
+    : shot?.operator_device_id ? { deviceId: shot.operator_device_id, name: shot.operator_name?.trim() || shot.operator_email } : null;
+  const shotClock = shot ? {
+    mode: shot.mode as 'single' | 'dual', fullSeconds: shot.full_seconds, shortSeconds: shot.short_seconds,
+    remainingMs: shotRemaining, running: shotRunning, visible: shot.visible, epoch: shot.epoch, serverTime: new Date(now).toISOString(),
+    ...(includeScorer ? { operator, scorerEpoch: shot.scorer_epoch, connectivity: { scorerConnected: !!shot.scorer_lease_until && new Date(shot.scorer_lease_until).getTime() > now,
+      operatorConnected: shot.mode === 'single' ? !!shot.scorer_lease_until && new Date(shot.scorer_lease_until).getTime() > now : !!shot.operator_lease_until && new Date(shot.operator_lease_until).getTime() > now, leaseMs: 15000 } } : {}),
+  } : null;
   return {
     gameId: game.id, status: game.status, version: state?.version ?? 0, stage: game.stage, scheduledAt: game.scheduled_at,
     leagueName: game.league_name, seasonName: game.season_name, divisionName: game.division_name, venueName: game.venue_name, timeZone: game.time_zone, seasonStatus: game.season_status,
     format: { periodCount: format.period_count, periodMinutes: format.period_minutes, overtimeMinutes: format.overtime_minutes, bonusFouls: format.bonus_fouls },
+    shotClock,
     period, clock: state ? { remainingMs: remaining(state, now), running: !!state.clock_running_since, serverTime: new Date(now).toISOString() } : null,
     home: { ...home, inBonus: away.teamFouls >= format.bonus_fouls }, away: { ...away, inBonus: home.teamFouls >= format.bonus_fouls },
     periodScores,

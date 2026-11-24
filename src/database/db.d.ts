@@ -9,6 +9,8 @@ export type Generated<T> = T extends ColumnType<infer S, infer I, infer U>
   ? ColumnType<S, I | undefined, U>
   : ColumnType<T, T | undefined, T>;
 
+export type Int8 = ColumnType<string, bigint | number | string, bigint | number | string>;
+
 export type Json = JsonValue;
 
 export type JsonArray = JsonValue[];
@@ -169,6 +171,42 @@ export interface LeagueGameScheduleChanges {
   old_venue_id: string | null;
 }
 
+export interface LeagueGameShotClockCommands {
+  created_at: Generated<Timestamp>;
+  device_id: string;
+  epoch: number;
+  game_id: string;
+  id: string;
+}
+
+export interface LeagueGameShotClockHistory {
+  at: Timestamp;
+  game_id: string;
+  id: Generated<Int8>;
+  period: number;
+  remaining_ms: number;
+  running_since: Timestamp | null;
+  visible: boolean;
+}
+
+export interface LeagueGameShotClocks {
+  epoch: Generated<number>;
+  full_seconds: number;
+  game_id: string;
+  last_game_clock_at: Timestamp | null;
+  last_shot_at: Timestamp | null;
+  mode: Generated<string>;
+  operator_device_id: string | null;
+  operator_lease_until: Timestamp | null;
+  operator_user_id: string | null;
+  remaining_ms: number;
+  running_since: Timestamp | null;
+  scorer_epoch: Generated<number>;
+  scorer_lease_until: Timestamp | null;
+  short_seconds: number;
+  visible: Generated<boolean>;
+}
+
 export interface LeagueInvitations {
   accepted_at: Timestamp | null;
   accepted_by_user_id: string | null;
@@ -315,6 +353,9 @@ export interface DB {
   "league.game_events": LeagueGameEvents;
   "league.game_live_states": LeagueGameLiveStates;
   "league.game_schedule_changes": LeagueGameScheduleChanges;
+  "league.game_shot_clock_commands": LeagueGameShotClockCommands;
+  "league.game_shot_clock_history": LeagueGameShotClockHistory;
+  "league.game_shot_clocks": LeagueGameShotClocks;
   "league.games": LeagueGames;
   "league.invitations": LeagueInvitations;
   "league.league_members": LeagueLeagueMembers;

@@ -233,12 +233,36 @@ export class InvitationTokenDto {
 
 export class LiveDeviceDto {
   @IsUUID() deviceId!: string;
+  @IsOptional() @IsInt() @Min(1) epoch?: number;
 }
 export class LiveStartDto extends LiveDeviceDto {
   @IsInt() @Min(1) @Max(8) periodCount!: number;
   @IsInt() @Min(1) @Max(30) periodMinutes!: number;
   @IsInt() @Min(1) @Max(15) overtimeMinutes!: number;
   @IsInt() @Min(1) @Max(10) bonusFouls!: number;
+  @IsOptional() @IsBoolean() shotClockEnabled?: boolean;
+  @IsOptional() @IsInt() @Min(1) @Max(120) shotClockFullSeconds?: number;
+  @IsOptional() @IsInt() @Min(1) @Max(120) shotClockShortSeconds?: number;
+}
+export class ShotClockCommandDto {
+  @IsUUID() deviceId!: string;
+  @IsUUID() commandId!: string;
+  @IsInt() @Min(1) epoch!: number;
+  @IsInt() @Min(0) @Max(120000) remainingMs!: number;
+  @IsBoolean() running!: boolean;
+  @IsBoolean() visible!: boolean;
+  @IsDateString({ strict: true }) at!: string;
+}
+export class ShotClockModeDto extends LiveDeviceDto {
+  @IsDefined() @IsInt() @Min(1) declare epoch: number;
+  @IsIn(['single', 'dual']) mode!: 'single' | 'dual';
+}
+export class ShotClockClaimDto extends LiveDeviceDto {
+  @IsDefined() @IsInt() @Min(1) declare epoch: number;
+}
+export class ShotClockHeartbeatDto {
+  @IsUUID() deviceId!: string;
+  @IsInt() @Min(1) epoch!: number;
 }
 export class LiveEventDto {
   @IsUUID() id!: string;
