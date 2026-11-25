@@ -289,12 +289,12 @@ export class LiveService {
     const state = await tx.selectFrom('league.game_live_states').select('finished_at').where('game_id', '=', gameId).executeTakeFirst();
     if (game.status !== 'completed' || !state?.finished_at) throw new BadRequestException('Only finished live games can be reopened');
     if (game.stage === 'preliminary') {
-      const filled = await tx.selectFrom('league.games').select('id').where('season_id', '=', game.season_id).where('division_id', '=', game.division_id).where('stage', '=', 'semifinal').where('home_season_team_id', 'is not', null).executeTakeFirst();
-      if (filled) throw new BadRequestException('The semifinals are already set from these standings, so this game cannot be reopened');
+      const filled = await tx.selectFrom('league.games').select('id').where('season_id', '=', game.season_id).where('division_id', '=', game.division_id).where('stage', 'in', ['quarterfinal', 'semifinal']).where('home_season_team_id', 'is not', null).executeTakeFirst();
+      if (filled) throw new BadRequestException('The playoff pairings are already set from these standings, so this game cannot be reopened');
     }
-    if (game.stage === 'semifinal') {
+    if (game.stage === 'quarterfinal' || game.stage === 'semifinal') {
       const next = await tx.selectFrom('league.games').select('status').where((eb) => eb.or([eb('home_source_game_id', '=', gameId), eb('away_source_game_id', '=', gameId)])).execute();
-      if (next.some((item) => item.status !== 'scheduled')) throw new BadRequestException('The next playoff game has started, so this semifinal cannot be reopened');
+      if (next.some((item) => item.status !== 'scheduled')) throw new BadRequestException(`The next playoff game has started, so this ${game.stage} cannot be reopened`);
     }
     await tx.updateTable('league.games').set({ status: 'live', home_score: null, away_score: null, forfeited_by_season_team_id: null, updated_at: new Date() }).where('id', '=', gameId).execute();
     await tx.deleteFrom('league.player_game_stats').where('game_id', '=', gameId).execute();

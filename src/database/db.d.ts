@@ -91,6 +91,7 @@ export interface LeagueDivisionSchedules {
   division_id: string;
   format: string;
   id: Generated<string>;
+  playoff_teams: Generated<number>;
   playoffs: boolean;
   team_ids: string[];
   third_place: boolean;

@@ -164,7 +164,7 @@ export class ScheduleGameDto {
   @IsString() @Matches(TEAM_OR_SLOT) homeTeamId!: string;
   @IsString() @Matches(TEAM_OR_SLOT) awayTeamId!: string;
   @IsInt() @Min(1) @Max(500) round!: number;
-  @IsIn(['preliminary', 'semifinal', 'final', 'third_place']) stage!: 'preliminary' | 'semifinal' | 'final' | 'third_place';
+  @IsIn(['preliminary', 'quarterfinal', 'semifinal', 'final', 'third_place']) stage!: 'preliminary' | 'quarterfinal' | 'semifinal' | 'final' | 'third_place';
   @IsDateString({ strict: true }) @Matches(/(?:Z|[+-]\d\d:\d\d)$/) scheduledAt!: string;
   @IsUUID() venueId!: string;
   @IsInt() @Min(1) @Max(1440) durationMinutes!: number;
@@ -180,21 +180,23 @@ export class PlayoffDatesDto {
 }
 export class SchedulePreviewDto extends ScheduleAvailabilityRequestDto {
   @IsIn(['single', 'double']) format!: 'single' | 'double';
-  // Playoffs bracket the top four teams of each division with at least four teams. Season generation schedules the bracket
-  // within playoffDates, after the round robin; division generation only records the choice.
+  // Playoffs bracket the top four or top eight teams of each division (top four when a division has fewer than eight).
+  // Season generation schedules the bracket within playoffDates, after the round robin; division generation only records the choice.
   @IsOptional() @IsBoolean() playoffs?: boolean;
+  @IsOptional() @IsIn([4, 8]) playoffTeams?: 4 | 8;
   @IsOptional() @IsBoolean() thirdPlace?: boolean;
   @IsOptional() @ValidateNested() @Type(() => PlayoffDatesDto) playoffDates?: PlayoffDatesDto;
 }
 export class ScheduleSaveDto extends SchedulePreviewDto {
   @IsArray() @ArrayNotEmpty() @ArrayMaxSize(1000) @ValidateNested({ each: true }) @Type(() => ScheduleGameDto) games!: ScheduleGameDto[];
 }
-// Playoff requests choose the third-place game; when omitted, the division's saved choice applies.
+// Playoff requests choose the bracket size and the third-place game; when omitted, the division's saved choices apply.
 export class PlayoffOptionsDto extends ScheduleAvailabilityRequestDto {
+  @IsOptional() @IsIn([4, 8]) playoffTeams?: 4 | 8;
   @IsOptional() @IsBoolean() thirdPlace?: boolean;
 }
 export class PlayoffSaveDto extends PlayoffOptionsDto {
-  @IsArray() @ArrayNotEmpty() @ArrayMaxSize(4) @ValidateNested({ each: true }) @Type(() => ScheduleGameDto) games!: ScheduleGameDto[];
+  @IsArray() @ArrayNotEmpty() @ArrayMaxSize(8) @ValidateNested({ each: true }) @Type(() => ScheduleGameDto) games!: ScheduleGameDto[];
 }
 export class SeasonScheduleGameDto extends ScheduleGameDto {
   @IsUUID() divisionId!: string;
@@ -212,7 +214,7 @@ export class ScheduleFixtureDto {
   @IsString() @Matches(TEAM_OR_SLOT) homeTeamId!: string;
   @IsString() @Matches(TEAM_OR_SLOT) awayTeamId!: string;
   @IsInt() @Min(1) @Max(500) round!: number;
-  @IsIn(['preliminary', 'semifinal', 'final', 'third_place']) stage!: 'preliminary' | 'semifinal' | 'final' | 'third_place';
+  @IsIn(['preliminary', 'quarterfinal', 'semifinal', 'final', 'third_place']) stage!: 'preliminary' | 'quarterfinal' | 'semifinal' | 'final' | 'third_place';
 }
 export class ScheduleSuggestTargetDto {
   @IsOptional() @IsInt() @Min(0) @Max(4999) index?: number;

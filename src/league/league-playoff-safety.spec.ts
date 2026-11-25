@@ -114,7 +114,7 @@ function setup() {
             if (expected !== undefined && game[key] !== expected) return false;
           }
           if (text.includes('"stage" in')) {
-            const stages = values.filter((value) => ['semifinal', 'final', 'third_place'].includes(String(value)));
+            const stages = values.filter((value) => ['preliminary', 'quarterfinal', 'semifinal', 'final', 'third_place'].includes(String(value)));
             if (!stages.includes(game.stage)) return false;
           }
           if (text.includes('"home_score" is not null') && game.home_score === null) return false;

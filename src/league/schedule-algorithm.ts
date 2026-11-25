@@ -19,9 +19,9 @@ export type ScheduleMatch = {
   homeTeamId: string;
   awayTeamId: string;
   round: number;
-  stage: 'preliminary' | 'semifinal' | 'final' | 'third_place';
+  stage: 'preliminary' | 'quarterfinal' | 'semifinal' | 'final' | 'third_place';
   groupId?: string;
-  // Stand-in teams this game also counts for, such as a semifinal's future winner and loser in a bracket.
+  // Stand-in teams this game also counts for, such as a quarterfinal's or semifinal's future winner and loser in a bracket.
   aliases?: string[];
 };
 
@@ -36,7 +36,7 @@ export type ExistingGame = {
   homeTeamId: string;
   awayTeamId: string;
   aliases?: string[];
-  // Saved games that later rounds must follow, such as semifinals, carry a round below every draft round.
+  // Saved games that later rounds must follow, such as quarterfinals and semifinals, carry a round below every draft round.
   round?: number;
   scheduledAt: string;
   venueId: string | null;
@@ -144,7 +144,7 @@ function validateMatch(match: ScheduleMatch): void {
   if (
     !Number.isSafeInteger(match.round) ||
     match.round < 1 ||
-    !['preliminary', 'semifinal', 'final', 'third_place'].includes(match.stage)
+    !['preliminary', 'quarterfinal', 'semifinal', 'final', 'third_place'].includes(match.stage)
   )
     throw new Error('Invalid match round or stage');
 }
