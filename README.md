@@ -68,3 +68,18 @@ ALTER DEFAULT PRIVILEGES FOR ROLE shotclock_owner IN SCHEMA auth, league GRANT S
 - Keep the API on a private network that only the web app can reach.
 - Use HTTPS origins for `FRONTEND_URL` and `CORS_ORIGINS`, and `DB_SSL=verify-full`.
 - CI fails on high or critical `pnpm audit` findings; CodeQL, gitleaks and Dependabot run on GitHub.
+
+### Optional live shot clock
+
+A live game's start body may include `shotClockEnabled` (default `false`), `shotClockFullSeconds` (default `24`) and `shotClockShortSeconds` (default `14`); seconds must be integers from 1 to 120. Existing or disabled games have `shotClock: null`. Enabled authenticated snapshots include `mode`, `fullSeconds`, `shortSeconds`, `remainingMs`, `running`, `visible`, `epoch`, `serverTime` (ISO), `operator` (`{ deviceId, name }` or `null`), `scorerEpoch`, and `connectivity` (`scorerConnected`, `operatorConnected`, `leaseMs`). Public snapshots omit `operator`, `scorerEpoch`, and `connectivity`.
+
+All routes below are authenticated owner/league-scorekeeper routes under `/league/games/:id/live`. They return the full authenticated live snapshot:
+
+- `POST /shot-clock`: `{ deviceId, commandId, epoch, remainingMs, running, visible, at }`. Device and command IDs are UUIDs, `epoch` is a positive integer, `remainingMs` is an integer from 0 through 120000, and `at` is an ISO date-time. Reusing an accepted command ID for the same game/device/epoch is idempotent. A different command must be newer than the last accepted shot-clock timestamp. Running requires the game clock to have been running at `at`.
+- `POST /shot-clock/mode`: `{ deviceId, epoch, mode }`, where mode is `single` or `dual`; only the scoring device may change it. Drain the scorer's ordered play/game-clock queue before changing modes: a change advances both role epochs.
+- `POST /shot-clock/claim`: `{ deviceId, epoch }`; in dual mode the new shot-clock operator must be a different device from the scorer. A shot-clock takeover advances `epoch` only and does not invalidate the scorer's queue.
+- `POST /shot-clock/heartbeat`: `{ deviceId, epoch }`; either role holder renews its own 15-second lease, using `shotClock.epoch`. Send roughly every five seconds, including while a scoring outbox is pending. In dual mode, shot-clock commands require both unexpired leases. Scoring and game-clock writes do not require leases.
+
+For enabled games, attach `epoch: shotClock.scorerEpoch` to scoring events, event voids, game-clock changes, period changes and finish requests. A scoring takeover advances both epochs; a period change resets the shot clock to the full duration, stopped, and also advances both. Finish and reopen fence old writes. A game-clock stop freezes the shot clock at the recorded event time; when it arrives after a newer shot-clock update, the server reconstructs the earlier reading and advances the shot-clock epoch. Clients should refresh on 409 and never replay an old epoch. A 15-second lease records recent successful server contact, not proof of uninterrupted connectivity.
+
+Clients must treat a missing `shotClock` field as disabled when talking to an older API. The existing public player-statistics responses include roster identifiers; the new public shot-clock object does not include personal or device identifiers. Mode and claim requests require the current shot-clock epoch. A stale request is rejected after control changes; clients must refresh instead of automatically retrying.

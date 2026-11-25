@@ -6,11 +6,13 @@ import type { DB } from '../database/db';
 import { PlayoffOptionsDto, PlayoffSaveDto, ScheduleAvailabilityRequestDto, SchedulePreviewDto, ScheduleSaveDto, SeasonSchedulePreviewDto, SeasonScheduleSaveDto, SeasonScheduleSuggestDto } from './league.dto';
 import { estimateCourtCapacity, planSchedule, teamGameCapacity, roundRobin, scheduleIssues, scheduleMatches, SchedulePlacementError, suggestSlots, validateSchedule, type ExistingGame, type ScheduleAvailability, type ScheduleGame, type ScheduleIssue, type ScheduleMatch } from './schedule-algorithm';
 import { calculateStandings } from './standings';
-import { bracketSlot, labelPending, parseBracketSlot, parseSavedSlot, parseSeedSlot, pendingLabel, seedLabel, seedSlot } from './bracket';
+import { bracketOrder, bracketSlot, labelPending, parseBracketSlot, parseSavedSlot, parseSeedSlot, resultLabel, seedLabel, seedSlot, type BracketStage } from './bracket';
 
 type Database = Kysely<DB> | Transaction<DB>;
 type DivisionContext = Awaited<ReturnType<ScheduleService['context']>>;
 type Named = { id: string; name: string };
+// A bracket game's future winner and loser, which later rounds take.
+type BracketResult = { winner: Named; loser: Named };
 
 const calendarDateFormatter = (timeZone: string) => new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' });
 
@@ -89,13 +91,13 @@ export class ScheduleService {
     const to = Date.parse(`${availability?.endDate}T00:00:00Z`) + 9 * 86400000;
     if (Number.isFinite(from) && Number.isFinite(to)) query = query.where('g.scheduled_at', '>=', new Date(from)).where('g.scheduled_at', '<', new Date(to));
     const games = await query.execute();
-    // A side still waiting stands in as its seed, or as a semifinal's winner or loser, which the semifinal also counts for.
+    // A side still waiting stands in as its seed, or as an earlier playoff game's winner or loser, which that game also counts for.
     const side = (team: string | null, seed: number | null, divisionId: string, source: string | null, outcome: string | null) =>
       team ?? (seed ? seedSlot(divisionId, seed) : source + ':' + outcome);
     return games.map((game) => ({ id: game.id,
       homeTeamId: side(game.home_season_team_id, game.home_seed, game.division_id, game.home_source_game_id, game.home_source_outcome),
       awayTeamId: side(game.away_season_team_id, game.away_seed, game.division_id, game.away_source_game_id, game.away_source_outcome),
-      ...(game.stage === 'semifinal' ? { aliases: [game.id + ':winner', game.id + ':loser'], round: 0 } : {}),
+      ...(game.stage === 'quarterfinal' || game.stage === 'semifinal' ? { aliases: [game.id + ':winner', game.id + ':loser'], round: 0 } : {}),
       scheduledAt: new Date(game.scheduled_at!).toISOString(), venueId: game.venue_id, durationMinutes: game.duration_minutes }));
   }
 
@@ -182,14 +184,17 @@ export class ScheduleService {
       this.teams(this.db, divisionId),
     ]);
     const prelim = games.filter((game) => game.stage === 'preliminary');
-    const semifinals = games.filter((game) => game.stage === 'semifinal');
-    let playoffStage: 'semifinal' | 'final' | null = null;
-    if (schedule && teams.length >= 4 && prelim.length) {
-      if (!semifinals.length) playoffStage = 'semifinal';
-      else if (semifinals.length === 2 && !games.some((game) => game.stage === 'final' || game.stage === 'third_place')) playoffStage = 'final';
+    const count = (stage: string) => games.filter((game) => game.stage === stage).length;
+    // The next bracket round to schedule: the first round, or the rounds after saved quarterfinals or semifinals.
+    let playoffStage: 'quarterfinal' | 'semifinal' | 'final' | null = null;
+    if (schedule && teams.length >= 4 && prelim.length && !count('final') && !count('third_place')) {
+      if (!count('quarterfinal') && !count('semifinal')) playoffStage = this.playoffSize(teams.length, schedule.playoff_teams) === 8 ? 'quarterfinal' : 'semifinal';
+      else if (count('semifinal') === 2) playoffStage = 'final';
+      else if (count('quarterfinal') === 4 && !count('semifinal')) playoffStage = 'semifinal';
     }
     return { hasSchedule: !!schedule, canGeneratePreliminary: context.status !== 'completed' && !schedule && !prelim.length,
-      playoffStage: context.status === 'completed' ? null : playoffStage, playoffs: !!schedule?.playoffs, thirdPlace: !!schedule?.third_place };
+      playoffStage: context.status === 'completed' ? null : playoffStage, playoffs: !!schedule?.playoffs, thirdPlace: !!schedule?.third_place,
+      playoffTeams: schedule?.playoff_teams ?? null };
   }
 
   private async seasonContext(user: string, seasonId: string, db: Database, lock = false) {
@@ -205,7 +210,7 @@ export class ScheduleService {
     return season;
   }
 
-  private async seasonDivisions(db: Database, season: Awaited<ReturnType<ScheduleService['seasonContext']>>, thirdPlace?: boolean) {
+  private async seasonDivisions(db: Database, season: Awaited<ReturnType<ScheduleService['seasonContext']>>, thirdPlace?: boolean, playoffTeams?: number) {
     const divisions = await db.selectFrom('league.divisions').select(['id', 'name']).where('season_id', '=', season.seasonId).orderBy('name').orderBy('id').execute();
     return Promise.all(divisions.map(async (division) => {
       const context = { ...season, divisionId: division.id };
@@ -217,7 +222,7 @@ export class ScheduleService {
       let playoff: Awaited<ReturnType<ScheduleService['playoffMatches']>> | null = null;
       let playoffReason = !schedule ? 'Generate the round robin first.' : 'Complete the previous round before scheduling playoffs.';
       if (schedule && season.status !== 'completed') {
-        try { playoff = await this.playoffMatches(db, context, thirdPlace); }
+        try { playoff = await this.playoffMatches(db, context, thirdPlace, playoffTeams); }
         catch (error) {
           if (!(error instanceof BadRequestException)) throw error;
           playoffReason = error.message;
@@ -227,10 +232,10 @@ export class ScheduleService {
         ? 'This division already has preliminary games or a generated schedule.'
         : teams.length < 2 ? 'At least two teams are required.'
           : teams.length > 32 ? 'A generated schedule supports at most 32 teams.' : undefined;
-      const playoffStage = playoff ? (playoff.matches[0]?.stage === 'semifinal' ? 'semifinal' as const : 'final' as const) : null;
+      const playoffStage = playoff?.matches[0]?.stage as 'quarterfinal' | 'semifinal' | 'final' | undefined ?? null;
       return { id: division.id, name: division.name, teamCount: teams.length, hasSchedule: !!schedule,
         canGeneratePreliminary: season.status !== 'completed' && !preliminaryReason,
-        playoffs: !!schedule?.playoffs, thirdPlace: !!schedule?.third_place, playoffStage,
+        playoffs: !!schedule?.playoffs, thirdPlace: !!schedule?.third_place, playoffTeams: schedule?.playoff_teams ?? null, playoffStage,
         preliminaryReason, playoffReason: playoff ? undefined : playoffReason, context, teams, labels: playoff?.labels ?? teams, playoff };
     }));
   }
@@ -248,21 +253,24 @@ export class ScheduleService {
     if (season.status === 'completed') throw new BadRequestException('Completed seasons cannot be changed');
     if (input.thirdPlace && !input.playoffs) throw new BadRequestException('A third-place game requires playoffs');
     await this.validateVenues(db, season.leagueId, input.availability);
-    const divisions = await this.seasonDivisions(db, season, input.playoffs ? !!input.thirdPlace : undefined);
+    const divisions = await this.seasonDivisions(db, season, input.playoffs ? !!input.thirdPlace : undefined, input.playoffs ? input.playoffTeams ?? 4 : undefined);
     this.checkTeamAvailability(input.availability, divisions.flatMap((division) => division.teams.map((team) => team.id)));
     const planned = divisions.map((division) => {
       const fixtures = division.canGeneratePreliminary ? roundRobin(division.teams.map((team) => team.id), input.format) : [];
-      let bracket: { matches: ScheduleMatch[]; labels: Named[] } | null = null;
-      if (input.playoffs && division.canGeneratePreliminary && division.teamCount >= 4) bracket = this.bracket(division.id, this.seeds(division.id), !!input.thirdPlace);
+      const playoffTeams = this.playoffSize(division.teamCount, input.playoffTeams);
+      let bracket: { matches: ScheduleMatch[]; labels: Named[]; playoffTeams: number } | null = null;
+      if (input.playoffs && division.canGeneratePreliminary && playoffTeams) bracket = this.bracket(division.id, this.seeds(division.id, playoffTeams), !!input.thirdPlace);
       else if (input.playoffs && !division.canGeneratePreliminary && division.playoff) bracket = division.playoff;
       return { ...division, fixtures, bracket, labels: [...division.teams, ...(bracket?.labels ?? [])] };
     });
     const included = planned.filter((division) => division.fixtures.length || division.bracket);
     const details = planned.map((division) => {
       const reason = included.includes(division) ? undefined : input.playoffs && division.hasSchedule ? division.playoffReason : division.preliminaryReason;
+      const notice = input.playoffs && division.fixtures.length && !division.bracket ? 'Fewer than four teams; round robin only.'
+        : input.playoffs && input.playoffTeams === 8 && division.bracket && division.teamCount < 8 ? 'Fewer than eight teams; the top four make the playoffs.' : undefined;
       return { id: division.id, name: division.name, teamCount: division.teamCount, ...(reason ? { reason } : {}),
-        roundRobin: division.fixtures.length > 0, playoffs: !!division.bracket,
-        ...(input.playoffs && division.fixtures.length && !division.bracket ? { notice: 'Fewer than four teams; round robin only.' } : {}) };
+        roundRobin: division.fixtures.length > 0, playoffs: !!division.bracket, ...(division.bracket ? { playoffTeams: division.bracket.playoffTeams } : {}),
+        ...(notice ? { notice } : {}) };
     });
     if (!included.length && !allowEmpty) throw new BadRequestException(input.playoffs ? 'No divisions are ready for a round robin or playoffs.' : 'No divisions are eligible for schedule generation.');
     const tagged = (division: (typeof included)[number], matches: ScheduleMatch[]) => matches.map((match) => ({ ...match, divisionId: division.id, groupId: division.id }));
@@ -482,12 +490,12 @@ export class ScheduleService {
         if (division.fixtures.length) {
           const playoffs = !!division.bracket;
           const schedule = await tx.insertInto('league.division_schedules').values({ division_id: division.id, format: input.format, playoffs,
-            third_place: playoffs && !!input.thirdPlace, team_ids: division.teams.map((team) => team.id) }).returning('id').executeTakeFirstOrThrow();
+            third_place: playoffs && !!input.thirdPlace, playoff_teams: division.bracket?.playoffTeams ?? 4, team_ids: division.teams.map((team) => team.id) }).returning('id').executeTakeFirstOrThrow();
           scheduleId = schedule.id;
         }
         if (!scheduleId) throw new BadRequestException('The playoff schedule changed; generate a new preview');
         await this.insert(tx, division.context, scheduleId, input.games.filter((game) => game.divisionId === division.id), [...division.fixtures, ...(division.bracket?.matches ?? [])]);
-        if (!division.fixtures.length && division.playoff) await this.recordPlayoffs(tx, scheduleId, division.playoff.thirdPlace);
+        if (!division.fixtures.length && division.playoff) await this.recordPlayoffs(tx, scheduleId, division.playoff.thirdPlace, division.playoff.playoffTeams);
       }
       return { saved: input.games.length };
     });
@@ -510,32 +518,67 @@ export class ScheduleService {
       const existing = await this.existing(tx, context.leagueId, input.availability);
       this.trySchedule(() => validateSchedule(input.games, input.availability, existing));
       const schedule = await tx.insertInto('league.division_schedules').values({ division_id: divisionId, format: input.format,
-        playoffs: !!input.playoffs, third_place: !!input.thirdPlace, team_ids: teams.map((team) => team.id) }).returning('id').executeTakeFirstOrThrow();
+        playoffs: !!input.playoffs, third_place: !!input.thirdPlace, playoff_teams: input.playoffTeams ?? 4, team_ids: teams.map((team) => team.id) }).returning('id').executeTakeFirstOrThrow();
       await this.insert(tx, context, schedule.id, input.games, []);
       return { saved: input.games.length };
     });
   }
 
-  // Semifinals 1 vs 4 and 2 vs 3 in round 1, then the championship and optional third-place game for their winners and losers.
-  private bracket(divisionId: string, seeds: Named[], thirdPlace: boolean) {
-    const pairs = [[seeds[0], seeds[3]], [seeds[1], seeds[2]]] as const;
-    const slot = (semifinal: 1 | 2, outcome: 'winner' | 'loser') => bracketSlot(divisionId, semifinal, outcome);
-    const matches: ScheduleMatch[] = pairs.map(([home, away], index) => ({ homeTeamId: home.id, awayTeamId: away.id, round: 1, stage: 'semifinal' as const,
-      aliases: [slot(index ? 2 : 1, 'winner'), slot(index ? 2 : 1, 'loser')] }));
-    matches.push({ homeTeamId: slot(1, 'winner'), awayTeamId: slot(2, 'winner'), round: 2, stage: 'final' });
-    if (thirdPlace) matches.push({ homeTeamId: slot(1, 'loser'), awayTeamId: slot(2, 'loser'), round: 2, stage: 'third_place' });
-    const labels = [...seeds, ...pairs.flatMap(([home, away], index) => (['winner', 'loser'] as const).map((outcome) => ({
-      id: slot(index ? 2 : 1, outcome), name: pendingLabel(outcome, home.name, away.name) })))];
+  // The top eight when chosen and the division has eight teams, otherwise the top four; fewer than four teams have no playoffs.
+  private playoffSize(teamCount: number, requested?: number | null) {
+    if (teamCount < 4) return null;
+    return requested === 8 && teamCount >= 8 ? 8 : 4;
+  }
+
+  // One bracket round. Each game also stands in for its future winner and loser, which the next round takes.
+  private playoffRound(divisionId: string, stage: BracketStage, round: number, pairs: [Named, Named][]) {
+    const known = (side: Named) => parseBracketSlot(side.id) || parseSavedSlot(side.id) ? null : side.name;
+    return pairs.map(([home, away], index) => {
+      const slot = (outcome: 'winner' | 'loser') => ({ id: bracketSlot(divisionId, stage, index + 1, outcome), name: resultLabel(outcome, stage, index + 1, known(home), known(away)) });
+      const winner = slot('winner');
+      const loser = slot('loser');
+      const match: ScheduleMatch = { homeTeamId: home.id, awayTeamId: away.id, round, stage, aliases: [winner.id, loser.id] };
+      return { match, winner, loser };
+    });
+  }
+
+  // The rounds after quarterfinals or semifinals whose results are still to come. Quarterfinal 1 and 2 winners meet in
+  // semifinal 1, and 3 and 4 in semifinal 2; the semifinal winners play the championship and the losers the optional third-place game.
+  private laterRounds(divisionId: string, results: BracketResult[], stage: BracketStage, round: number, thirdPlace: boolean) {
+    const matches: ScheduleMatch[] = [];
+    const labels: Named[] = [];
+    let semifinals = results;
+    let semifinalRound = round;
+    if (stage === 'quarterfinal') {
+      semifinalRound = round + 1;
+      const games = this.playoffRound(divisionId, 'semifinal', semifinalRound, [[results[0].winner, results[1].winner], [results[2].winner, results[3].winner]]);
+      matches.push(...games.map((game) => game.match));
+      labels.push(...games.flatMap((game) => [game.winner, game.loser]));
+      semifinals = games;
+    }
+    matches.push({ homeTeamId: semifinals[0].winner.id, awayTeamId: semifinals[1].winner.id, round: semifinalRound + 1, stage: 'final' });
+    if (thirdPlace) matches.push({ homeTeamId: semifinals[0].loser.id, awayTeamId: semifinals[1].loser.id, round: semifinalRound + 1, stage: 'third_place' });
     return { matches, labels };
   }
 
-  // Seeds stand in for the top four teams until the final standings decide them.
-  private seeds(divisionId: string): Named[] {
-    return [1, 2, 3, 4].map((seed) => ({ id: seedSlot(divisionId, seed), name: seedLabel(seed) }));
+  // Seeds meet in bracket order in round 1: semifinals 1 vs 4 and 2 vs 3, or quarterfinals 1 vs 8, 4 vs 5, 2 vs 7 and 3 vs 6.
+  private bracket(divisionId: string, seeds: Named[], thirdPlace: boolean) {
+    const stage: BracketStage = seeds.length === 8 ? 'quarterfinal' : 'semifinal';
+    const order = bracketOrder(seeds.length).map((seed) => seeds[seed - 1]);
+    const pairs = Array.from({ length: order.length / 2 }, (_, index): [Named, Named] => [order[index * 2], order[index * 2 + 1]]);
+    const first = this.playoffRound(divisionId, stage, 1, pairs);
+    const later = this.laterRounds(divisionId, first, stage, 1, thirdPlace);
+    return { matches: [...first.map((game) => game.match), ...later.matches], labels: [...seeds, ...first.flatMap((game) => [game.winner, game.loser]), ...later.labels],
+      playoffTeams: seeds.length };
   }
 
-  // Any division with a generated round robin and at least four teams can schedule playoffs; the third-place choice is made here.
-  private async playoffMatches(db: Database, context: DivisionContext, thirdPlaceChoice?: boolean) {
+  // Seeds stand in for the top teams until the final standings decide them.
+  private seeds(divisionId: string, count: number): Named[] {
+    return Array.from({ length: count }, (_, index) => ({ id: seedSlot(divisionId, index + 1), name: seedLabel(index + 1) }));
+  }
+
+  // Any division with a generated round robin and at least four teams can schedule playoffs; the bracket size and third-place game are chosen here.
+  private async playoffMatches(db: Database, context: DivisionContext, thirdPlaceChoice?: boolean, playoffTeamsChoice?: number) {
     this.editable(context);
     const [schedule, teams, games] = await Promise.all([
       db.selectFrom('league.division_schedules').selectAll().where('division_id', '=', context.divisionId).executeTakeFirst(),
@@ -551,44 +594,54 @@ export class ScheduleService {
     const generated = preliminary.filter((game) => game.schedule_id === schedule.id);
     this.sameMatches(expected, generated.map((game) => ({ homeTeamId: game.home_season_team_id!, awayTeamId: game.away_season_team_id!,
       round: game.round ?? 0, stage: 'preliminary', scheduledAt: '', venueId: '', durationMinutes: 1 })));
-    const semifinals = games.filter((game) => game.stage === 'semifinal');
     if (games.some((game) => game.stage === 'final' || game.stage === 'third_place')) throw new BadRequestException('Playoff games are already scheduled.');
-    let matches: ScheduleMatch[];
-    let labels: Named[] = teams;
-    if (!semifinals.length) {
-      // The whole bracket at once. Until every round-robin game is final, the semifinals take seeds that the standings fill in later.
+    const quarterfinals = games.filter((game) => game.stage === 'quarterfinal');
+    const semifinals = games.filter((game) => game.stage === 'semifinal');
+    if (!quarterfinals.length && !semifinals.length) {
+      // The whole bracket at once. Until every round-robin game is final, the first round takes seeds that the standings fill in later.
+      const playoffTeams = this.playoffSize(teams.length, playoffTeamsChoice ?? schedule.playoff_teams)!;
       const complete = preliminary.every((game) => game.status === 'completed');
       const seeds = complete ? calculateStandings(teams, preliminary.map((game) => ({ homeId: game.home_season_team_id!, awayId: game.away_season_team_id!,
-        homeScore: game.home_score!, awayScore: game.away_score! }))).slice(0, 4) : this.seeds(context.divisionId);
+        homeScore: game.home_score!, awayScore: game.away_score! }))).slice(0, playoffTeams) : this.seeds(context.divisionId, playoffTeams);
       const bracket = this.bracket(context.divisionId, seeds, thirdPlace);
-      matches = bracket.matches;
-      labels = [...teams, ...bracket.labels];
-    } else {
-      // Semifinals saved on their own: the later games take each result now if it is in, or when it is recorded.
-      if (semifinals.length !== 2) throw new BadRequestException('Playoffs need exactly two semifinals');
-      semifinals.sort((a, b) => a.id.localeCompare(b.id));
-      const side = (game: typeof semifinals[number], outcome: 'winner' | 'loser') => {
-        if (game.status !== 'completed') return game.id + ':' + outcome;
-        const homeWon = game.home_score! > game.away_score!;
-        return (homeWon === (outcome === 'winner') ? game.home_season_team_id : game.away_season_team_id)!;
-      };
-      matches = [{ homeTeamId: side(semifinals[0], 'winner'), awayTeamId: side(semifinals[1], 'winner'), round: 2, stage: 'final' }];
-      if (thirdPlace) matches.push({ homeTeamId: side(semifinals[0], 'loser'), awayTeamId: side(semifinals[1], 'loser'), round: 2, stage: 'third_place' });
-      const name = (id: string | null) => teams.find((team) => team.id === id)?.name ?? '';
-      labels = [...teams, ...semifinals.filter((game) => game.status !== 'completed').flatMap((game) => (['winner', 'loser'] as const).map((outcome) => ({
-        id: game.id + ':' + outcome, name: pendingLabel(outcome, name(game.home_season_team_id), name(game.away_season_team_id)) })))];
+      return { teams, labels: [...teams, ...bracket.labels], matches: bracket.matches, schedule, thirdPlace, playoffTeams };
     }
-    return { teams, labels, matches, schedule, thirdPlace };
+    // Bracket games saved before the rest: the later rounds take each result now if it is in, or when it is recorded.
+    const stage: BracketStage = semifinals.length ? 'semifinal' : 'quarterfinal';
+    const current = semifinals.length ? semifinals : quarterfinals;
+    if (current.length !== (stage === 'semifinal' ? 2 : 4)) throw new BadRequestException(stage === 'semifinal' ? 'Playoffs need exactly two semifinals' : 'Playoffs need exactly four quarterfinals');
+    // Each game keeps its place in the bracket, found from its seeds or from the quarterfinal it waits for. Games saved without seeds keep a fixed order.
+    const byId = new Map(games.map((game) => [game.id, game]));
+    const position = (game: (typeof games)[number]): number => {
+      if (game.home_seed) return bracketOrder(8).indexOf(game.home_seed);
+      const source = game.home_source_game_id ? byId.get(game.home_source_game_id) : undefined;
+      return source ? position(source) : Infinity;
+    };
+    current.sort((a, b) => position(a) - position(b) || a.id.localeCompare(b.id));
+    const name = (team: string | null, seed: number | null) => teams.find((item) => item.id === team)?.name ?? (seed ? seedLabel(seed) : null);
+    const results = current.map((game, index): BracketResult => {
+      if (game.status === 'completed') {
+        const homeWon = game.home_score! > game.away_score!;
+        const named = (team: string | null) => ({ id: team!, name: name(team, null) ?? '' });
+        return { winner: named(homeWon ? game.home_season_team_id : game.away_season_team_id), loser: named(homeWon ? game.away_season_team_id : game.home_season_team_id) };
+      }
+      const slot = (outcome: 'winner' | 'loser') => ({ id: game.id + ':' + outcome,
+        name: resultLabel(outcome, stage, index + 1, name(game.home_season_team_id, game.home_seed), name(game.away_season_team_id, game.away_seed)) });
+      return { winner: slot('winner'), loser: slot('loser') };
+    });
+    const later = this.laterRounds(context.divisionId, results, stage, Math.max(...current.map((game) => game.round ?? 1)), thirdPlace);
+    return { teams, labels: [...teams, ...results.flatMap((result) => [result.winner, result.loser]), ...later.labels], matches: later.matches, schedule, thirdPlace,
+      playoffTeams: quarterfinals.length ? 8 : 4 };
   }
 
   // Once a bracket is saved the season requires its championship, and the third-place game if chosen.
-  private async recordPlayoffs(tx: Transaction<DB>, scheduleId: string, thirdPlace: boolean) {
-    await tx.updateTable('league.division_schedules').set({ playoffs: true, third_place: thirdPlace }).where('id', '=', scheduleId).execute();
+  private async recordPlayoffs(tx: Transaction<DB>, scheduleId: string, thirdPlace: boolean, playoffTeams: number) {
+    await tx.updateTable('league.division_schedules').set({ playoffs: true, third_place: thirdPlace, playoff_teams: playoffTeams }).where('id', '=', scheduleId).execute();
   }
 
   async previewPlayoffs(user: string, divisionId: string, input: PlayoffOptionsDto) {
     const context = await this.context(user, divisionId, this.db);
-    const { teams, labels, matches } = await this.playoffMatches(this.db, context, input.thirdPlace);
+    const { teams, labels, matches } = await this.playoffMatches(this.db, context, input.thirdPlace, input.playoffTeams);
     await this.validateVenues(this.db, context.leagueId, input.availability);
     await this.validatePlayoffDates(this.db, context, input.availability);
     this.checkTeamAvailability(input.availability, teams.map((team) => team.id));
@@ -601,7 +654,7 @@ export class ScheduleService {
     return this.db.transaction().execute(async (tx) => {
       const context = await this.context(user, divisionId, tx, true);
       await this.leagueLock(tx, context.leagueId);
-      const { teams, matches, schedule, thirdPlace } = await this.playoffMatches(tx, context, input.thirdPlace);
+      const { teams, matches, schedule, thirdPlace, playoffTeams } = await this.playoffMatches(tx, context, input.thirdPlace, input.playoffTeams);
       await this.validateVenues(tx, context.leagueId, input.availability);
       await this.validatePlayoffDates(tx, context, input.availability);
       this.checkTeamAvailability(input.availability, teams.map((team) => team.id));
@@ -609,57 +662,58 @@ export class ScheduleService {
       const existing = await this.existing(tx, context.leagueId, input.availability);
       this.trySchedule(() => validateSchedule(this.withAliases(input.games, matches), input.availability, existing));
       await this.insert(tx, context, schedule.id, input.games, matches);
-      await this.recordPlayoffs(tx, schedule.id, thirdPlace);
+      await this.recordPlayoffs(tx, schedule.id, thirdPlace, playoffTeams);
       return { saved: input.games.length };
     });
   }
 
-  // Games whose sides wait for a semifinal are saved after it, pointing at it until its result fills in the team.
-  // Semifinals record their seeds; a seeded side has no team until the final standings fill it in.
+  // Round-robin games are saved together. Bracket games are saved round by round, so a game waiting for an earlier game's
+  // winner or loser can point at it until its result fills in the team. First-round games record the seeds of their place in
+  // the bracket; a seeded side has no team until the final standings fill it in.
   private async insert(tx: Transaction<DB>, context: DivisionContext, scheduleId: string, games: ScheduleGame[], matches: ScheduleMatch[]) {
-    const isSlot = (id: string) => !!parseBracketSlot(id) || !!parseSavedSlot(id);
-    const pending = (game: ScheduleGame) => isSlot(game.homeTeamId) || isSlot(game.awayTeamId);
+    const key = (match: ScheduleMatch) => [match.stage, match.round, match.homeTeamId, match.awayTeamId].join(':');
+    const slots = new Map(matches.flatMap((match) => {
+      const slot = match.aliases?.map(parseBracketSlot).find((item) => item);
+      return slot ? [[key(match), slot] as const] : [];
+    }));
     const row = (game: ScheduleGame) => ({ season_id: context.seasonId, division_id: context.divisionId, scheduled_at: new Date(game.scheduledAt),
       venue_id: game.venueId, duration_minutes: game.durationMinutes, stage: game.stage, round: game.round, schedule_id: scheduleId });
-    // Semifinal 1 is seeds 1 and 4 and semifinal 2 is seeds 2 and 3; the number comes from the slots its winner and loser fill.
-    const semifinalNumber = (game: ScheduleGame) => matches.find((item) => item.stage === 'semifinal' && item.homeTeamId === game.homeTeamId && item.awayTeamId === game.awayTeamId)
-      ?.aliases?.map(parseBracketSlot).find((slot) => slot)?.semifinal;
-    const team = (id: string) => {
-      const seed = parseSeedSlot(id);
-      if (seed && seed.divisionId !== context.divisionId) throw new BadRequestException('The schedule has changed; generate a new preview');
-      return seed ? null : id;
-    };
-    const known = games.filter((game) => !pending(game));
-    const saved = known.length ? await tx.insertInto('league.games').values(known.map((game) => {
-      const number = game.stage === 'semifinal' ? semifinalNumber(game) : undefined;
-      return { ...row(game), home_season_team_id: team(game.homeTeamId), away_season_team_id: team(game.awayTeamId),
-        home_seed: number ?? null, away_seed: number ? 5 - number : null };
-    })).returning(['id', 'stage', 'home_seed']).execute() : [];
-    const later = games.filter(pending);
-    if (!later.length) return;
-    const savedSemifinals = new Set((await tx.selectFrom('league.games').select('id').where('division_id', '=', context.divisionId).where('stage', '=', 'semifinal').execute()).map((game) => game.id));
-    const semifinalId = (number: 1 | 2) => {
-      const game = saved.find((item) => item.stage === 'semifinal' && item.home_seed === number);
-      if (!game) throw new BadRequestException('Schedule both semifinals with the rest of the bracket');
-      return game.id;
-    };
+    const preliminary = games.filter((game) => game.stage === 'preliminary');
+    if (preliminary.length) await tx.insertInto('league.games').values(preliminary.map((game) => ({ ...row(game), home_season_team_id: game.homeTeamId, away_season_team_id: game.awayTeamId }))).execute();
+    const playoff = games.filter((game) => game.stage !== 'preliminary').sort((a, b) => a.round - b.round);
+    if (!playoff.length) return;
+    const saved = await tx.selectFrom('league.games').select(['id', 'stage']).where('division_id', '=', context.divisionId).where('stage', 'in', ['quarterfinal', 'semifinal']).execute();
+    // A bracket continuing from saved quarterfinals has no seeded games.
+    const firstStage = matches.some((match) => match.stage === 'quarterfinal') ? 'quarterfinal' : saved.some((game) => game.stage === 'quarterfinal') ? null : 'semifinal';
+    const order = bracketOrder(firstStage === 'quarterfinal' ? 8 : 4);
+    const inserted = new Map<string, string>();
     const side = (id: string) => {
-      const existing = parseSavedSlot(id);
-      if (existing) {
-        if (!savedSemifinals.has(existing.gameId)) throw new BadRequestException('The schedule has changed; generate a new preview');
-        return { team: null, source: existing.gameId, outcome: existing.outcome };
+      const seed = parseSeedSlot(id);
+      if (seed) {
+        if (seed.divisionId !== context.divisionId) throw new BadRequestException('The schedule has changed; generate a new preview');
+        return { team: null, source: null, outcome: null };
+      }
+      const savedSlot = parseSavedSlot(id);
+      if (savedSlot) {
+        if (!saved.some((game) => game.id === savedSlot.gameId)) throw new BadRequestException('The schedule has changed; generate a new preview');
+        return { team: null, source: savedSlot.gameId, outcome: savedSlot.outcome };
       }
       const slot = parseBracketSlot(id);
       if (!slot) return { team: id, source: null, outcome: null };
-      if (slot.divisionId !== context.divisionId) throw new BadRequestException('The schedule has changed; generate a new preview');
-      return { team: null, source: semifinalId(slot.semifinal), outcome: slot.outcome };
+      const source = slot.divisionId === context.divisionId ? inserted.get(`${slot.stage}-${slot.number}`) : undefined;
+      if (!source) throw new BadRequestException('Schedule the whole bracket together');
+      return { team: null, source, outcome: slot.outcome };
     };
-    await tx.insertInto('league.games').values(later.map((game) => {
+    for (const game of playoff) {
       const home = side(game.homeTeamId);
       const away = side(game.awayTeamId);
-      return { ...row(game), home_season_team_id: home.team, away_season_team_id: away.team, home_source_game_id: home.source,
-        home_source_outcome: home.outcome, away_source_game_id: away.source, away_source_outcome: away.outcome };
-    })).execute();
+      const slot = slots.get(key(game));
+      const seeded = slot && slot.stage === firstStage;
+      const created = await tx.insertInto('league.games').values({ ...row(game), home_season_team_id: home.team, away_season_team_id: away.team,
+        home_source_game_id: home.source, home_source_outcome: home.outcome, away_source_game_id: away.source, away_source_outcome: away.outcome,
+        home_seed: seeded ? order[slot.number * 2 - 2] : null, away_seed: seeded ? order[slot.number * 2 - 1] : null }).returning('id').executeTakeFirstOrThrow();
+      if (slot) inserted.set(`${slot.stage}-${slot.number}`, created.id);
+    }
   }
 
   async remove(user: string, gameId: string) {
@@ -674,9 +728,9 @@ export class ScheduleService {
       if (game.status !== 'scheduled') throw new BadRequestException('Only unplayed scheduled games can be removed');
       const stats = await tx.selectFrom('league.player_game_stats').select('id').where('game_id', '=', gameId).executeTakeFirst();
       if (stats) throw new BadRequestException('Games with dependent records cannot be removed');
-      if (game.stage === 'preliminary' || game.stage === 'semifinal') {
-        const later = await tx.selectFrom('league.games').select('id').where('division_id', '=', context.divisionId)
-          .where('stage', 'in', game.stage === 'preliminary' ? ['semifinal', 'final', 'third_place'] : ['final', 'third_place']).executeTakeFirst();
+      const laterStages: Record<string, string[]> = { preliminary: ['quarterfinal', 'semifinal', 'final', 'third_place'], quarterfinal: ['semifinal', 'final', 'third_place'], semifinal: ['final', 'third_place'] };
+      if (laterStages[game.stage]) {
+        const later = await tx.selectFrom('league.games').select('id').where('division_id', '=', context.divisionId).where('stage', 'in', laterStages[game.stage]).executeTakeFirst();
         if (later) throw new BadRequestException('Remove dependent playoff games first');
       }
       await tx.deleteFrom('league.games').where('id', '=', gameId).execute();

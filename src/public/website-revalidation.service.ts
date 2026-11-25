@@ -8,7 +8,7 @@ const RESOURCES = new Set<string>(['organizations', 'leagues', 'seasons', 'divis
 // Schedule planning requests only compute previews and change nothing.
 const DIAGNOSTIC_ROUTE = /\/(preview|estimate|validate|suggest|calendar)$/;
 // Individual plays, clock changes and takeovers change nothing on the website until a live game finishes.
-const LIVE_PLAY_ROUTE = /\/live\/(events|clock|period|claim)(\/|$)/;
+const LIVE_PLAY_ROUTE = /\/live\/(events|clock|period|claim|shot-clock)(\/|$)/;
 const ROUTE = /^\/league\/([a-z-]+)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\/|$)/i;
 
 export type Snapshot = { leagueIds: string[]; slugs: string[] };

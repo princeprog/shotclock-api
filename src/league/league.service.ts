@@ -3,7 +3,7 @@ import { sql, type Kysely, type Selectable, type Transaction } from 'kysely';
 import { DatabaseService } from '../database/database.service';
 import type { DB } from '../database/db';
 import { calculateStandings } from './standings';
-import { labelPending } from './bracket';
+import { bracketOrder, labelPending } from './bracket';
 import { slugify, uniqueSlug } from './slug';
 import { ForfeitDto } from './forfeit.dto';
 import { paginationMeta } from '../common/pagination';
@@ -626,7 +626,7 @@ export class LeagueService {
     const items = await labelPending(this.db, await query.orderBy('g.scheduled_at', filters.sort ?? 'asc').orderBy('g.id', 'asc').limit(meta.pageSize).offset((meta.page - 1) * meta.pageSize).execute());
     return { items, ...meta };
   }
-  // A fixed side list keeps a generated game's teams, including sides still waiting for a semifinal.
+  // A fixed side list keeps a generated game's teams, including sides still waiting for an earlier playoff game.
   private async gameValues(user: string, season: { id: string; league_id: string }, dto: GameDto, tx: Database, fixed?: { division_id: string; home: string | null; away: string | null }) {
     if (!fixed && (!dto.homeTeamId || !dto.awayTeamId)) throw new BadRequestException('Choose a home team and an away team');
     if (!fixed && dto.homeTeamId === dto.awayTeamId) throw new BadRequestException('Teams must differ');
@@ -668,27 +668,28 @@ export class LeagueService {
         throw new BadRequestException('Game conflicts with another game at this venue or involving a team');
       }
     }
-    // The round robin ends before the division's semifinals start.
-    if (game.stage === 'preliminary' || game.stage === 'semifinal') {
-      const others = await tx.selectFrom('league.games').select(['scheduled_at', 'duration_minutes']).where('division_id', '=', game.division_id)
-        .where('stage', '=', game.stage === 'preliminary' ? 'semifinal' : 'preliminary').where('scheduled_at', 'is not', null).execute();
+    // The round robin ends before the division's quarterfinals or semifinals start.
+    const roundNames: Record<string, string> = { quarterfinal: 'quarterfinals', semifinal: 'semifinals' };
+    if (game.stage === 'preliminary' || roundNames[game.stage]) {
+      const others = await tx.selectFrom('league.games').select(['stage', 'scheduled_at', 'duration_minutes']).where('division_id', '=', game.division_id)
+        .where('stage', 'in', game.stage === 'preliminary' ? ['quarterfinal', 'semifinal'] : ['preliminary']).where('scheduled_at', 'is not', null).execute();
       for (const other of others) {
         const otherStart = new Date(other.scheduled_at!).getTime();
-        if (game.stage === 'preliminary' && end > otherStart) throw new BadRequestException('Round-robin games must end before the semifinals start');
-        if (game.stage === 'semifinal' && start < otherStart + (other.duration_minutes ?? duration) * 60_000) throw new BadRequestException('Semifinals must start after the round robin ends');
+        if (game.stage === 'preliminary' && end > otherStart) throw new BadRequestException(`Round-robin games must end before the ${roundNames[other.stage]} start`);
+        if (game.stage !== 'preliminary' && start < otherStart + (other.duration_minutes ?? duration) * 60_000) throw new BadRequestException(`${game.stage === 'quarterfinal' ? 'Quarterfinals' : 'Semifinals'} must start after the round robin ends`);
       }
     }
-    // Bracket order: a game waiting for a semifinal starts after it ends, and a semifinal ends before the games waiting for it.
+    // Bracket order: a game waiting for an earlier playoff game starts after it ends, and that game ends before the games waiting for it.
     const sources = [game.home_source_game_id, game.away_source_game_id].filter((source): source is string => !!source);
-    const linked = game.stage === 'semifinal' || sources.length ? await tx.selectFrom('league.games').select(['id', 'scheduled_at', 'duration_minutes', 'home_source_game_id', 'away_source_game_id'])
+    const linked = roundNames[game.stage] || sources.length ? await tx.selectFrom('league.games').select(['id', 'stage', 'scheduled_at', 'duration_minutes', 'home_source_game_id', 'away_source_game_id'])
       .where((eb) => eb.or([eb('home_source_game_id', '=', id), eb('away_source_game_id', '=', id), ...(sources.length ? [eb('id', 'in', sources)] : [])])).execute() : [];
     for (const other of linked) {
       if (!other.scheduled_at) continue;
       const otherStart = new Date(other.scheduled_at).getTime();
       const source = sources.includes(other.id);
       if (!source && other.home_source_game_id !== id && other.away_source_game_id !== id) continue;
-      if (source && start < otherStart + (other.duration_minutes ?? duration) * 60_000) throw new BadRequestException('This game must start after the semifinal it waits for ends');
-      if (!source && end > otherStart) throw new BadRequestException('This semifinal must end before the playoff games that wait for its result');
+      if (source && start < otherStart + (other.duration_minutes ?? duration) * 60_000) throw new BadRequestException(`This game must start after the ${other.stage} it waits for ends`);
+      if (!source && end > otherStart) throw new BadRequestException(`This ${game.stage} must end before the playoff games that wait for its result`);
     }
     const updated = await tx.updateTable('league.games').set({ ...values, ...(scheduleChanged ? { duration_minutes: duration } : {}), updated_at: new Date() }).where('id', '=', id).returningAll().executeTakeFirstOrThrow();
     if (scheduleChanged) await tx.insertInto('league.game_schedule_changes').values({
@@ -714,55 +715,64 @@ export class LeagueService {
     if (proposed) results.push({ homeId: proposed.game.home_season_team_id!, awayId: proposed.game.away_season_team_id!, homeScore: proposed.score.homeScore, awayScore: proposed.score.awayScore });
     return calculateStandings(teams, results);
   }
-  private semifinalPairings(standings: { id: string }[]) {
-    const seeds = standings.slice(0, 4).map((row) => row.id);
-    if (seeds.length < 4) return JSON.stringify(seeds);
-    return JSON.stringify([[seeds[0], seeds[3]].sort(), [seeds[1], seeds[2]].sort()].sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1])));
+  // The first-round pairings the standings give for a bracket of four or eight, compared regardless of home and away or game order.
+  private seededPairings(standings: { id: string }[], size: number) {
+    const seeds = standings.slice(0, size).map((row) => row.id);
+    if (seeds.length < size) return JSON.stringify(seeds);
+    const order = bracketOrder(size);
+    const pairs = Array.from({ length: size / 2 }, (_, index) => [seeds[order[index * 2] - 1], seeds[order[index * 2 + 1] - 1]].sort());
+    return JSON.stringify(pairs.sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1])));
   }
-  // Semifinals scheduled with the round robin take their teams from the final standings once every round-robin game is final.
-  private async fillSeededSemifinals(tx: Transaction<DB>, seasonId: string, divisionId: string) {
-    const waiting = await tx.selectFrom('league.games').select(['id', 'home_seed', 'away_seed']).where('division_id', '=', divisionId).where('stage', '=', 'semifinal')
+  // First-round games scheduled with the round robin take their teams from the final standings once every round-robin game is final.
+  private async fillSeededGames(tx: Transaction<DB>, seasonId: string, divisionId: string) {
+    const waiting = await tx.selectFrom('league.games').select(['id', 'home_seed', 'away_seed']).where('division_id', '=', divisionId).where('stage', 'in', ['quarterfinal', 'semifinal'])
       .where('home_season_team_id', 'is', null).where('home_seed', 'is not', null).where('away_seed', 'is not', null).execute();
     if (!waiting.length) return;
     const unplayed = await tx.selectFrom('league.games').select('id').where('division_id', '=', divisionId).where('stage', '=', 'preliminary').where('status', '!=', 'completed').executeTakeFirst();
     if (unplayed) return;
     const standings = await this.preliminaryStandings(tx, seasonId, divisionId);
-    if (standings.length < 4) throw new BadRequestException('Playoffs need at least four teams');
-    for (const semifinal of waiting) {
-      await tx.updateTable('league.games').set({ home_season_team_id: standings[semifinal.home_seed! - 1].id, away_season_team_id: standings[semifinal.away_seed! - 1].id, updated_at: new Date() })
-        .where('id', '=', semifinal.id).execute();
+    const needed = Math.max(...waiting.flatMap((game) => [game.home_seed!, game.away_seed!]));
+    if (standings.length < needed) throw new BadRequestException(`Playoffs need at least ${needed} teams`);
+    for (const seeded of waiting) {
+      await tx.updateTable('league.games').set({ home_season_team_id: standings[seeded.home_seed! - 1].id, away_season_team_id: standings[seeded.away_seed! - 1].id, updated_at: new Date() })
+        .where('id', '=', seeded.id).execute();
     }
   }
   private async writeGameResult(tx: Transaction<DB>, seasonId: string, game: Selectable<DB['league.games']>, dto: ScoreDto, forfeitingTeamId: string | null) {
     if (!game.home_season_team_id || !game.away_season_team_id) throw new BadRequestException('Both teams must be known before recording a result');
     if (dto.homeScore === dto.awayScore) throw new BadRequestException('Final scores cannot be tied');
-    // Bracket games that take this semifinal's winner or loser.
-    const dependents = game.stage === 'semifinal' ? await tx.selectFrom('league.games').select(['id', 'status', 'home_source_game_id', 'home_source_outcome', 'away_source_game_id', 'away_source_outcome'])
+    // Bracket games that take this quarterfinal's or semifinal's winner or loser.
+    const bracketRound = game.stage === 'quarterfinal' || game.stage === 'semifinal';
+    const roundName = game.stage === 'quarterfinal' ? 'Quarterfinal' : 'Semifinal';
+    const dependents = bracketRound ? await tx.selectFrom('league.games').select(['id', 'status', 'home_source_game_id', 'home_source_outcome', 'away_source_game_id', 'away_source_outcome'])
       .where((eb) => eb.or([eb('home_source_game_id', '=', game.id), eb('away_source_game_id', '=', game.id)])).execute()
       .then((rows) => rows.filter((next) => next.home_source_game_id === game.id || next.away_source_game_id === game.id)) : [];
     if (game.stage === 'preliminary') {
-      // Seeded semifinals still waiting for the standings can change freely; once filled, their pairings are fixed.
-      const semifinal = await tx.selectFrom('league.games').select('id').where('season_id', '=', seasonId).where('division_id', '=', game.division_id).where('stage', '=', 'semifinal')
-        .where('home_season_team_id', 'is not', null).executeTakeFirst();
-      if (semifinal) {
+      // Seeded first-round games still waiting for the standings can change freely; once filled, their pairings are fixed.
+      const filled = await tx.selectFrom('league.games').select('stage').where('season_id', '=', seasonId).where('division_id', '=', game.division_id).where('stage', 'in', ['quarterfinal', 'semifinal'])
+        .where('home_season_team_id', 'is not', null).execute();
+      if (filled.length) {
+        const size = filled.some((item) => item.stage === 'quarterfinal') ? 8 : 4;
         const before = await this.preliminaryStandings(tx, seasonId, game.division_id);
         const after = await this.preliminaryStandings(tx, seasonId, game.division_id, { game, score: dto });
-        if (this.semifinalPairings(before) !== this.semifinalPairings(after)) throw new BadRequestException('Score would change existing semifinal pairings');
+        if (this.seededPairings(before, size) !== this.seededPairings(after, size)) throw new BadRequestException('Score would change existing playoff pairings');
       }
-    } else if (game.stage === 'semifinal' && game.status === 'completed' && game.home_score !== null && game.away_score !== null && (game.home_score > game.away_score) !== (dto.homeScore > dto.awayScore)) {
+    } else if (bracketRound && game.status === 'completed' && game.home_score !== null && game.away_score !== null && (game.home_score > game.away_score) !== (dto.homeScore > dto.awayScore)) {
       // Waiting games follow a corrected winner until they are played; finals created from known winners cannot change.
-      if (dependents.some((next) => next.status !== 'scheduled')) throw new BadRequestException('Semifinal winner cannot change after the championship or third-place game is played');
+      if (dependents.some((next) => next.status !== 'scheduled')) throw new BadRequestException(`${roundName} winner cannot change after the next playoff game is played`);
       if (dependents.length) {
         const stats = await tx.selectFrom('league.player_game_stats').select('id').where('game_id', 'in', dependents.map((next) => next.id)).executeTakeFirst();
-        if (stats) throw new BadRequestException('Semifinal winner cannot change after player statistics are recorded for the next game');
+        if (stats) throw new BadRequestException(`${roundName} winner cannot change after player statistics are recorded for the next game`);
       }
-      const next = await tx.selectFrom('league.games').select('id').where('season_id', '=', seasonId).where('division_id', '=', game.division_id).where('schedule_id', '=', game.schedule_id).where('stage', 'in', ['final', 'third_place'])
+      // Next-round games created from already known winners keep their teams, so the winner is fixed once they exist.
+      const nextStages = game.stage === 'quarterfinal' ? ['semifinal'] : ['final', 'third_place'];
+      const next = await tx.selectFrom('league.games').select('id').where('season_id', '=', seasonId).where('division_id', '=', game.division_id).where('schedule_id', '=', game.schedule_id).where('stage', 'in', nextStages)
         .where('home_source_game_id', 'is', null).where('away_source_game_id', 'is', null).executeTakeFirst();
-      if (next) throw new BadRequestException('Semifinal winner cannot change after the final or third-place game is created');
+      if (next) throw new BadRequestException(`${roundName} winner cannot change after the next playoff game is created`);
     }
     const saved = await tx.updateTable('league.games').set({ home_score: dto.homeScore, away_score: dto.awayScore, forfeited_by_season_team_id: forfeitingTeamId, status: 'completed', updated_at: new Date() }).where('id', '=', game.id).returningAll().executeTakeFirstOrThrow();
-    if (game.stage === 'preliminary') await this.fillSeededSemifinals(tx, seasonId, game.division_id);
-    // The semifinal's winner and loser move into the games waiting for them.
+    if (game.stage === 'preliminary') await this.fillSeededGames(tx, seasonId, game.division_id);
+    // The winner and loser move into the games waiting for them.
     const winner = dto.homeScore > dto.awayScore ? game.home_season_team_id : game.away_season_team_id;
     const loser = winner === game.home_season_team_id ? game.away_season_team_id : game.home_season_team_id;
     for (const next of dependents) {
@@ -862,7 +872,7 @@ export class LeagueService {
       }),
     };
   }
-  // A division's playoff stage: waiting for the round robin, semifinals, the championship, or complete with a champion.
+  // A division's playoff stage: waiting for the round robin, quarterfinals, semifinals, the championship, or complete with a champion.
   private playoffStatus<T extends { stage: string; status: string; home_name: string; away_name: string; home_score: number | null; away_score: number | null }>(games: T[]) {
     const playoffGames = games.filter((game) => game.stage !== 'preliminary');
     if (!playoffGames.length) return null;
@@ -871,8 +881,8 @@ export class LeagueService {
       return { stage: 'complete' as const, nextGame: null, champion: championship.home_score! > championship.away_score! ? championship.home_name : championship.away_name };
     }
     const roundRobinLeft = games.some((game) => game.stage === 'preliminary' && game.status !== 'completed');
-    const semifinalsLeft = playoffGames.some((game) => game.stage === 'semifinal' && game.status !== 'completed');
-    const stage = roundRobinLeft ? 'waiting' as const : semifinalsLeft ? 'semifinals' as const : 'final' as const;
+    const left = (stage: string) => playoffGames.some((game) => game.stage === stage && game.status !== 'completed');
+    const stage = roundRobinLeft ? 'waiting' as const : left('quarterfinal') ? 'quarterfinals' as const : left('semifinal') ? 'semifinals' as const : 'final' as const;
     return { stage, nextGame: playoffGames.find((game) => game.status !== 'completed') ?? null, champion: null };
   }
 }
